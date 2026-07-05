@@ -9,7 +9,6 @@ fingerprint (``config.fingerprint``'s ``composite_mode`` argument) and its
 mode names are consumed verbatim by the CI gate (T15/T16) -- do not rename.
 """
 
-from collections.abc import Mapping
 from enum import StrEnum
 
 DETERMINISTIC_FIELDS: tuple[str, ...] = (
@@ -33,7 +32,7 @@ _MODE_FIELDS: dict[CompositeMode, tuple[str, ...]] = {
 }
 
 
-def composite(field_scores: Mapping[str, int], mode: CompositeMode) -> float:
+def composite(field_scores: dict[str, float], mode: CompositeMode) -> float:
     """Unweighted mean of the fields included by ``mode``, on a 0-100 scale."""
 
     included = [field_scores[field] for field in _MODE_FIELDS[mode]]

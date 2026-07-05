@@ -47,3 +47,16 @@ class TestComposite:
         field_scores = dict(_ALL_PASSING, category=0, priority=0, issue_summary=0)
 
         assert composite(field_scores, CompositeMode.FULL_7) == pytest.approx(4 / 7 * 100)
+
+    def test_float_valued_scores(self):
+        field_scores = {
+            "category": 1.0,
+            "priority": 1.0,
+            "customer_name": 0.0,
+            "order_id": 1.0,
+            "product_name": 1.0,
+            "issue_summary": 2 / 3,
+            "requested_action": 1 / 3,
+        }
+
+        assert composite(field_scores, CompositeMode.FULL_7) == pytest.approx(5 / 7 * 100)
