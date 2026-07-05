@@ -1,0 +1,41 @@
+# Default run configuration (spec §9). Defaults are the decided D2/D3 values
+# (K=3, K_baseline=6, margin=2.0, alpha=0.05); changing them requires a dated
+# decision-log amendment (docs/decisions.md).
+
+models:
+  candidate_a: claude-haiku-4-5-20251001
+  candidate_b: gpt-5.4-mini
+  judge: gemini-3.5-flash
+
+prompt_version: 1
+
+dataset:
+  path: data/golden/golden.jsonl
+  version: 1
+
+k: 3
+k_baseline: 6
+retry_max_attempts: 4
+
+gate:
+  margin: 2.0
+  alpha: 0.05
+
+# List prices per provider, USD per million tokens (MTok). Approximate at the
+# snapshot date below -- not a live price feed. Consumed by the gate summary
+# for token-cost reporting (spec §7, §9).
+price_snapshot:
+  date: "2026-07-04"
+  label: approximate-at-snapshot
+  candidate_a:
+    input_per_mtok: 1.00
+    output_per_mtok: 5.00
+  candidate_b:
+    input_per_mtok: 0.75
+    output_per_mtok: 4.50
+  judge:
+    input_per_mtok: 1.50
+    output_per_mtok: 9.00
+
+langfuse:
+  host: https://cloud.langfuse.com
