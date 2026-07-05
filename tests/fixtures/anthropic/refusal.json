@@ -1,0 +1,18 @@
+{
+  "id": "msg_test_refusal",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-haiku-4-5-20251223",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'm not able to help with that request."
+    }
+  ],
+  "stop_reason": "refusal",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 480,
+    "output_tokens": 14
+  }
+}

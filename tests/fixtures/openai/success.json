@@ -1,0 +1,31 @@
+{
+  "id": "resp_test_success",
+  "object": "response",
+  "created_at": 1751500000,
+  "model": "gpt-5.4-mini-2026-02-01",
+  "output": [
+    {
+      "id": "msg_1",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"category\": \"billing\", \"priority\": \"normal\", \"customer_name\": \"Alex Chen\", \"order_id\": \"ORD-11223\", \"product_name\": null, \"issue_summary\": \"Charged twice for the same subscription renewal.\", \"requested_action\": \"Refund the duplicate charge.\"}",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "parallel_tool_calls": true,
+  "tool_choice": "auto",
+  "tools": [],
+  "usage": {
+    "input_tokens": 300,
+    "input_tokens_details": {"cached_tokens": 0},
+    "output_tokens": 80,
+    "output_tokens_details": {"reasoning_tokens": 0},
+    "total_tokens": 380
+  }
+}

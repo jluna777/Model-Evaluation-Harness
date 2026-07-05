@@ -1,0 +1,30 @@
+{
+  "id": "resp_test_refusal",
+  "object": "response",
+  "created_at": 1751500000,
+  "model": "gpt-5.4-mini-2026-02-01",
+  "output": [
+    {
+      "id": "msg_1",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "refusal",
+          "refusal": "I can't help with that request."
+        }
+      ]
+    }
+  ],
+  "parallel_tool_calls": true,
+  "tool_choice": "auto",
+  "tools": [],
+  "usage": {
+    "input_tokens": 280,
+    "input_tokens_details": {"cached_tokens": 0},
+    "output_tokens": 10,
+    "output_tokens_details": {"reasoning_tokens": 0},
+    "total_tokens": 290
+  }
+}

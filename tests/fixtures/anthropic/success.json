@@ -1,0 +1,18 @@
+{
+  "id": "msg_test_success",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-haiku-4-5-20251223",
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"category\": \"shipping\", \"priority\": \"high\", \"customer_name\": \"Jamie Rivera\", \"order_id\": \"ORD-98765\", \"product_name\": \"Wireless Mouse\", \"issue_summary\": \"Package marked delivered but never arrived.\", \"requested_action\": \"Reship the order or issue a refund.\"}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 512,
+    "output_tokens": 96
+  }
+}
