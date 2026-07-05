@@ -38,6 +38,12 @@ class PermutationResult:
     ``m_nonzero`` and ``min_attainable_p`` are load-bearing for the CI
     gate's sparse-delta disclosure (T16): they let callers warn when too few
     nonzero deltas exist for rejection to be possible at a given alpha.
+
+    For two-sided tests, the ``min_attainable_p`` floor reflects a mirror-pairing
+    constraint: because two-sided extremeness (|stat| >= |observed|) is invariant
+    under full sign-negation of all deltas, extreme configurations always come in
+    equal-magnitude pairs (positive and negative). This reduces the count of
+    distinct attainable p-values; the floor is 2**(1-m) for m >= 1.
     """
 
     p: float
@@ -90,11 +96,15 @@ def sign_flip_test(
         stats = (signs @ nonzero) / n_total
         extreme = _extreme_mask(stats, observed, sided)
         count = int(extreme.sum())
+        if sided == "one":
+            floor = 2.0**-m
+        else:  # sided == "two"
+            floor = min(1.0, 2.0**(1 - m))
         return PermutationResult(
             p=count / total,
             m_nonzero=m,
             method="exact",
-            min_attainable_p=2.0**-m,
+            min_attainable_p=floor,
         )
 
     rng = np.random.default_rng(seed)

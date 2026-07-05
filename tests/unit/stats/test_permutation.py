@@ -161,6 +161,39 @@ class TestMinAttainableP:
 
         assert result.min_attainable_p == pytest.approx(1 / 1000)
 
+    def test_two_sided_m1_min_attainable_p_is_one(self):
+        # For m=1, the mirror-pairing constraint forces a floor of 1.0 (both
+        # configurations are equidistant extremes and tie).
+        result = sign_flip_test([-3.0], sided="two", seed=0)
+
+        assert result.p == pytest.approx(1.0)
+        assert result.min_attainable_p == pytest.approx(1.0)
+
+    def test_two_sided_m3_min_attainable_p_is_floor_of_mirror_pairing(self):
+        # For m=3, clearly-extreme all-negative deltas. The mirror-pairing
+        # constraint gives a floor of min(1.0, 2.0**(1-3)) = min(1.0, 0.25) = 0.25.
+        # All three sign flips to positive is also extreme and equally rare.
+        deltas = [-5.0, -6.0, -7.0]
+        result = sign_flip_test(deltas, sided="two", seed=0)
+
+        assert result.p == pytest.approx(0.25)
+        assert result.min_attainable_p == pytest.approx(0.25)
+
+    def test_two_sided_m5_min_attainable_p_is_floor_of_mirror_pairing(self):
+        # For m=5, all-negative deltas. Mirror-pairing floor is 2.0**(1-5) = 0.0625.
+        deltas = [-1.0, -2.0, -3.0, -4.0, -5.0]
+        result = sign_flip_test(deltas, sided="two", seed=0)
+
+        assert result.min_attainable_p == pytest.approx(0.0625)
+        assert result.p == pytest.approx(0.0625)
+
+    def test_one_sided_m5_min_attainable_p_unchanged(self):
+        # One-sided floor remains 2.0**-m regardless.
+        deltas = [-1.0, -2.0, -3.0, -4.0, -5.0]
+        result = sign_flip_test(deltas, sided="one", seed=0)
+
+        assert result.min_attainable_p == pytest.approx(0.03125)  # 2**-5
+
 
 class TestInputValidation:
     def test_empty_deltas_raises(self):
