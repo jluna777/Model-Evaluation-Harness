@@ -2,7 +2,7 @@
 
 **Project:** Model Evaluation Harness
 **Identity:** A structured-extraction eval harness with a calibrated LLM judge and CI gating.
-**Status:** Draft v0.1 — pending owner validation · 2026-07-04
+**Status:** Validated v1.0 · 2026-07-04
 
 This document states the principles and locked v1 scope. It changes rarely and only with the owner's sign-off. The spec, plan, and tickets must not contradict it; if they need to, this document is amended first.
 
