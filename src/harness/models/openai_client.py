@@ -61,7 +61,9 @@ class OpenAIClient:
         jitter: Callable[[], float] = random.random,
     ) -> None:
         self._model = model
-        self._client = client
+        # Disable SDK-internal retries; retry_transport decorator owns ALL retry behavior
+        # (config cap + jittered backoff).
+        self._client = client.with_options(max_retries=0)
         self._max_attempts = max_attempts
         self._schema_name = schema_name
         self._sleep = sleep

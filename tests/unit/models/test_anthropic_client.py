@@ -119,6 +119,26 @@ class TestSchemaInvalid:
         assert len(calls) == 1
 
 
+class TestDisableSDKInternalRetries:
+    def test_client_with_default_retries_disables_them(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _json_response(200, _load("success.json"))
+
+        # Create SDK client WITHOUT max_retries=0 (defaults to 2)
+        sdk_client = anthropic.Anthropic(
+            api_key="test-key",
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        # Verify SDK client has default retries
+        assert sdk_client.max_retries == 2
+
+        # Wrap in our client
+        candidate_client = AnthropicClient(model=REQUESTED_MODEL, client=sdk_client)
+
+        # Verify internal SDK retries are disabled
+        assert candidate_client._client.max_retries == 0
+
+
 class TestRetryOnTransportErrors:
     def test_succeeds_after_429_429_200_in_three_attempts(self):
         calls = []
