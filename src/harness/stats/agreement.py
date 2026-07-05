@@ -39,6 +39,17 @@ calibration slice (or an unlucky bootstrap resample that happens to draw an
 all-one-category subsample) flows through reporting code instead of
 crashing. Callers that need to react to an undefined kappa check
 ``math.isnan(result.kappa)``.
+
+That same convention means individual *bootstrap replicates* of kappa can
+come back NaN even when the full sample's point estimate is well-defined:
+an unlucky cluster resample can land entirely on agreeing single-category
+clusters, which is near-certain to happen at least once across thousands of
+resamples on a well-agreeing, pass-skewed calibration set. This module
+therefore calls :func:`bca_ci` with ``nan_policy="omit"``: the CI is
+computed over the non-degenerate replicates, conditioning it on
+non-degenerate resamples (a small, accepted bias), and the count of omitted
+replicates is disclosed via a ``RuntimeWarning`` rather than silently
+propagating into a ``(nan, nan)`` interval.
 """
 
 from __future__ import annotations
@@ -88,6 +99,12 @@ def cohens_kappa(
     judgment belongs to) used only for the confidence interval's cluster
     bootstrap (spec §5, D2) -- the kappa point estimate itself does not
     depend on clustering.
+
+    The CI conditions on non-degenerate resamples (see module docstring):
+    any cluster resample whose kappa is undefined under the degenerate
+    single-category convention is omitted from the bootstrap, and the
+    omission count is disclosed via a ``RuntimeWarning`` rather than
+    silently producing a ``(nan, nan)`` interval.
     """
 
     a_arr = np.asarray(a)
@@ -122,6 +139,7 @@ def cohens_kappa(
         clusters=clusters,
         n_resamples=n_resamples,
         seed=seed,
+        nan_policy="omit",
     )
 
     return KappaResult(kappa=kappa, ci=ci, raw_agreement=raw_agreement, prevalence=prevalence)

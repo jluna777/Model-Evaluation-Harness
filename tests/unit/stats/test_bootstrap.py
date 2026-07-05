@@ -1,3 +1,6 @@
+import math
+import warnings
+
 import numpy as np
 import pytest
 from scipy import stats as scipy_stats
@@ -302,3 +305,156 @@ class TestInputValidation:
     def test_single_cluster_label_raises(self):
         with pytest.raises(ValueError):
             bca_ci([1.0, 2.0, 3.0], level=0.95, clusters=["a", "a", "a"], seed=1)
+
+
+def _nan_above_threshold(threshold: float):
+    """Statistic that returns NaN whenever the (resampled) mean exceeds
+    ``threshold``, else the mean itself. Engineered so that, on the fixed
+    data/seed used below, a known fraction of bootstrap replicates come back
+    NaN while the observed statistic and every jackknife leave-one-out
+    statistic stay finite -- isolating the "some but not all replicates are
+    NaN" case from degenerate-observed or degenerate-jackknife cases.
+    """
+
+    def statistic(x: np.ndarray) -> float:
+        m = float(np.mean(x))
+        return float("nan") if m > threshold else m
+
+    return statistic
+
+
+def _nan_on_duplicate(x: np.ndarray) -> float:
+    """Statistic that returns NaN whenever ``x`` contains a repeated value,
+    else the mean. Bootstrap resamples draw ``n`` values with replacement
+    from ``n`` distinct values, so for even a moderate ``n`` a resample with
+    *no* repeats is astronomically unlikely (~n!/n^n) -- every bootstrap
+    replicate comes back NaN in practice, deterministically, for any seed.
+    Jackknife leave-one-out subsets never contain duplicates (they are drawn
+    without replacement from already-distinct values), so this isolates the
+    "all bootstrap replicates NaN, jackknife untouched" case.
+    """
+
+    if len(x) != len(np.unique(x)):
+        return float("nan")
+    return float(np.mean(x))
+
+
+class TestNanPolicy:
+    """`bca_ci`'s NaN handling: a single NaN bootstrap replicate must not
+    silently flow into `np.percentile` and produce a silent `(nan, nan)`
+    interval (the bug this module is being hardened against -- see
+    `cohens_kappa`'s documented degenerate single-category convention,
+    which is a real-world source of NaN replicates). Default policy fails
+    loudly; `nan_policy="omit"` recovers a finite CI with disclosure.
+    """
+
+    # Fixed data/seed combination (verified empirically, see the docstrings
+    # on the engineered statistics above): with threshold=0.35, exactly 172
+    # of 10_000 bootstrap replicates are NaN and 0 of 20 jackknife values
+    # are NaN, for this values/seed pair.
+    _values = np.random.default_rng(42).normal(loc=0.0, scale=1.0, size=20)
+    _seed = 123
+    _n_resamples = 10_000
+    _threshold = 0.35
+
+    def test_default_policy_raises_with_nan_count_in_message(self):
+        statistic = _nan_above_threshold(self._threshold)
+
+        with pytest.raises(ValueError, match="172"):
+            bca_ci(
+                self._values,
+                statistic,
+                level=0.95,
+                seed=self._seed,
+                n_resamples=self._n_resamples,
+            )
+
+    def test_default_policy_message_mentions_omit_suggestion(self):
+        statistic = _nan_above_threshold(self._threshold)
+
+        with pytest.raises(ValueError, match="nan_policy"):
+            bca_ci(
+                self._values,
+                statistic,
+                level=0.95,
+                seed=self._seed,
+                n_resamples=self._n_resamples,
+            )
+
+    def test_omit_policy_returns_finite_interval_within_sane_bounds(self):
+        statistic = _nan_above_threshold(self._threshold)
+
+        with pytest.warns(RuntimeWarning):
+            lo, hi = bca_ci(
+                self._values,
+                statistic,
+                level=0.95,
+                seed=self._seed,
+                n_resamples=self._n_resamples,
+                nan_policy="omit",
+            )
+
+        assert math.isfinite(lo)
+        assert math.isfinite(hi)
+        assert lo <= hi
+        # Sane bounds: the underlying data is standard-normal-ish (mean ~0,
+        # std ~0.85, n=20), so a 95% CI on the mean has no business landing
+        # outside a generous +/-3 band.
+        assert -3.0 < lo < 3.0
+        assert -3.0 < hi < 3.0
+
+    def test_omit_policy_warning_names_the_omission_count(self):
+        statistic = _nan_above_threshold(self._threshold)
+
+        with pytest.warns(RuntimeWarning, match=r"172 of 10000"):
+            bca_ci(
+                self._values,
+                statistic,
+                level=0.95,
+                seed=self._seed,
+                n_resamples=self._n_resamples,
+                nan_policy="omit",
+            )
+
+    def test_all_nan_bootstrap_replicates_raises_even_under_omit(self):
+        values = np.random.default_rng(7).normal(loc=0.0, scale=1.0, size=20)
+
+        with pytest.raises(ValueError):
+            bca_ci(
+                values,
+                _nan_on_duplicate,
+                level=0.95,
+                seed=1,
+                n_resamples=500,
+                nan_policy="omit",
+            )
+
+    def test_all_nan_bootstrap_replicates_also_raises_under_default_policy(self):
+        values = np.random.default_rng(7).normal(loc=0.0, scale=1.0, size=20)
+
+        with pytest.raises(ValueError):
+            bca_ci(values, _nan_on_duplicate, level=0.95, seed=1, n_resamples=500)
+
+    def test_observed_statistic_nan_always_raises_regardless_of_policy(self):
+        with pytest.raises(ValueError):
+            bca_ci(
+                [1.0, 2.0, 3.0, 4.0],
+                lambda x: float("nan"),
+                level=0.95,
+                seed=1,
+                n_resamples=200,
+                nan_policy="omit",
+            )
+
+    def test_existing_no_nan_path_emits_no_warning(self):
+        # Default (no-NaN-engineered) usage must not warn at all -- promote
+        # any warning to an error so a regression that starts warning on the
+        # happy path fails loudly here.
+        rng = np.random.default_rng(21)
+        values = rng.normal(size=30)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            lo, hi = bca_ci(values, np.mean, level=0.95, seed=1, n_resamples=2000)
+
+        assert lo <= hi

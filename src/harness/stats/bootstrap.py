@@ -32,10 +32,26 @@ BCa precision points:
     CDF; Acklam's rational approximation plus one Halley refinement step
     for the quantile/ppf) rather than imported from scipy, which is a
     dev-only dependency for this project.
+  - A bootstrap replicate statistic (or a jackknife leave-one-out
+    statistic) can itself come back NaN for statistics with a documented
+    degenerate-input convention (e.g. :func:`harness.stats.agreement.
+    cohens_kappa`'s single-shared-category kappa=nan case) -- an unlucky
+    resample can land entirely on a degenerate subset even when the full
+    sample is not degenerate. Feeding a NaN straight into ``np.percentile``
+    silently returns ``(nan, nan)``. ``nan_policy`` controls what happens
+    instead: ``"raise"`` (default) fails loudly, since a silent NaN CI is
+    strictly worse than an exception. ``"omit"`` drops the NaN replicates
+    (and NaN jackknife values) and proceeds on the rest, disclosing the
+    omission via a ``RuntimeWarning`` -- appropriate only for statistics
+    with a *known, documented* degenerate-resample convention. Omission
+    conditions the CI on non-degenerate resamples, a small bias that is
+    accepted here in exchange for disclosure rather than a silent failure.
 """
 
 import math
+import warnings
 from collections.abc import Callable, Hashable, Sequence
+from typing import Literal
 
 import numpy as np
 
@@ -150,6 +166,7 @@ def bca_ci(
     clusters: Sequence[Hashable] | None = None,
     n_resamples: int = 10_000,
     seed: int,
+    nan_policy: Literal["raise", "omit"] = "raise",
 ) -> tuple[float, float]:
     """Bias-corrected and accelerated (BCa) bootstrap confidence interval.
 
@@ -166,6 +183,33 @@ def bca_ci(
     ``seed`` makes the bootstrap resampling, and therefore the returned
     interval, fully reproducible: the same ``seed`` (with the same other
     arguments) always yields an identical ``(lo, hi)``.
+
+    ``nan_policy`` controls what happens when a bootstrap replicate or
+    jackknife leave-one-out statistic comes back NaN (see the module
+    docstring's BCa precision points for why that can happen even when
+    ``statistic(values)`` itself is finite):
+
+      - ``"raise"`` (default): raises ``ValueError`` naming how many
+        replicates (and jackknife values, if any) are NaN, and suggests
+        ``nan_policy="omit"`` for statistics with a documented degenerate
+        resample convention (e.g. :func:`harness.stats.agreement.
+        cohens_kappa`).
+      - ``"omit"``: drops the NaN bootstrap replicates before the
+        percentile step, and computes the bias-correction proportion
+        (``z0``) over the valid (non-NaN) replicates only -- the valid
+        count, not the original ``n_resamples``, is the denominator. NaN
+        jackknife values are dropped from the acceleration term the same
+        way. Exactly one ``RuntimeWarning`` is emitted naming how many of
+        how many replicates (and jackknife values) were omitted. This
+        conditions the returned CI on non-degenerate resamples, a small
+        bias accepted here in exchange for disclosure. If *every*
+        bootstrap replicate (or every jackknife value) is NaN even after
+        omission, ``ValueError`` is raised regardless of policy -- there
+        is nothing left to compute a CI from.
+
+    ``statistic(values)`` itself being NaN always raises ``ValueError``,
+    under either policy: that is not a degenerate-resample artifact, it
+    means the observed point estimate is undefined.
     """
 
     values_arr = np.asarray(values, dtype=np.float64)
@@ -175,9 +219,13 @@ def bca_ci(
         raise ValueError(f"level must be in (0, 1), got {level!r}")
     if n_resamples < 1:
         raise ValueError("n_resamples must be >= 1")
+    if nan_policy not in ("raise", "omit"):
+        raise ValueError(f"nan_policy must be 'raise' or 'omit', got {nan_policy!r}")
 
     rng = np.random.default_rng(seed)
     observed = float(statistic(values_arr))
+    if math.isnan(observed):
+        raise ValueError("observed statistic is NaN; cannot compute a BCa CI")
 
     if clusters is None:
         boot_stats, jack_stats = _resample_plain(values_arr, statistic, rng, n_resamples)
@@ -189,11 +237,71 @@ def bca_ci(
             raise ValueError("clusters must contain at least 2 distinct labels")
         boot_stats, jack_stats = _resample_clustered(groups, statistic, rng, n_resamples)
 
+    boot_stats, jack_stats = _handle_nan_replicates(boot_stats, jack_stats, nan_policy)
+
     alpha = 1.0 - level
     lo_pct, hi_pct = _bca_percentiles(boot_stats, jack_stats, observed, alpha)
     lo = float(np.percentile(boot_stats, 100.0 * lo_pct))
     hi = float(np.percentile(boot_stats, 100.0 * hi_pct))
     return lo, hi
+
+
+def _handle_nan_replicates(
+    boot_stats: np.ndarray,
+    jack_stats: np.ndarray,
+    nan_policy: Literal["raise", "omit"],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply ``nan_policy`` to NaN bootstrap/jackknife statistics.
+
+    Returns ``(boot_stats, jack_stats)`` unchanged when neither contains a
+    NaN. Otherwise either raises (policy ``"raise"``, or any policy if
+    omission would leave nothing to compute from) or returns the NaN-free
+    arrays after emitting exactly one ``RuntimeWarning`` (policy ``"omit"``).
+    """
+
+    boot_nan_mask = np.isnan(boot_stats)
+    jack_nan_mask = np.isnan(jack_stats)
+    n_nan_boot = int(boot_nan_mask.sum())
+    n_nan_jack = int(jack_nan_mask.sum())
+
+    if n_nan_boot == 0 and n_nan_jack == 0:
+        return boot_stats, jack_stats
+
+    if nan_policy == "raise":
+        parts = [f"{n_nan_boot} of {boot_stats.size} bootstrap replicate statistics are NaN"]
+        if n_nan_jack:
+            parts.append(f"{n_nan_jack} of {jack_stats.size} jackknife statistics are NaN")
+        raise ValueError(
+            "; ".join(parts)
+            + " (degenerate resample). Pass nan_policy='omit' for statistics with a known "
+            "degenerate resample convention."
+        )
+
+    valid_boot = boot_stats[~boot_nan_mask]
+    valid_jack = jack_stats[~jack_nan_mask]
+    if valid_boot.size == 0:
+        raise ValueError(
+            f"all {boot_stats.size} bootstrap replicate statistics are NaN; cannot compute a "
+            "BCa CI even with nan_policy='omit'"
+        )
+    if valid_jack.size == 0:
+        raise ValueError(
+            f"all {jack_stats.size} jackknife statistics are NaN; cannot compute a BCa CI even "
+            "with nan_policy='omit'"
+        )
+
+    omitted_parts = []
+    if n_nan_boot:
+        omitted_parts.append(f"{n_nan_boot} of {boot_stats.size} bootstrap replicates")
+    if n_nan_jack:
+        omitted_parts.append(f"{n_nan_jack} of {jack_stats.size} jackknife values")
+    warnings.warn(
+        "Omitted " + " and ".join(omitted_parts) + " with NaN statistics (degenerate resample); "
+        "the BCa CI now conditions on non-degenerate resamples.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    return valid_boot, valid_jack
 
 
 def _resample_plain(
