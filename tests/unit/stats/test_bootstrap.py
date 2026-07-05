@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy import stats as scipy_stats
 
-from harness.stats.bootstrap import _norm_cdf, _norm_ppf, bca_ci
+from harness.stats.bootstrap import _bca_adjust, _bca_percentiles, _norm_cdf, _norm_ppf, bca_ci
 
 
 class TestNormalHelpers:
@@ -52,15 +52,102 @@ class TestAgreesWithScipyBca:
         # independent Monte Carlo resamples of the same data; residual
         # disagreement is bootstrap resampling noise. Bound it by a fraction
         # of scipy's own reported bootstrap standard error rather than a
-        # hand-picked constant: empirically (30 trial reference samples of
-        # this shape) that noise stays under 0.11 * standard_error, while an
-        # implementation missing the bias correction or acceleration term
-        # disagrees with scipy by 0.19-0.63 * standard_error on this same
-        # data -- so 0.5 * standard_error comfortably separates the two.
-        tol = 0.5 * scipy_result.standard_error
+        # hand-picked constant: empirically the correct implementation's
+        # disagreement with scipy stays around 0.01 * standard_error, while
+        # a zeroed-acceleration mutant disagrees by 0.19-0.47 * standard_error
+        # and a zeroed-bias-correction (z0) mutant by 0.09-0.14 *
+        # standard_error on data of this shape -- so 0.15 * standard_error
+        # leaves ~15x headroom over the correct implementation's noise while
+        # still catching the acceleration mutant. (It cannot reliably catch
+        # the z0 mutant on its own -- see TestBcaAdjustmentTerms below for a
+        # deterministic, term-level test that does.)
+        tol = 0.15 * scipy_result.standard_error
 
         assert abs(lo - scipy_lo) <= tol
         assert abs(hi - scipy_hi) <= tol
+
+
+class TestBcaAdjustmentTerms:
+    """Deterministic, hand-computed check of the z0/acceleration terms.
+
+    ``TestAgreesWithScipyBca`` above only catches a broken bias-correction
+    (z0) term within a fraction of the Monte Carlo noise floor and can miss
+    it; this class instead feeds fixed, hand-computable inputs straight into
+    the internal helpers and compares against literals derived independently
+    of the module's own formula, so it kills a zeroed-``a`` or zeroed-``z0``
+    mutant deterministically.
+
+    Fixed inputs:
+      - ``boot_stats = [1..10]``, ``observed = 4.5`` -> exactly 4 of the 10
+        bootstrap stats (1, 2, 3, 4) are strictly less than 4.5, so
+        ``p0 = 0.4`` and ``z0 = norm.ppf(0.4) = -0.2533471031357997``.
+      - ``jack_stats = [1.0, 2.0, 4.0]`` -> mean ``theta_dot = 7/3``, giving
+        ``d = theta_dot - jack = [4/3, 1/3, -5/3]``.
+        ``sum(d**3) = (64 + 1 - 125) / 27 = -60/27 = -20/9 ≈ -2.2222222``
+        ``sum(d**2) = (16 + 1 + 25) / 9 = 42/9 = 14/3 ≈ 4.6666667``
+        ``a = sum(d**3) / (6 * sum(d**2)**1.5) ≈ -2.2222222 / 60.4869132
+          ≈ -0.0367389``
+      - ``alpha = 0.10`` (level=0.90) -> ``z_lo = norm.ppf(0.05)``,
+        ``z_hi = norm.ppf(0.95)`` (``±1.6448536269514722``).
+
+    All literals below were computed independently in a scratch script
+    (``scipy.stats.norm.ppf``/``.cdf`` plus the ``_bca_adjust`` formula
+    transcribed by hand) rather than by re-running the module's own helpers,
+    so the assertions are not tautological.
+    """
+
+    boot_stats = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    observed = 4.5
+    jack_stats = np.array([1.0, 2.0, 4.0])
+    alpha = 0.10  # level = 0.90
+
+    z0 = -0.2533471031357997
+    a = -0.03673889284811709
+    z_lo = -1.6448536269514729
+    z_hi = 1.6448536269514722
+
+    def test_bca_percentiles_match_hand_computed_literals(self):
+        lo_pct, hi_pct = _bca_percentiles(
+            self.boot_stats, self.jack_stats, self.observed, self.alpha
+        )
+
+        assert lo_pct == pytest.approx(0.010899619829167055, abs=1e-6)
+        assert hi_pct == pytest.approx(0.8577988153330023, abs=1e-6)
+
+    def test_bca_adjust_matches_hand_computed_literals(self):
+        adj_lo = _bca_adjust(self.z0, self.a, self.z_lo)
+        adj_hi = _bca_adjust(self.z0, self.a, self.z_hi)
+
+        assert adj_lo == pytest.approx(-2.293847852566169, abs=1e-6)
+        assert adj_hi == pytest.approx(1.0704820834562707, abs=1e-6)
+
+    def test_zeroed_acceleration_changes_the_adjusted_value(self):
+        # Mutation check: a zeroed acceleration term must move the
+        # adjusted z away from the correct (a != 0) value computed above.
+        adj_lo_correct = _bca_adjust(self.z0, self.a, self.z_lo)
+        adj_hi_correct = _bca_adjust(self.z0, self.a, self.z_hi)
+
+        adj_lo_a0 = _bca_adjust(self.z0, 0.0, self.z_lo)
+        adj_hi_a0 = _bca_adjust(self.z0, 0.0, self.z_hi)
+
+        assert adj_lo_a0 == pytest.approx(-2.151547833223072, abs=1e-6)
+        assert adj_hi_a0 == pytest.approx(1.1381594206798729, abs=1e-6)
+        assert adj_lo_a0 != pytest.approx(adj_lo_correct, abs=1e-6)
+        assert adj_hi_a0 != pytest.approx(adj_hi_correct, abs=1e-6)
+
+    def test_zeroed_bias_correction_changes_the_adjusted_value(self):
+        # Mutation check: a zeroed z0 term must move the adjusted z away
+        # from the correct (z0 != 0) value computed above.
+        adj_lo_correct = _bca_adjust(self.z0, self.a, self.z_lo)
+        adj_hi_correct = _bca_adjust(self.z0, self.a, self.z_hi)
+
+        adj_lo_z00 = _bca_adjust(0.0, self.a, self.z_lo)
+        adj_hi_z00 = _bca_adjust(0.0, self.a, self.z_hi)
+
+        assert adj_lo_z00 == pytest.approx(-1.7506452994792383, abs=1e-6)
+        assert adj_hi_z00 == pytest.approx(1.55111932900198, abs=1e-6)
+        assert adj_lo_z00 != pytest.approx(adj_lo_correct, abs=1e-6)
+        assert adj_hi_z00 != pytest.approx(adj_hi_correct, abs=1e-6)
 
 
 class TestClusterWidensCorrelatedData:
