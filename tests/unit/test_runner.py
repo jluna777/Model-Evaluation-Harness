@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -245,6 +246,61 @@ class TestAbortOnTransportExhausted:
         assert len(artifact.rows) == 3
 
 
+class TestAbortOnAnyWorkerException:
+    """C2: a non-``TransportExhausted`` worker exception must still produce
+    the ONE distinct ``RunAborted`` outcome, and must never leave the thread
+    pool orphaned -- spending after ``run_eval`` has already returned
+    control to the caller."""
+
+    def test_non_transport_exception_aborts_without_orphaning_pool(self, tmp_path):
+        items = [make_item(f"item-{i}") for i in range(8)]
+
+        def make_result(idx: int, prompt: str, schema: type) -> StructuredResult:
+            if idx == 2:  # the 3rd call
+                raise ValueError("boom")
+            time.sleep(0.05)
+            return success_result()
+
+        candidate = FakeModelClient(make_result=make_result)
+        model_key = _model_key(candidate)
+
+        with pytest.raises(RunAborted) as exc_info:
+            run_eval(
+                _config(),
+                model_key,
+                k=1,
+                dataset=items,
+                prompt=EXTRACTION_PROMPT,
+                runs_root=tmp_path,
+                max_workers=4,
+            )
+
+        aborted = exc_info.value
+        assert isinstance(aborted.cause, ValueError)
+        assert isinstance(aborted.__cause__, ValueError)
+
+        # The pool must already be fully shut down by the time run_eval
+        # raises -- not still running tasks in the background. A short sleep
+        # after control returns must show zero additional spend.
+        stable_count = candidate.call_count
+        time.sleep(0.3)
+        assert candidate.call_count == stable_count, (
+            "worker pool kept spending after run_eval returned control"
+        )
+
+        rows_path = aborted.run_dir.path / "rows.jsonl"
+        assert rows_path.exists()
+        persisted = [
+            json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()
+        ]
+        # Partial rows from tasks already in flight when the failure was
+        # observed stay intact; not-yet-started tasks never ran at all.
+        assert 0 < len(persisted) < 8
+
+        artifact = load_run(aborted.run_dir)
+        assert artifact.completed is False
+
+
 class TestResume:
     def test_resume_skips_completed_rows_no_respend(self, tmp_path):
         items = [make_item(f"item-{i}") for i in range(5)]
@@ -336,6 +392,8 @@ class TestIncrementalWrites:
                 EXTRACTION_PROMPT.version,
                 config.dataset.version,
                 config.dataset.path,
+                config.models.candidate_a,
+                config.models.judge,
             )
             rows_path = run_dir_path / "rows.jsonl"
             persisted = [
@@ -372,6 +430,95 @@ class TestFingerprint:
         assert artifact_v1.prompt_version == 1
         assert artifact_v2.prompt_version == 2
         assert artifact_v1.fingerprint != artifact_v2.fingerprint
+
+
+class TestModelIdentityInRunIdentity:
+    """C1: run identity must key on the *requested* model id, not just the
+    abstract "a"/"b" label -- otherwise swapping the configured candidate or
+    judge model under an unchanged label/config-shape silently resumes a
+    stale run's rows (zero new calls, completed=True) for what is actually a
+    different model."""
+
+    def test_changed_candidate_model_id_does_not_resume_stale_run(self, tmp_path):
+        items = [make_item("item-0")]
+        config_v1 = _config()
+        judge = FakeModelClient(make_result=lambda *a: judge_pass_result())
+        candidate_v1 = FakeModelClient(make_result=lambda *a: success_result())
+        model_key_v1 = ModelKey(label="a", candidate_client=candidate_v1, judge_client=judge)
+
+        run_dir_v1 = run_eval(
+            config_v1,
+            model_key_v1,
+            k=1,
+            dataset=items,
+            prompt=EXTRACTION_PROMPT,
+            runs_root=tmp_path,
+        )
+        artifact_v1 = load_run(run_dir_v1)
+        assert candidate_v1.call_count == 1
+        assert artifact_v1.completed is True
+
+        # Same label, same k/dataset/prompt -- only the *configured*
+        # candidate model id changed (a served-version swap of the same
+        # candidate slot). This must NOT be treated as the same run.
+        config_v2 = config_v1.model_copy(
+            update={
+                "models": config_v1.models.model_copy(
+                    update={"candidate_a": "some-other-candidate-model-version"}
+                )
+            }
+        )
+        candidate_v2 = FakeModelClient(make_result=lambda *a: success_result())
+        model_key_v2 = ModelKey(label="a", candidate_client=candidate_v2, judge_client=judge)
+
+        run_dir_v2 = run_eval(
+            config_v2,
+            model_key_v2,
+            k=1,
+            dataset=items,
+            prompt=EXTRACTION_PROMPT,
+            runs_root=tmp_path,
+        )
+
+        assert run_dir_v2.path != run_dir_v1.path
+        # A fresh call was actually made -- not resumed from candidate_v1's
+        # stale rows.
+        assert candidate_v2.call_count == 1
+        assert candidate_v1.call_count == 1
+
+    def test_changed_judge_model_id_does_not_resume_stale_run(self, tmp_path):
+        items = [make_item("item-0")]
+        config_v1 = _config()
+        model_key_v1 = _model_key()
+
+        run_dir_v1 = run_eval(
+            config_v1,
+            model_key_v1,
+            k=1,
+            dataset=items,
+            prompt=EXTRACTION_PROMPT,
+            runs_root=tmp_path,
+        )
+
+        config_v2 = config_v1.model_copy(
+            update={
+                "models": config_v1.models.model_copy(
+                    update={"judge": "some-other-judge-model-version"}
+                )
+            }
+        )
+        model_key_v2 = _model_key()
+
+        run_dir_v2 = run_eval(
+            config_v2,
+            model_key_v2,
+            k=1,
+            dataset=items,
+            prompt=EXTRACTION_PROMPT,
+            runs_root=tmp_path,
+        )
+
+        assert run_dir_v2.path != run_dir_v1.path
 
 
 class TestLoadRunRoundTrip:
@@ -468,3 +615,192 @@ class TestManifestCompatibilityCheck:
             )
 
         assert "k" in exc_info.value.mismatches
+
+    def test_raises_on_candidate_model_id_mismatch(self, tmp_path):
+        """C1: a manifest recorded against a different candidate model id
+        than the current call's config must be flagged incompatible, even
+        when the label/k/prompt/dataset all agree (the residual case a hash
+        collision or a hand-edited manifest could otherwise slip through)."""
+
+        config = _config()
+        manifest = {
+            "model_key": "a",
+            "candidate_model_id": "stale-candidate-model-id",
+            "judge_model_id": config.models.judge,
+            "k": 1,
+            "prompt_version": EXTRACTION_PROMPT.version,
+            "dataset_version": config.dataset.version,
+            "item_ids": ["item-0"],
+        }
+        model_key = _model_key()
+
+        with pytest.raises(RunConfigMismatch) as exc_info:
+            _check_manifest_compatible(
+                manifest, tmp_path, model_key, [make_item("item-0")], 1, EXTRACTION_PROMPT, config
+            )
+
+        assert "candidate_model_id" in exc_info.value.mismatches
+
+    def test_raises_on_judge_model_id_mismatch(self, tmp_path):
+        config = _config()
+        manifest = {
+            "model_key": "a",
+            "candidate_model_id": config.models.candidate_a,
+            "judge_model_id": "stale-judge-model-id",
+            "k": 1,
+            "prompt_version": EXTRACTION_PROMPT.version,
+            "dataset_version": config.dataset.version,
+            "item_ids": ["item-0"],
+        }
+        model_key = _model_key()
+
+        with pytest.raises(RunConfigMismatch) as exc_info:
+            _check_manifest_compatible(
+                manifest, tmp_path, model_key, [make_item("item-0")], 1, EXTRACTION_PROMPT, config
+            )
+
+        assert "judge_model_id" in exc_info.value.mismatches
+
+
+class TestJudgeUsageAccounting:
+    """I3: judge usage and served model version must be captured, not
+    structurally discarded -- run rows carry per-field judge usage, and the
+    manifest's served_versions records the judge's runtime-observed
+    identity alongside the candidate's."""
+
+    def test_rows_carry_judge_usage_and_manifest_has_judge_served_version(self, tmp_path):
+        items = [make_item("item-0")]
+        candidate = FakeModelClient(make_result=lambda *a: success_result())
+        judge = FakeModelClient(make_result=lambda *a: judge_pass_result())
+        model_key = _model_key(candidate, judge)
+
+        run_dir = run_eval(
+            _config(), model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+        artifact = load_run(run_dir)
+
+        row = artifact.rows[0]
+        assert set(row.judge_usage) == {"issue_summary", "requested_action"}
+        for field_usage in row.judge_usage.values():
+            assert field_usage == {"input_tokens": 5, "output_tokens": 5}
+
+        manifest = json.loads((run_dir.path / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["served_versions"]["judge"] == "judge-v1"
+        assert manifest["served_versions"]["candidate_a"] == "candidate-v1"
+
+        assert artifact.judge_usage_totals() == {"input_tokens": 10, "output_tokens": 10}
+        # Candidate-only totals stay exactly as before -- unaffected by the
+        # additive judge usage tracking.
+        assert artifact.usage_totals() == {"input_tokens": 50, "output_tokens": 20}
+
+    def test_candidate_failure_row_has_no_judge_usage_per_field(self, tmp_path):
+        items = [make_item("item-0")]
+        candidate = FakeModelClient(
+            make_result=lambda *a: StructuredResult(
+                output=None,
+                failure="schema_invalid",
+                raw="not json",
+                usage=Usage(input_tokens=10, output_tokens=0),
+                served_model_version="candidate-v1",
+            )
+        )
+        model_key = _model_key(candidate)
+
+        run_dir = run_eval(
+            _config(), model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+        artifact = load_run(run_dir)
+
+        row = artifact.rows[0]
+        assert row.judge_usage == {"issue_summary": None, "requested_action": None}
+
+        manifest = json.loads((run_dir.path / "manifest.json").read_text(encoding="utf-8"))
+        # No judge call was ever made, so no judge served version to report.
+        assert "judge" not in manifest["served_versions"]
+
+    def test_fixture_rows_without_judge_usage_contribute_nothing(self):
+        """Rows persisted before I3 (no ``judge_usage`` key at all) must
+        still load and total to zero judge usage, not raise."""
+
+        artifact = load_run(RunDir(path=FIXTURE_RUN_DIR))
+
+        assert all(row.judge_usage is None for row in artifact.rows)
+        assert artifact.judge_usage_totals() == {"input_tokens": 0, "output_tokens": 0}
+
+
+class TestTruncatedTrailingLine:
+    """I4: a crash mid-write can leave ``rows.jsonl``'s final line as an
+    unparseable JSON fragment. That must be forgiven (dropped with a
+    warning, re-executed on resume) -- but only when it's the LAST line;
+    unparseable content anywhere else in the file is real corruption and
+    must still raise."""
+
+    def test_truncated_last_line_is_dropped_with_warning_and_rerun(self, tmp_path):
+        items = [make_item("item-0"), make_item("item-1")]
+        candidate = FakeModelClient(make_result=lambda *a: success_result())
+        model_key = _model_key(candidate)
+        config = _config()
+
+        run_dir = run_eval(
+            config, model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+        assert candidate.call_count == 2
+
+        rows_path = run_dir.path / "rows.jsonl"
+        lines = rows_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        truncated = lines[-1][: len(lines[-1]) // 2]
+        rows_path.write_text(lines[0] + "\n" + truncated, encoding="utf-8")
+
+        with pytest.warns(UserWarning):
+            result_dir = run_eval(
+                config, model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+            )
+
+        assert result_dir.path == run_dir.path
+        artifact = load_run(result_dir)
+        assert artifact.completed is True
+        assert len(artifact.rows) == 2
+        # 2 calls from the first run + 1 re-executed call for the item whose
+        # trailing row got truncated -- the other item is never re-called.
+        assert candidate.call_count == 3
+
+    def test_load_run_also_tolerates_truncated_last_line(self, tmp_path):
+        items = [make_item("item-0"), make_item("item-1")]
+        model_key = _model_key()
+        config = _config()
+
+        run_dir = run_eval(
+            config, model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+        rows_path = run_dir.path / "rows.jsonl"
+        lines = rows_path.read_text(encoding="utf-8").splitlines()
+        truncated = lines[-1][: len(lines[-1]) // 2]
+        rows_path.write_text(lines[0] + "\n" + truncated, encoding="utf-8")
+
+        with pytest.warns(UserWarning):
+            artifact = load_run(run_dir)
+
+        assert len(artifact.rows) == 1
+
+    def test_midfile_corruption_still_raises_on_resume_and_load(self, tmp_path):
+        items = [make_item("item-0"), make_item("item-1"), make_item("item-2")]
+        model_key = _model_key()
+        config = _config()
+
+        run_dir = run_eval(
+            config, model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+        rows_path = run_dir.path / "rows.jsonl"
+        lines = rows_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 3
+        lines[1] = "{not valid json at all"
+        rows_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        with pytest.raises(json.JSONDecodeError):
+            run_eval(
+                config, model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+            )
+
+        with pytest.raises(json.JSONDecodeError):
+            load_run(run_dir)

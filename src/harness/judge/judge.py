@@ -30,7 +30,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from harness.judge.rubric import FEW_SHOTS, PROMPT_PREAMBLE, RUBRIC_TEXT
-from harness.models import ModelClient
+from harness.models import ModelClient, Usage
 from harness.schema import EmailInput
 
 
@@ -51,12 +51,21 @@ class JudgeResult:
     schema-invalid output) is never coerced to ``"fail"``. ``raw`` is always
     populated so the underlying model response stays inspectable regardless
     of outcome.
+
+    ``usage``/``served_model_version`` (additive, I3) mirror the underlying
+    ``StructuredResult``'s fields exactly -- populated on every call,
+    success or error, since the client always reports them regardless of
+    ``failure``. They exist so callers (the runner, T08) can account for
+    judge-call token cost and observe judge alias drift, which previously
+    had no path out of this module.
     """
 
     verdict: Literal["pass", "fail"] | None
     error: str | None
     rationale: str | None
     raw: str
+    usage: Usage | None = None
+    served_model_version: str | None = None
 
 
 def _render_few_shots() -> str:
@@ -115,6 +124,8 @@ class Judge:
                 error=result.failure,
                 rationale=None,
                 raw=result.raw,
+                usage=result.usage,
+                served_model_version=result.served_model_version,
             )
 
         output = result.output
@@ -130,4 +141,6 @@ class Judge:
             error=None,
             rationale=output.rationale,
             raw=result.raw,
+            usage=result.usage,
+            served_model_version=result.served_model_version,
         )

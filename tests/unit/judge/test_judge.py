@@ -151,6 +151,49 @@ class TestOneCallPerField:
         assert fake.schemas[0] is JudgeVerdict
 
 
+class TestUsageAndServedVersionCaptured:
+    """I3: ``judge_field`` must surface the underlying ``StructuredResult``'s
+    usage and served model version rather than discarding them, on both the
+    success and error paths."""
+
+    def test_pass_verdict_captures_usage_and_served_version(self):
+        output = JudgeVerdict(verdict="pass", rationale="ok")
+        usage = Usage(input_tokens=42, output_tokens=7)
+        fake = _FakeClient(
+            result=StructuredResult(
+                output=output,
+                failure=None,
+                raw="{}",
+                usage=usage,
+                served_model_version="gemini-3.5-flash-002",
+            )
+        )
+        judge = Judge(fake)
+
+        result = judge.judge_field(EMAIL, "issue_summary", "reference text", "candidate text")
+
+        assert result.usage == usage
+        assert result.served_model_version == "gemini-3.5-flash-002"
+
+    def test_error_path_still_captures_usage_and_served_version(self):
+        usage = Usage(input_tokens=11, output_tokens=0)
+        fake = _FakeClient(
+            result=StructuredResult(
+                output=None,
+                failure="schema_invalid",
+                raw="not valid json",
+                usage=usage,
+                served_model_version="gemini-3.5-flash-002",
+            )
+        )
+        judge = Judge(fake)
+
+        result = judge.judge_field(EMAIL, "issue_summary", "reference text", "candidate text")
+
+        assert result.usage == usage
+        assert result.served_model_version == "gemini-3.5-flash-002"
+
+
 class TestPromptContent:
     def test_prompt_includes_rubric_reference_and_candidate_value(self):
         output = JudgeVerdict(verdict="pass", rationale="ok")

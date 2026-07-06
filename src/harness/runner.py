@@ -36,11 +36,16 @@ because nothing upstream pins them):**
   bound (not tuned per-provider). All tasks for a run are submitted to the
   pool upfront, so a worker that finishes a task can otherwise race straight
   to the next queued one before the main thread ever inspects the failed
-  future -- a shared ``threading.Event`` set the instant any task observes
-  ``TransportExhausted``, and checked at the top of every task, is what
-  actually stops that extra, unnecessary spend once a transport failure is
-  known (a task already in flight on another worker when the event is set
-  still runs to completion; only not-yet-started tasks are skipped).
+  future -- a shared ``threading.Event`` set the instant any task raises
+  *any* exception (not just ``TransportExhausted`` -- C2), and checked at
+  the top of every task, is what actually stops that extra, unnecessary
+  spend once a failure is known (a task already in flight on another worker
+  when the event is set still runs to completion; only not-yet-started
+  tasks are skipped). ``run_eval``'s gather loop mirrors this: any worker
+  exception -- transport or otherwise -- triggers
+  ``executor.shutdown(wait=True, cancel_futures=True)`` from a ``finally``
+  block before ``RunAborted`` is raised, so the pool is never left running
+  (and spending) after control returns to the caller.
 - **Missing-judge-verdict representation (binding for T10/T11/T15/T16):** a
   judge error (``JudgeResult.verdict is None``) is recorded as an explicit
   ``None`` in that row's ``field_scores[field]`` -- never a dropped key,
@@ -55,16 +60,33 @@ because nothing upstream pins them):**
   raw response text (``JudgeResult.raw`` is always populated) while
   ``judge_rationales`` is ``None`` (no rationale on error).
 - Per-row ``usage``/``served_model_version`` describe the *candidate* call
-  only. ``Judge``/``JudgeResult`` (T7) deliberately does not surface the
-  underlying judge ``StructuredResult``'s usage or served version to
-  callers, so the runner has no way to observe them through the judge's
-  binding interface -- this is presumably intentional, deferring
-  judge-call cost/version tracking to tracing spans (T09) rather than the
-  JSONL row. Consistently, the fingerprint's ``served_versions`` mapping
-  here only records the candidate's served version; the judge's identity is
-  already covered by ``judge_version()`` (a hash that bakes in the pinned
-  judge model id string), which is a static identity check rather than a
-  runtime alias-drift observation.
+  only; that pair is part of the binding row schema and stays candidate-only
+  on purpose. Judge-call accounting is additive rather than folded into
+  those two fields: ``RunRow.judge_usage`` is a dict keyed by judged-field
+  name holding that field's judge-call token usage (``None`` for a field
+  that was never judged, e.g. a candidate schema-invalid/refusal failure --
+  mirroring ``raw_judge``/``judge_rationales``'s existing None-means-no-call
+  convention). ``RunArtifact.judge_usage_totals()`` sums it across every row,
+  kept separate from ``usage_totals()`` (candidate-only, unchanged) so T16's
+  cost totals can report both distinctly rather than conflating a 2:1
+  call-volume-different pair of costs into one number. The run's judge
+  identity was already covered statically by ``judge_version()`` (a hash
+  baking in the pinned judge model id string); ``served_versions["judge"]``
+  (aggregated from each judged field's ``JudgeResult.served_model_version``,
+  last-call-wins, same convention as the candidate's entry) adds the runtime
+  alias-drift *observation* that static hash can't provide on its own.
+- Run identity (the run directory name, via ``_run_id``, and
+  ``_check_manifest_compatible``'s resume guard) folds in the *requested*
+  candidate and judge model ids from ``config.models`` -- not just the
+  abstract "a"/"b" label. Keying identity on the label alone would let a
+  provider-side or config-side model swap (same label, different served
+  model) silently resume into a stale run's rows: same directory, same
+  manifest, zero new calls, ``completed=True``, for what is actually a
+  different model. Folding the requested model ids into the hash means a
+  swap lands in a *new* run directory automatically; folding them into the
+  compatibility check as well catches the residual case of a hash
+  collision or a hand-edited manifest pointing at a directory that was
+  never regenerated.
 - The manifest stores a fingerprint computed with placeholder
   ``composite_mode=FULL_7`` and ``calibration_verdict="uncalibrated"``,
   because T08 has no certificate (T14 doesn't exist yet) and no report-time
@@ -82,6 +104,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import warnings
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -93,7 +116,6 @@ from harness.config import Config, fingerprint
 from harness.judge.judge import Judge
 from harness.judge.rubric import judge_version as compute_judge_version
 from harness.models import ModelClient, StructuredResult
-from harness.models.retry import TransportExhausted
 from harness.prompts import PromptTemplate
 from harness.schema import GoldenItem, TicketExtraction
 from harness.scoring.composite import DETERMINISTIC_FIELDS, JUDGED_FIELDS, CompositeMode
@@ -139,9 +161,14 @@ class RunDir:
 class RunAborted(Exception):
     """Raised when ``TransportExhausted`` surfaces mid-run (spec §6): a
     measurement error, never scored, distinct from a completed run's normal
-    ``RunDir`` return. The partial JSONL file already written remains on
-    disk -- re-invoking ``run_eval`` with the same arguments resumes from the
-    persisted rows rather than re-spending calls."""
+    ``RunDir`` return. Also raised, with the same distinct outcome, if any
+    *other* worker exception surfaces (C2) -- ``TransportExhausted`` stays
+    the canonical transport-error cause, but callers get exactly one abort
+    outcome to handle regardless of what actually failed; ``.cause`` (and
+    ``__cause__``) always carries the original exception. The partial JSONL
+    file already written remains on disk -- re-invoking ``run_eval`` with
+    the same arguments resumes from the persisted rows rather than
+    re-spending calls."""
 
     def __init__(self, run_dir: RunDir, cause: BaseException) -> None:
         super().__init__(f"Run aborted at {run_dir.path}: {cause!r}")
@@ -168,8 +195,14 @@ class RunRow:
     """One persisted (item, replicate) outcome -- the JSONL row schema
     (binding: ``item_id``, ``replicate``, ``raw_output``, ``raw_judge``,
     ``field_scores``, ``usage``, ``served_model_version``,
-    ``judge_rationales``). See the module docstring for the missing-verdict
-    representation and the usage/served-version scope."""
+    ``judge_rationales``; additive: ``judge_usage``, I3). See the module
+    docstring for the missing-verdict representation and the
+    usage/served-version scope.
+
+    ``judge_usage`` defaults to ``None`` so rows persisted before I3 (no key
+    in the JSONL line at all) still round-trip through ``RunRow(**row)``
+    unchanged -- this is a purely additive field, never a breaking one.
+    """
 
     item_id: str
     replicate: int
@@ -179,6 +212,7 @@ class RunRow:
     usage: dict[str, int]
     served_model_version: str
     judge_rationales: dict[str, str | None]
+    judge_usage: dict[str, dict[str, int] | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -235,7 +269,14 @@ class RunArtifact:
         return sum(1 for row in self.rows for value in row.field_scores.values() if value is None)
 
     def usage_totals(self) -> dict[str, int]:
-        """Summed candidate-call token usage across every persisted row."""
+        """Summed candidate-call token usage across every persisted row.
+
+        Candidate-only by design -- see ``judge_usage_totals()`` for the
+        separate judge-call total (I3); the two are kept apart rather than
+        combined since a caller may want either one visible on its own
+        (e.g. reporting candidate cost distinctly from judge cost) as well
+        as their sum.
+        """
 
         totals = {"input_tokens": 0, "output_tokens": 0}
         for row in self.rows:
@@ -243,9 +284,42 @@ class RunArtifact:
             totals["output_tokens"] += row.usage["output_tokens"]
         return totals
 
+    def judge_usage_totals(self) -> dict[str, int]:
+        """Summed judge-call token usage across every persisted row's
+        ``judge_usage`` (I3, additive).
+
+        Judge calls outnumber candidate calls (one call per judged field per
+        row, vs. one candidate call per row), so this is a distinct total
+        from ``usage_totals()`` rather than folded into it -- T16's mandated
+        cost totals need both. Rows persisted before ``judge_usage`` existed
+        (``None``) and fields never judged (candidate schema-invalid/refusal
+        failures, also ``None``) contribute nothing, not an error.
+        """
+
+        totals = {"input_tokens": 0, "output_tokens": 0}
+        for row in self.rows:
+            if not row.judge_usage:
+                continue
+            for field_usage in row.judge_usage.values():
+                if field_usage is None:
+                    continue
+                totals["input_tokens"] += field_usage["input_tokens"]
+                totals["output_tokens"] += field_usage["output_tokens"]
+        return totals
+
 
 def _canonical_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _requested_candidate_model_id(config: Config, model_key_label: str) -> str:
+    """The pinned, configured model id for this run's candidate label
+    (``config.models.candidate_a`` or ``candidate_b``) -- distinct from
+    ``served_model_version`` (the provider's runtime-reported identifier).
+    Folded into run identity (C1) so a config-side model swap under the same
+    label can never be mistaken for the same run."""
+
+    return config.models.candidate_a if model_key_label == "a" else config.models.candidate_b
 
 
 def _run_id(
@@ -255,10 +329,14 @@ def _run_id(
     prompt_version: int,
     dataset_version: int,
     dataset_path: str,
+    candidate_model_id: str,
+    judge_model_id: str,
 ) -> str:
     sorted_items = sorted(items, key=lambda item: item.id)
     payload = {
         "model_key": model_key_label,
+        "candidate_model_id": candidate_model_id,
+        "judge_model_id": judge_model_id,
         "items": [item.model_dump(mode="json") for item in sorted_items],
         "k": k,
         "prompt_version": prompt_version,
@@ -277,8 +355,19 @@ def _run_dir_path(
     prompt_version: int,
     dataset_version: int,
     dataset_path: str,
+    candidate_model_id: str,
+    judge_model_id: str,
 ) -> Path:
-    run_id = _run_id(model_key_label, items, k, prompt_version, dataset_version, dataset_path)
+    run_id = _run_id(
+        model_key_label,
+        items,
+        k,
+        prompt_version,
+        dataset_version,
+        dataset_path,
+        candidate_model_id,
+        judge_model_id,
+    )
     return runs_root / f"{model_key_label}-{run_id}"
 
 
@@ -291,6 +380,8 @@ def _initial_manifest(
 ) -> dict:
     return {
         "model_key": model_key.label,
+        "candidate_model_id": _requested_candidate_model_id(config, model_key.label),
+        "judge_model_id": config.models.judge,
         "k": k,
         "prompt_version": prompt.version,
         "dataset_path": config.dataset.path,
@@ -319,6 +410,18 @@ def _check_manifest_compatible(
     mismatches: list[str] = []
     if manifest["model_key"] != model_key.label:
         mismatches.append("model_key")
+    # C1: identity must key on the *requested* model ids, not just the
+    # abstract "a"/"b" label -- otherwise swapping a candidate or judge
+    # model under the same label and config shape would resume into a
+    # stale run's rows undetected. ``.get(...)`` tolerates a manifest
+    # written before this field existed; that missing key legitimately
+    # mismatches (never silently compatible-by-absence).
+    if manifest.get("candidate_model_id") != _requested_candidate_model_id(
+        config, model_key.label
+    ):
+        mismatches.append("candidate_model_id")
+    if manifest.get("judge_model_id") != config.models.judge:
+        mismatches.append("judge_model_id")
     if manifest["k"] != k:
         mismatches.append("k")
     if manifest["prompt_version"] != prompt.version:
@@ -331,18 +434,88 @@ def _check_manifest_compatible(
         raise RunConfigMismatch(run_dir_path, mismatches)
 
 
-def _load_completed_keys(rows_path: Path) -> set[tuple[str, int]]:
+def _last_nonblank_line_index(lines: Sequence[str]) -> int | None:
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].strip():
+            return idx
+    return None
+
+
+def _repair_truncated_tail(rows_path: Path) -> None:
+    """Physically drop an unparseable trailing line from ``rows.jsonl``
+    before ``run_eval`` appends anything further to it (I4).
+
+    A crash mid-``fh.write()`` can leave the final line as a JSON fragment
+    with no trailing newline. Left in place, the next process to open the
+    file in append mode would write its next row starting right after that
+    fragment on the *same* line -- silently corrupting a well-formed new row
+    by concatenating it onto dead bytes, so every future read would still
+    find an unparseable trailing line no matter how many times the run is
+    resumed. Dropping the fragment here, once, before any new appends
+    happen, keeps the file well-formed going forward. Warns exactly when it
+    changes something; a no-op if the file is missing, empty, or its last
+    line is already valid JSON.
+    """
+
     if not rows_path.exists():
-        return set()
-    keys: set[tuple[str, int]] = set()
+        return
     with rows_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            keys.add((row["item_id"], row["replicate"]))
-    return keys
+        lines = fh.readlines()
+    last_idx = _last_nonblank_line_index(lines)
+    if last_idx is None:
+        return
+    try:
+        json.loads(lines[last_idx].strip())
+    except json.JSONDecodeError:
+        warnings.warn(
+            f"Dropping truncated trailing line in {rows_path} "
+            f"(will be re-executed on resume): {lines[last_idx].strip()[:200]!r}",
+            stacklevel=2,
+        )
+        rows_path.write_text("".join(lines[:last_idx]), encoding="utf-8")
+
+
+def _read_row_dicts(rows_path: Path) -> list[dict]:
+    """Parse ``rows.jsonl`` into row dicts (I4).
+
+    Tolerates an unparseable *final* non-blank line -- the shape a crash
+    mid-write leaves behind (a truncated JSON fragment, never flushed past
+    the ``fh.flush()`` in ``_run_and_write``'s write path) -- by dropping it
+    with a ``warnings.warn`` rather than raising: that row's ``(item,
+    replicate)`` simply isn't in the completed set, so resuming re-executes
+    it and overwrites the fragment with a full line. An unparseable line
+    anywhere else in the file is real corruption (the process cannot have
+    been mid-write there, since writes only ever append) and still raises
+    ``json.JSONDecodeError`` -- silently swallowing that would hide data
+    loss instead of surfacing it.
+    """
+
+    if not rows_path.exists():
+        return []
+    with rows_path.open("r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+    last_idx = _last_nonblank_line_index(lines)
+
+    rows: list[dict] = []
+    for idx, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            if idx != last_idx:
+                raise
+            warnings.warn(
+                f"Dropping truncated trailing line in {rows_path} "
+                f"(will be re-executed on resume): {line[:200]!r}",
+                stacklevel=2,
+            )
+    return rows
+
+
+def _load_completed_keys(rows_path: Path) -> set[tuple[str, int]]:
+    return {(row["item_id"], row["replicate"]) for row in _read_row_dicts(rows_path)}
 
 
 def _score_row(
@@ -350,7 +523,16 @@ def _score_row(
     replicate: int,
     model_key: ModelKey,
     prompt: PromptTemplate,
-) -> RunRow:
+) -> tuple[RunRow, str | None]:
+    """Score one ``(item, replicate)`` pair.
+
+    Returns the persisted row plus the judge's served model version observed
+    while scoring it (``None`` if no judge call was made at all, e.g. a
+    candidate schema-invalid/refusal failure) -- the caller aggregates that
+    into the manifest's ``served_versions["judge"]`` (I3) without needing a
+    dedicated judge-served-version field on ``RunRow`` itself.
+    """
+
     rendered = prompt.render(item.email)
     result: StructuredResult = model_key.candidate_client.complete_structured(
         rendered, TicketExtraction
@@ -361,7 +543,7 @@ def _score_row(
         # Candidate output is schema-invalid or a refusal: a real candidate
         # failure, scored (spec §6) -- all seven fields 0, raw persisted, no
         # judge calls (there is no candidate value to judge).
-        return RunRow(
+        row = RunRow(
             item_id=item.id,
             replicate=replicate,
             raw_output=result.raw,
@@ -370,7 +552,9 @@ def _score_row(
             usage=usage,
             served_model_version=result.served_model_version,
             judge_rationales=dict.fromkeys(JUDGED_FIELDS),
+            judge_usage=dict.fromkeys(JUDGED_FIELDS),
         )
+        return row, None
 
     output = result.output
     if not isinstance(output, TicketExtraction):
@@ -383,6 +567,8 @@ def _score_row(
     field_scores: dict[str, int | None] = dict(score_deterministic(item.expected, output))
     raw_judge: dict[str, str | None] = {}
     judge_rationales: dict[str, str | None] = {}
+    judge_usage: dict[str, dict[str, int] | None] = {}
+    judge_served_version: str | None = None
     judge = Judge(model_key.judge_client)
     for field_name in JUDGED_FIELDS:
         judge_result = judge.judge_field(
@@ -393,11 +579,21 @@ def _score_row(
         )
         raw_judge[field_name] = judge_result.raw
         judge_rationales[field_name] = judge_result.rationale
+        judge_usage[field_name] = (
+            {
+                "input_tokens": judge_result.usage.input_tokens,
+                "output_tokens": judge_result.usage.output_tokens,
+            }
+            if judge_result.usage is not None
+            else None
+        )
+        if judge_result.served_model_version is not None:
+            judge_served_version = judge_result.served_model_version
         field_scores[field_name] = None if judge_result.verdict is None else int(
             judge_result.verdict == "pass"
         )
 
-    return RunRow(
+    row = RunRow(
         item_id=item.id,
         replicate=replicate,
         raw_output=result.raw,
@@ -406,7 +602,9 @@ def _score_row(
         usage=usage,
         served_model_version=result.served_model_version,
         judge_rationales=judge_rationales,
+        judge_usage=judge_usage,
     )
+    return row, judge_served_version
 
 
 def run_eval(
@@ -422,15 +620,18 @@ def run_eval(
     """Run one candidate over ``dataset`` for ``k`` replicates each.
 
     Persists one JSONL row per ``(item, replicate)`` as soon as it completes.
-    Re-invoking with identical arguments (including ``dataset`` content)
+    Re-invoking with identical arguments (including ``dataset`` content,
+    and the requested candidate/judge model ids in ``config.models`` -- C1)
     resumes at the first missing ``(item, replicate)`` pair without
     re-calling clients for rows that already exist on disk. Raises
-    ``RunAborted`` (never returns) if ``TransportExhausted`` surfaces from
-    any candidate or judge call -- the partial file stays intact.
+    ``RunAborted`` (never returns) if ``TransportExhausted`` -- or any other
+    worker exception, C2 -- surfaces from any candidate or judge call; the
+    partial file stays intact either way.
     """
 
     items = list(dataset)
     runs_root = Path(runs_root)
+    requested_candidate_id = _requested_candidate_model_id(config, model_key.label)
     run_dir_path = _run_dir_path(
         runs_root,
         model_key.label,
@@ -439,6 +640,8 @@ def run_eval(
         prompt.version,
         config.dataset.version,
         config.dataset.path,
+        requested_candidate_id,
+        config.models.judge,
     )
     run_dir = RunDir(path=run_dir_path)
     run_dir_path.mkdir(parents=True, exist_ok=True)
@@ -453,6 +656,10 @@ def run_eval(
         manifest = _initial_manifest(model_key, items, k, prompt, config)
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
+    # I4: drop any dead, unparseable trailing fragment left by a
+    # crash-mid-write *before* anything below opens rows_path for append --
+    # otherwise a fresh row would land on the same line as the fragment.
+    _repair_truncated_tail(rows_path)
     completed = _load_completed_keys(rows_path)
     tasks = [
         (item, replicate)
@@ -464,24 +671,34 @@ def run_eval(
     served_versions: dict[str, str] = dict(manifest.get("served_versions") or {})
     served_versions_lock = threading.Lock()
     write_lock = threading.Lock()
-    # Set the instant any task observes TransportExhausted, and checked at the
-    # top of every task. Submitting the whole task list upfront (below) means a
-    # worker thread can otherwise race straight past a failing task to the next
-    # one in its queue before the main thread ever calls `future.result()` on
-    # the failed future -- this flag is what actually stops that additional,
-    # unnecessary spend once a transport failure is known.
+    # Set the instant any task raises (TransportExhausted or otherwise, C2),
+    # and checked at the top of every task. Submitting the whole task list
+    # upfront (below) means a worker thread can otherwise race straight past
+    # a failing task to the next one in its queue before the main thread
+    # ever calls `future.result()` on the failed future -- this flag is what
+    # actually stops that additional, unnecessary spend once a failure is
+    # known.
     abort_event = threading.Event()
 
     def _run_and_write(item: GoldenItem, replicate: int) -> None:
         if abort_event.is_set():
             return
         try:
-            row = _score_row(item, replicate, model_key, prompt)
-        except TransportExhausted:
+            row, judge_served_version = _score_row(item, replicate, model_key, prompt)
+        except Exception:
+            # C2: ANY worker exception -- not just TransportExhausted --
+            # must set the abort flag immediately, in the worker thread,
+            # before the main thread ever gets a chance to observe it via
+            # `future.result()`. Without this, a non-transport exception
+            # (e.g. a ValueError) would leave abort_event unset, so every
+            # other queued task keeps right on running/spending after the
+            # failure -- the orphaned-pool bug.
             abort_event.set()
             raise
         with served_versions_lock:
             served_versions[f"candidate_{model_key.label}"] = row.served_model_version
+            if judge_served_version is not None:
+                served_versions["judge"] = judge_served_version
         with write_lock, rows_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(asdict(row)) + "\n")
             fh.flush()
@@ -503,14 +720,27 @@ def run_eval(
     if tasks:
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures = {executor.submit(_run_and_write, item, replicate) for item, replicate in tasks}
+        abort_cause: BaseException | None = None
         try:
             for future in as_completed(futures):
                 future.result()
-        except TransportExhausted as exc:
+        except Exception as exc:
+            # C2: TransportExhausted remains the canonical transport-error
+            # cause, but ANY worker exception is still wrapped as
+            # RunAborted -- callers get exactly one distinct abort outcome
+            # regardless of what actually failed. `finally` below guarantees
+            # the executor is always shut down (cancelling not-yet-started
+            # tasks, waiting for in-flight ones to finish) before this
+            # function returns control to the caller on any path -- no
+            # thread pool is ever left orphaned, spending after the raise.
+            abort_cause = exc
+            abort_event.set()
+        finally:
             executor.shutdown(wait=True, cancel_futures=True)
+
+        if abort_cause is not None:
             _write_final_manifest(completed_flag=False)
-            raise RunAborted(run_dir, exc) from exc
-        executor.shutdown(wait=True)
+            raise RunAborted(run_dir, abort_cause) from abort_cause
 
     _write_final_manifest(completed_flag=True)
     return run_dir
@@ -519,7 +749,9 @@ def run_eval(
 def load_run(run_dir: RunDir) -> RunArtifact:
     """Parse a persisted run directory (manifest + JSONL rows) into a
     ``RunArtifact``. Works on both completed and aborted (partial) runs --
-    check ``.completed`` to distinguish them."""
+    check ``.completed`` to distinguish them. Tolerates a truncated trailing
+    row line the same way ``run_eval``'s resume path does (I4, see
+    ``_read_row_dicts``)."""
 
     manifest_path = run_dir.path / _MANIFEST_FILENAME
     rows_path = run_dir.path / _ROWS_FILENAME
@@ -527,14 +759,7 @@ def load_run(run_dir: RunDir) -> RunArtifact:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     items = tuple(GoldenItem.model_validate(item) for item in manifest["items"])
 
-    rows: list[RunRow] = []
-    if rows_path.exists():
-        with rows_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                rows.append(RunRow(**json.loads(line)))
+    rows = tuple(RunRow(**row) for row in _read_row_dicts(rows_path))
 
     return RunArtifact(
         run_dir=run_dir,
@@ -543,7 +768,7 @@ def load_run(run_dir: RunDir) -> RunArtifact:
         prompt_version=manifest["prompt_version"],
         dataset_version=manifest["dataset_version"],
         items=items,
-        rows=tuple(rows),
+        rows=rows,
         served_versions=dict(manifest["served_versions"]),
         judge_version=manifest["judge_version"],
         fingerprint=manifest["fingerprint"],
