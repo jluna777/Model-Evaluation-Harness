@@ -442,3 +442,98 @@ class TestRunnerIntegration:
         assert all(row.field_scores["issue_summary"] is not None for row in artifact.rows)
         # ... but the artifact is flagged untraced (spec §8)
         assert artifact.untraced is True
+
+    def test_untraced_flag_is_sticky_untraced_then_traced(self, monkeypatch, tmp_path):
+        """Regression test: untraced flag is sticky once True.
+
+        Invocation 1: run with trace=None (untraced=True in manifest)
+        Invocation 2: resume same run with a working TraceContext (untraced should stay True)
+        """
+        config = _config()
+        items = [make_item("item-0"), make_item("item-1")]
+
+        # First invocation: no trace, run completes
+        run_dir = run_eval(
+            config,
+            _model_key(),
+            k=1,
+            dataset=items,
+            prompt=EXTRACTION_PROMPT,
+            runs_root=tmp_path,
+            trace=None,
+        )
+        artifact1 = load_run(run_dir)
+        assert artifact1.untraced is True
+        assert artifact1.completed is True
+        assert len(artifact1.rows) == 2
+
+        # Second invocation: resume same run with a working trace context
+        # The dataset is identical, so all items are already completed. When the
+        # manifest is rewritten, it should merge untraced=True from the prior
+        # invocation with untraced=False from the current trace context, resulting
+        # in untraced=True (sticky).
+        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+        fake_client = FakeLangfuseClient()
+        trace = TraceContext.for_run(
+            config, reportable=True, client_factory=lambda: fake_client
+        )
+
+        run_dir2 = run_eval(
+            config,
+            _model_key(),
+            k=1,
+            dataset=items,  # Same dataset as first invocation
+            prompt=EXTRACTION_PROMPT,
+            runs_root=tmp_path,
+            trace=trace,
+        )
+        artifact2 = load_run(run_dir2)
+        # The flag is sticky: once untraced=True, it stays True even with a working trace
+        assert artifact2.untraced is True
+        assert len(artifact2.rows) == 2  # Same items as first invocation
+
+    def test_untraced_flag_is_sticky_traced_then_untraced(self, monkeypatch, tmp_path):
+        """Regression test: untraced flag is sticky once True.
+
+        Invocation 1: run with a working TraceContext (untraced=False in manifest)
+        Invocation 2: resume same run dir with trace=None (untraced should become True via OR)
+        """
+        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+        config = _config()
+
+        # First invocation: working trace, run completes
+        fake_client = FakeLangfuseClient()
+        trace = TraceContext.for_run(
+            config, reportable=True, client_factory=lambda: fake_client
+        )
+
+        run_dir = run_eval(
+            config,
+            _model_key(),
+            k=1,
+            dataset=[make_item("item-0")],
+            prompt=EXTRACTION_PROMPT,
+            runs_root=tmp_path,
+            trace=trace,
+        )
+        artifact1 = load_run(run_dir)
+        assert artifact1.untraced is False
+        assert artifact1.completed is True
+
+        # Second invocation: resume same run dir with no trace context
+        # by adding a new item to the dataset
+        run_dir2 = run_eval(
+            config,
+            _model_key(),
+            k=1,
+            dataset=[make_item("item-0"), make_item("item-1")],
+            prompt=EXTRACTION_PROMPT,
+            runs_root=tmp_path,
+            trace=None,
+        )
+        artifact2 = load_run(run_dir2)
+        # Second invocation is untraced, so untraced flag becomes True via OR
+        assert artifact2.untraced is True
+        assert len(artifact2.rows) == 2  # Both items now complete

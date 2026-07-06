@@ -783,7 +783,17 @@ def run_eval(
         final_manifest = dict(manifest)
         final_manifest["served_versions"] = dict(served_versions)
         final_manifest["completed"] = completed_flag
-        final_manifest["untraced"] = trace.untraced if trace is not None else True
+        # The untraced flag is sticky: once True, it stays True across resumed invocations.
+        # On a fresh run (no prior rows), use current trace state. On a resumed run, merge
+        # with the prior untraced state via OR logic.
+        current_untraced = trace.untraced if trace is not None else True
+        if len(completed) > 0:
+            # Resumed run: merge with the prior untraced flag via OR (sticky once True)
+            persisted_untraced = bool(manifest.get("untraced", True))
+            final_manifest["untraced"] = persisted_untraced or current_untraced
+        else:
+            # Fresh run: set from current invocation only
+            final_manifest["untraced"] = current_untraced
         final_manifest["fingerprint"] = fingerprint(
             effective_config,
             served_versions,
