@@ -1,0 +1,16 @@
+{
+  "judge_version": "fixture-judge-version-hash",
+  "overall_kappa": 0.62,
+  "kappa_ci": [
+    0.25,
+    0.8
+  ],
+  "per_candidate_kappa": {
+    "a": 0.55,
+    "b": 0.68
+  },
+  "verdict": "adequate_with_caveat",
+  "ceiling_kappa": null,
+  "label_file_hash": "deadbeefcafe",
+  "date": "2026-06-01"
+}

@@ -1,0 +1,135 @@
+{
+  "model_key": "b",
+  "k": 2,
+  "prompt_version": 1,
+  "dataset_path": "tests/fixtures/reports/dataset.jsonl",
+  "dataset_version": 1,
+  "item_ids": [
+    "r1",
+    "r2",
+    "r3",
+    "r4"
+  ],
+  "items": [
+    {
+      "id": "r1",
+      "email": {
+        "from_": "r1@example.com",
+        "subject": "Subject for r1",
+        "body": "Body text for r1."
+      },
+      "expected": {
+        "category": "billing",
+        "priority": "normal",
+        "customer_name": "Jane Doe",
+        "order_id": null,
+        "product_name": null,
+        "issue_summary": "Reference issue summary.",
+        "requested_action": "Reference requested action."
+      },
+      "meta": {
+        "slice": "nominal",
+        "categories": [
+          "billing"
+        ],
+        "difficulty": 1,
+        "generator": "gpt-4",
+        "edited": false,
+        "notes": ""
+      }
+    },
+    {
+      "id": "r2",
+      "email": {
+        "from_": "r2@example.com",
+        "subject": "Subject for r2",
+        "body": "Body text for r2."
+      },
+      "expected": {
+        "category": "billing",
+        "priority": "normal",
+        "customer_name": "Jane Doe",
+        "order_id": null,
+        "product_name": null,
+        "issue_summary": "Reference issue summary.",
+        "requested_action": "Reference requested action."
+      },
+      "meta": {
+        "slice": "nominal",
+        "categories": [
+          "shipping",
+          "billing"
+        ],
+        "difficulty": 1,
+        "generator": "gpt-4",
+        "edited": false,
+        "notes": ""
+      }
+    },
+    {
+      "id": "r3",
+      "email": {
+        "from_": "r3@example.com",
+        "subject": "Subject for r3",
+        "body": "Body text for r3."
+      },
+      "expected": {
+        "category": "billing",
+        "priority": "normal",
+        "customer_name": "Jane Doe",
+        "order_id": null,
+        "product_name": null,
+        "issue_summary": "Reference issue summary.",
+        "requested_action": "Reference requested action."
+      },
+      "meta": {
+        "slice": "adversarial",
+        "categories": [
+          "account"
+        ],
+        "difficulty": 3,
+        "generator": "gpt-4",
+        "edited": false,
+        "notes": ""
+      }
+    },
+    {
+      "id": "r4",
+      "email": {
+        "from_": "r4@example.com",
+        "subject": "Subject for r4",
+        "body": "Body text for r4."
+      },
+      "expected": {
+        "category": "billing",
+        "priority": "normal",
+        "customer_name": "Jane Doe",
+        "order_id": null,
+        "product_name": null,
+        "issue_summary": "Reference issue summary.",
+        "requested_action": "Reference requested action."
+      },
+      "meta": {
+        "slice": "adversarial",
+        "categories": [
+          "product"
+        ],
+        "difficulty": 2,
+        "generator": "gpt-4",
+        "edited": false,
+        "notes": ""
+      }
+    }
+  ],
+  "served_versions": {
+    "candidate_b": "candidate-b-fixture",
+    "judge": "judge-fixture"
+  },
+  "judge_version": "fixture-judge-version-hash",
+  "composite_mode": "FULL_7",
+  "calibration_verdict": "uncalibrated",
+  "fingerprint": "fixture-fingerprint-hash",
+  "completed": true,
+  "untraced": false,
+  "created_at": "2026-07-04T00:00:00+00:00"
+}
