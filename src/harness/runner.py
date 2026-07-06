@@ -108,6 +108,7 @@ import threading
 import warnings
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -121,6 +122,7 @@ from harness.prompts import PromptTemplate
 from harness.schema import GoldenItem, TicketExtraction
 from harness.scoring.composite import DETERMINISTIC_FIELDS, JUDGED_FIELDS, CompositeMode
 from harness.scoring.deterministic import score_deterministic
+from harness.tracing import TraceContext
 
 ALL_FIELDS: tuple[str, ...] = DETERMINISTIC_FIELDS + JUDGED_FIELDS
 
@@ -233,6 +235,15 @@ class RunArtifact:
       comparison fingerprint).
     - ``completed``: ``False`` for a run loaded mid-abort (before resuming);
       ``True`` once every ``(item, replicate)`` task has a persisted row.
+    - ``untraced`` (additive, T09): ``True`` unless a working ``TraceContext``
+      (spec §8) was supplied to ``run_eval`` for the *entire* run -- no
+      ``TraceContext`` at all, a keyless dev context, or a context that hit a
+      mid-run Langfuse transport failure all land here as ``True``. A
+      manifest written before this field existed has no key at all;
+      ``load_run`` defaults that to ``True`` (never silently assume a
+      pre-T09 run was traced). Untraced artifacts can never feed a baseline
+      or the README (enforced at those call sites, T14/T16/T19 -- this field
+      just makes the fact reliably observable).
     """
 
     run_dir: RunDir
@@ -246,6 +257,7 @@ class RunArtifact:
     judge_version: str
     fingerprint: str
     completed: bool
+    untraced: bool
 
     def rows_for_item(self, item_id: str) -> tuple[RunRow, ...]:
         """All persisted replicates for one item, in persisted order."""
@@ -395,6 +407,7 @@ def _initial_manifest(
         "calibration_verdict": "uncalibrated",
         "fingerprint": None,
         "completed": False,
+        "untraced": True,
         "created_at": datetime.now(UTC).isoformat(),
     }
 
@@ -542,6 +555,7 @@ def _score_row(
     replicate: int,
     model_key: ModelKey,
     prompt: PromptTemplate,
+    trace: TraceContext | None,
 ) -> tuple[RunRow, str | None]:
     """Score one ``(item, replicate)`` pair.
 
@@ -550,12 +564,25 @@ def _score_row(
     candidate schema-invalid/refusal failure) -- the caller aggregates that
     into the manifest's ``served_versions["judge"]`` (I3) without needing a
     dedicated judge-served-version field on ``RunRow`` itself.
+
+    ``trace`` (T09, additive) wraps the candidate call and each judge call in
+    a Langfuse span when tracing is active, and attaches this row's field
+    scores to a per-item span once they're known (spec §8). ``None`` -- the
+    default everywhere upstream -- keeps this identical to pre-T09 behavior:
+    every ``trace.*`` call site below is skipped via ``nullcontext()``/an
+    early return, never imposing tracing on a caller that didn't ask for it.
     """
 
     rendered = prompt.render(item.email)
-    result: StructuredResult = model_key.candidate_client.complete_structured(
-        rendered, TicketExtraction
+    candidate_span = (
+        trace.candidate_span(item_id=item.id, replicate=replicate)
+        if trace is not None
+        else nullcontext()
     )
+    with candidate_span:
+        result: StructuredResult = model_key.candidate_client.complete_structured(
+            rendered, TicketExtraction
+        )
     usage = {"input_tokens": result.usage.input_tokens, "output_tokens": result.usage.output_tokens}
 
     if result.failure is not None:
@@ -573,6 +600,10 @@ def _score_row(
             judge_rationales=dict.fromkeys(JUDGED_FIELDS),
             judge_usage=dict.fromkeys(JUDGED_FIELDS),
         )
+        if trace is not None:
+            trace.record_item_scores(
+                item_id=item.id, replicate=replicate, field_scores=row.field_scores
+            )
         return row, None
 
     output = result.output
@@ -590,12 +621,18 @@ def _score_row(
     judge_served_version: str | None = None
     judge = Judge(model_key.judge_client)
     for field_name in JUDGED_FIELDS:
-        judge_result = judge.judge_field(
-            item.email,
-            field_name,
-            getattr(item.expected, field_name),
-            getattr(output, field_name),
+        judge_span = (
+            trace.judge_span(item_id=item.id, replicate=replicate, field=field_name)
+            if trace is not None
+            else nullcontext()
         )
+        with judge_span:
+            judge_result = judge.judge_field(
+                item.email,
+                field_name,
+                getattr(item.expected, field_name),
+                getattr(output, field_name),
+            )
         raw_judge[field_name] = judge_result.raw
         judge_rationales[field_name] = judge_result.rationale
         judge_usage[field_name] = (
@@ -611,6 +648,9 @@ def _score_row(
         field_scores[field_name] = None if judge_result.verdict is None else int(
             judge_result.verdict == "pass"
         )
+
+    if trace is not None:
+        trace.record_item_scores(item_id=item.id, replicate=replicate, field_scores=field_scores)
 
     row = RunRow(
         item_id=item.id,
@@ -635,6 +675,7 @@ def run_eval(
     prompt: PromptTemplate,
     runs_root: str | Path = DEFAULT_RUNS_ROOT,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    trace: TraceContext | None = None,
 ) -> RunDir:
     """Run one candidate over ``dataset`` for ``k`` replicates each.
 
@@ -646,6 +687,16 @@ def run_eval(
     ``RunAborted`` (never returns) if ``TransportExhausted`` -- or any other
     worker exception, C2 -- surfaces from any candidate or judge call; the
     partial file stays intact either way.
+
+    ``trace`` (T09, additive, keyword-only, default ``None``) is an optional
+    ``TraceContext`` (spec §8): when supplied, every candidate/judge call
+    becomes a Langfuse span and each row's field scores are attached per
+    item. Its absence changes nothing else about this function -- the
+    manifest's ``untraced`` flag is simply ``True`` (no ``TraceContext`` at
+    all is indistinguishable, for reporting purposes, from one that never
+    got working credentials). A mid-run Langfuse transport failure inside
+    ``trace`` degrades to untraced on its own (bounded degradation, spec §8)
+    and never raises here -- it can never turn into a ``RunAborted``.
     """
 
     items = list(dataset)
@@ -703,7 +754,7 @@ def run_eval(
         if abort_event.is_set():
             return
         try:
-            row, judge_served_version = _score_row(item, replicate, model_key, prompt)
+            row, judge_served_version = _score_row(item, replicate, model_key, prompt, trace)
         except Exception:
             # C2: ANY worker exception -- not just TransportExhausted --
             # must set the abort flag immediately, in the worker thread,
@@ -723,10 +774,16 @@ def run_eval(
             fh.flush()
 
     def _write_final_manifest(*, completed_flag: bool) -> None:
+        # Flush before reading `trace.untraced` so a flush-time transport
+        # failure (spec §8's bounded degradation) is still reflected in this
+        # invocation's manifest -- `flush()` itself never raises.
+        if trace is not None:
+            trace.flush()
         effective_config = config.model_copy(update={"prompt_version": prompt.version})
         final_manifest = dict(manifest)
         final_manifest["served_versions"] = dict(served_versions)
         final_manifest["completed"] = completed_flag
+        final_manifest["untraced"] = trace.untraced if trace is not None else True
         final_manifest["fingerprint"] = fingerprint(
             effective_config,
             served_versions,
@@ -792,4 +849,8 @@ def load_run(run_dir: RunDir) -> RunArtifact:
         judge_version=manifest["judge_version"],
         fingerprint=manifest["fingerprint"],
         completed=manifest["completed"],
+        # T09, additive: a manifest written before this field existed has no
+        # key at all -- default to untraced rather than silently assume a
+        # pre-T09 run was traced (spec §8).
+        untraced=bool(manifest.get("untraced", True)),
     )
