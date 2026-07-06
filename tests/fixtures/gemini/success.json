@@ -1,0 +1,22 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "{\"category\": \"shipping\", \"priority\": \"high\", \"customer_name\": \"Pat Rivera\", \"order_id\": \"ORD-77213\", \"product_name\": \"Wireless Headphones\", \"issue_summary\": \"Replacement headphones arrived broken.\", \"requested_action\": \"Refund order ORD-77213.\"}"
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 210,
+    "candidatesTokenCount": 68,
+    "totalTokenCount": 278
+  },
+  "modelVersion": "gemini-3.5-flash-002"
+}

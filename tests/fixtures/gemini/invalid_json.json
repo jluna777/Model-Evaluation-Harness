@@ -1,0 +1,22 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "The candidate value looks correct to me, no JSON here."
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 150,
+    "candidatesTokenCount": 12,
+    "totalTokenCount": 162
+  },
+  "modelVersion": "gemini-3.5-flash-002"
+}

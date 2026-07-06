@@ -1,4 +1,4 @@
-"""Live smoke test for the candidate clients (T06).
+"""Live smoke test for the candidate and judge clients (T06/T07).
 
 Marked ``live`` and excluded from the default test run (default `-m "not
 live"` in ``pyproject.toml``). Opt in explicitly:
@@ -7,10 +7,10 @@ live"` in ``pyproject.toml``). Opt in explicitly:
 
 Hits real provider APIs once against a trivial extraction prompt to confirm
 the request/response wiring in ``anthropic_client.py`` / ``openai_client.py``
-matches the live SDK surface, not just the mocked transports in
-``tests/unit/models/``. Skips (rather than fails) when API keys are absent
-so CI -- which never selects the ``live`` marker -- and contributors without
-keys are unaffected.
+/ ``gemini_client.py`` matches the live SDK surface, not just the mocked
+transports in ``tests/unit/models/``. Skips (rather than fails) when API
+keys are absent so CI -- which never selects the ``live`` marker -- and
+contributors without keys are unaffected.
 """
 
 from __future__ import annotations
@@ -20,8 +20,10 @@ import os
 import anthropic
 import openai
 import pytest
+from google import genai
 
 from harness.models.anthropic_client import AnthropicClient
+from harness.models.gemini_client import GeminiClient
 from harness.models.openai_client import OpenAIClient
 from harness.schema import TicketExtraction
 
@@ -70,6 +72,22 @@ class TestOpenAILiveSmoke:
         result = client.complete_structured(_PROMPT, TicketExtraction)
 
         print("OpenAI live smoke result:", result)
+        assert result.raw
+        assert result.served_model_version
+        assert result.failure in (None, "schema_invalid", "refusal")
+
+
+class TestGeminiLiveSmoke:
+    def test_complete_structured_against_real_api(self):
+        api_key = _require_key("GEMINI_API_KEY")
+        client = GeminiClient(
+            model="gemini-3.5-flash",
+            client=genai.Client(api_key=api_key),
+        )
+
+        result = client.complete_structured(_PROMPT, TicketExtraction)
+
+        print("Gemini live smoke result:", result)
         assert result.raw
         assert result.served_model_version
         assert result.failure in (None, "schema_invalid", "refusal")

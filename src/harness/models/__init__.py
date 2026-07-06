@@ -1,7 +1,7 @@
 """``ModelClient`` protocol and structured-completion result (spec §2, §6).
 
-Exactly three hand-written clients speak this protocol -- Anthropic and
-OpenAI (this ticket), Gemini (T07) -- no plugin system (constitution §5).
+Exactly three hand-written clients speak this protocol -- Anthropic, OpenAI
+(T06), and Gemini (T07) -- no plugin system (constitution §5).
 Each wraps its SDK's native structured-output mechanism and returns a
 provider-agnostic ``StructuredResult`` so the runner (T08) can treat all
 three uniformly.

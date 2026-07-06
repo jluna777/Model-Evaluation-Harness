@@ -1,0 +1,20 @@
+{
+  "candidates": [
+    {
+      "finishReason": "SAFETY",
+      "index": 0,
+      "safetyRatings": [
+        {
+          "category": "HARM_CATEGORY_HARASSMENT",
+          "probability": "HIGH"
+        }
+      ]
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 96,
+    "candidatesTokenCount": 0,
+    "totalTokenCount": 96
+  },
+  "modelVersion": "gemini-3.5-flash-002"
+}
