@@ -272,6 +272,17 @@ class TestGateSummaryGolden:
         # Relative link to docs/gate-design.md.
         assert "[docs/gate-design.md](docs/gate-design.md)" in actual
 
+    def test_mde_line_interpolates_alpha_dynamically(self):
+        """Verify that the MDE line uses data.alpha, not hardcoded 0.05.
+        Ensure consistency between config alpha and MDE line alpha."""
+        data = _gate_summary_data(alpha=0.01)
+
+        actual = render_gate_summary(data)
+
+        # Both the config line and MDE line should reflect alpha=0.01.
+        assert "- alpha: 0.01" in actual
+        assert "MDE (α=0.01, 80% power)" in actual
+
 
 # --------------------------------------------------------------------------
 # Certificate header / banner-state behavior (not the golden happy path).

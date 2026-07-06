@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run pytest)",
+      "Bash(uv run pytest *)",
+      "Bash(uv run ruff check)",
+      "Bash(uv run ruff check *)",
+      "Edit",
+      "Write",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git show *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "mcp__plugin_default_azure__repo_get_file_content",
+      "mcp__plugin_default_azure__search_code",
+      "mcp__plugin_default_azure__repo_list_repos_by_project",
+      "mcp__claude_ai_Atlassian_Rovo__searchJiraIssuesUsingJql",
+      "mcp__claude_ai_Atlassian_Rovo__getJiraIssue",
+      "mcp__claude_ai_Atlassian_Rovo__getAccessibleAtlassianResources",
+      "mcp__claude_ai_Atlassian_Rovo__searchConfluenceUsingCql",
+      "mcp__plugin_default_atlassian__searchJiraIssuesUsingJql",
+      "mcp__plugin_default_chrome__take_screenshot",
+      "mcp__claude_ai_Microsoft_365__sharepoint_search"
+    ]
+  }
+}

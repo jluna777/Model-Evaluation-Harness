@@ -857,7 +857,7 @@ def render_gate_summary(data: GateSummaryData) -> str:
         warning = _sparse_delta_warning(candidate.m_nonzero)
         if warning is not None:
             lines.append(f"- {warning}")
-        lines.append(f"- MDE (α=0.05, 80% power): **{candidate.mde:.2f}** points")
+        lines.append(f"- MDE (α={data.alpha}, 80% power): **{candidate.mde:.2f}** points")
         lines.append(
             f"- Judge-error exclusions: {candidate.judge_error_excluded} item(s) excluded "
             "from paired deltas (a missing judged field is never scored as a fail)"
