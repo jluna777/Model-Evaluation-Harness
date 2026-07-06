@@ -804,3 +804,45 @@ class TestTruncatedTrailingLine:
 
         with pytest.raises(json.JSONDecodeError):
             load_run(run_dir)
+
+    def test_stale_repair_tmp_is_cleaned_up_and_repair_completes(self, tmp_path):
+        """Simulate the killed-mid-repair state: valid rows.jsonl + stale
+        .repair-tmp with partial content. On resume, the stale tmp should be
+        removed, rows.jsonl retains all valid rows, and repair completes."""
+        items = [make_item("item-0"), make_item("item-1")]
+        candidate = FakeModelClient(make_result=lambda *a: success_result())
+        model_key = _model_key(candidate)
+        config = _config()
+
+        # First run to create valid rows.jsonl with 2 completed items.
+        run_dir = run_eval(
+            config, model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+        assert candidate.call_count == 2
+
+        rows_path = run_dir.path / "rows.jsonl"
+        repair_tmp = rows_path.with_suffix(".jsonl.repair-tmp")
+
+        # Read the valid rows.
+        lines = rows_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+
+        # Simulate the killed-mid-repair state: keep rows.jsonl intact, but
+        # create a stale repair-tmp with partial content (as if a prior repair
+        # was killed between writing the temp and the os.replace).
+        repair_tmp.write_text(lines[0] + "\n", encoding="utf-8")
+
+        # On resume, the stale tmp should be removed, rows.jsonl stays intact
+        # with all valid rows, and everything completes successfully.
+        result_dir = run_eval(
+            config, model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+
+        assert result_dir.path == run_dir.path
+        assert not repair_tmp.exists(), "stale repair-tmp should be cleaned up"
+        artifact = load_run(result_dir)
+        assert artifact.completed is True
+        assert len(artifact.rows) == 2
+        # No additional candidate calls should be made since both rows
+        # survived the stale tmp scenario.
+        assert candidate.call_count == 2

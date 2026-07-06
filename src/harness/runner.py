@@ -103,6 +103,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import warnings
 from collections.abc import Sequence
@@ -455,10 +456,21 @@ def _repair_truncated_tail(rows_path: Path) -> None:
     happen, keeps the file well-formed going forward. Warns exactly when it
     changes something; a no-op if the file is missing, empty, or its last
     line is already valid JSON.
+
+    Uses atomic file replacement (write to temp file, then os.replace) to
+    ensure a crash during repair cannot destroy the original rows.jsonl.
+    Cleans up any stale temp file from a prior killed repair at the start.
     """
 
     if not rows_path.exists():
         return
+
+    # Clean up any stale temp file from a prior killed repair; the original
+    # rows.jsonl is intact in that case, so just delete the temp and redo.
+    repair_tmp = rows_path.with_suffix(".jsonl.repair-tmp")
+    if repair_tmp.exists():
+        repair_tmp.unlink()
+
     with rows_path.open("r", encoding="utf-8") as fh:
         lines = fh.readlines()
     last_idx = _last_nonblank_line_index(lines)
@@ -472,7 +484,14 @@ def _repair_truncated_tail(rows_path: Path) -> None:
             f"(will be re-executed on resume): {lines[last_idx].strip()[:200]!r}",
             stacklevel=2,
         )
-        rows_path.write_text("".join(lines[:last_idx]), encoding="utf-8")
+        # Write repaired content to a sibling temp file in the same directory,
+        # then atomically replace the original with os.replace (atomic for
+        # same-volume renames on Windows and POSIX).
+        with repair_tmp.open("w", encoding="utf-8") as fh:
+            fh.write("".join(lines[:last_idx]))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(str(repair_tmp), str(rows_path))
 
 
 def _read_row_dicts(rows_path: Path) -> list[dict]:
