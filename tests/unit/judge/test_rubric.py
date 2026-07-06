@@ -1,5 +1,7 @@
 from dataclasses import replace
+from pathlib import Path
 
+from harness.config import load_config
 from harness.judge import rubric
 
 RUBRIC_SENTENCE = (
@@ -71,3 +73,11 @@ class TestJudgeVersionHash:
         # must reproduce the exact same digest every time.
         digests = {rubric.judge_version() for _ in range(5)}
         assert len(digests) == 1
+
+
+class TestJudgeModelIdSync:
+    def test_judge_model_id_matches_default_config(self):
+        """Enforce that JUDGE_MODEL_ID stays in sync with configs/default.yaml."""
+        config_path = Path(__file__).parents[3] / "configs" / "default.yaml"
+        config = load_config(config_path)
+        assert rubric.JUDGE_MODEL_ID == config.models.judge
