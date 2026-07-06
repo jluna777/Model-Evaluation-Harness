@@ -217,3 +217,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .superpowers/
+
+# Generated run artifacts (spec §10, repo layout contract): results/ is
+# gitignored except results/published/, the committed evidence for numbers
+# that appear in the README.
+/results/*
+!/results/published/
