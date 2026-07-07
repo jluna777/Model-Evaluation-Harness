@@ -40,10 +40,19 @@ class TestExtractionPromptPlaceholder:
 # spec §1's canonical tie-break sentence, copied verbatim -- this is the exact
 # string that must appear in the frozen prompt (T12 acceptance criterion).
 TIE_BREAK_SENTENCE = (
-    "the ticket describes the primary request — the first actionable request "
-    "in the newest, non-quoted part of the email, unless a later statement "
-    "there explicitly retracts or supersedes it, in which case the superseding "
-    "request is primary."
+    "The ticket describes ONE primary request. Determine it as follows:\n"
+    "1. Consider only the newest, non-quoted part of the email. Quoted or forwarded "
+    "content below it (lines starting with '>', earlier messages introduced by headers "
+    "like \"On ... wrote:\", or trailing prior threads) is earlier conversation: any "
+    "request made there is already superseded by the newest message and is never the "
+    "primary request.\n"
+    "2. Within the newest, non-quoted text, the primary request is the first actionable "
+    "request — unless a later statement in that same text explicitly retracts or "
+    "supersedes it, in which case the superseding request is primary.\n"
+    "3. When the newest text refers to quoted content — such as accepting an option "
+    "support offered earlier — use the quoted content to describe the request precisely. "
+    "Entity fields (customer_name, order_id, product_name) may likewise be resolved from "
+    "anywhere in the email, including quoted or forwarded sections."
 )
 
 

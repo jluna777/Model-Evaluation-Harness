@@ -11,7 +11,7 @@ One-line identity: a structured-extraction eval harness with a calibrated LLM ju
 
 Extract a structured support ticket from a customer support email.
 
-**Input:** one email — `from`, `subject`, `body` (body may contain quoted replies/forwarded content).
+**Input:** one email — `from`, `subject`, `body` (body may contain quoted replies/forwarded content). Each email is extracted independently; threading or deduplication across separate emails is upstream triage, out of v1 scope.
 
 **Output schema (`TicketExtraction`, Pydantic):**
 
@@ -27,7 +27,14 @@ Extract a structured support ticket from a customer support email.
 
 **Normalization for entity fields:** trim, casefold, collapse internal whitespace; `None` matches only `None`. Fields absent from the email have reference value `None`; OpenAI strict mode cannot omit fields, so `None`/null is the required "not present" encoding for both providers.
 
-**Tie-break rule (multi-request emails), canonical wording (amended 2026-07-07):** *the ticket describes the primary request — the first actionable request in the newest, non-quoted part of the email, unless a later statement there explicitly retracts or supersedes it, in which case the superseding request is primary.* This sentence appears verbatim in the extraction prompt and governs every reference answer. Secondary requests are omitted from reference answers. Multi-ticket extraction (one ticket per request, variable-length output) is a noted v2 direction — it would showcase set-valued scoring but requires alignment machinery cut from v1.
+**Primary-request rule (multi-request emails), canonical wording (amended and restructured 2026-07-07):** the following three-step rule appears verbatim in the extraction prompt and governs every reference answer:
+
+> The ticket describes ONE primary request. Determine it as follows:
+> 1. Consider only the newest, non-quoted part of the email. Quoted or forwarded content below it (lines starting with '>', earlier messages introduced by headers like "On ... wrote:", or trailing prior threads) is earlier conversation: any request made there is already superseded by the newest message and is never the primary request.
+> 2. Within the newest, non-quoted text, the primary request is the first actionable request — unless a later statement in that same text explicitly retracts or supersedes it, in which case the superseding request is primary.
+> 3. When the newest text refers to quoted content — such as accepting an option support offered earlier — use the quoted content to describe the request precisely. Entity fields (customer_name, order_id, product_name) may likewise be resolved from anywhere in the email, including quoted or forwarded sections.
+
+Secondary requests are omitted from reference answers. Multi-ticket extraction (one ticket per request, variable-length output) is a noted v2 direction — it would showcase set-valued scoring but requires alignment machinery cut from v1.
 
 **Extraction prompts:** one shared, versioned prompt template for both candidates; schema delivered via each provider's native structured-output mechanism (Anthropic `output_config.format`, OpenAI `json_schema` strict).
 
