@@ -384,6 +384,52 @@ def _run_dir_path(
     return runs_root / f"{model_key_label}-{run_id}"
 
 
+def find_completed_run(
+    config: Config,
+    label: str,
+    *,
+    k: int,
+    dataset: Sequence[GoldenItem],
+    prompt: PromptTemplate,
+    runs_root: str | Path = DEFAULT_RUNS_ROOT,
+) -> RunDir | None:
+    """Public counterpart to ``run_eval``'s own run-directory computation
+    (module docstring, C1): returns the ``RunDir`` for this exact (label,
+    dataset content, k, prompt version, dataset version/path, requested
+    candidate/judge model ids) identity IFF a manifest already exists there
+    with ``completed: true`` -- ``None`` otherwise, whether the directory is
+    altogether absent or holds an incomplete/aborted manifest. Never creates
+    a directory and never touches a client.
+
+    Exists so callers outside this module (the CLI's run-identity reuse) never
+    need to recompute -- or duplicate -- ``_run_dir_path``'s hash by hand
+    (which is exactly what would let the two drift). ``_run_dir_path`` itself
+    stays private; this is the one supported way to ask "does a completed run
+    already exist for these inputs?" from outside ``runner.py``.
+    """
+
+    items = list(dataset)
+    candidate_model_id = _requested_candidate_model_id(config, label)
+    run_dir_path = _run_dir_path(
+        Path(runs_root),
+        label,
+        items,
+        k,
+        prompt.version,
+        config.dataset.version,
+        config.dataset.path,
+        candidate_model_id,
+        config.models.judge,
+    )
+    manifest_path = run_dir_path / _MANIFEST_FILENAME
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not manifest.get("completed"):
+        return None
+    return RunDir(path=run_dir_path)
+
+
 def _initial_manifest(
     model_key: ModelKey,
     items: Sequence[GoldenItem],

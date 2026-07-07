@@ -26,14 +26,14 @@ back two distinct claims:
   path.
 
 **Run-identity reuse (``compare``, and incidentally ``run``):** before
-constructing anything, ``_existing_complete_run`` recomputes the exact
-deterministic run-directory path ``run_eval`` (``runner.py``) would use for
-this invocation's (label, items, k, prompt version, dataset version/path,
-requested candidate/judge model ids) by calling ``runner._run_dir_path``
-directly rather than re-implementing its hash, so the two can never drift.
-If a manifest already exists there with ``completed: true``, it is loaded
-directly and no client is ever constructed for that candidate; otherwise
-``_build_model_key`` + ``run_eval`` run (and resume) as usual. This is what
+constructing anything, ``_get_or_run`` calls ``runner.find_completed_run`` --
+the public counterpart to ``run_eval``'s own deterministic run-directory
+computation for this invocation's (label, items, k, prompt version, dataset
+version/path, requested candidate/judge model ids) -- so the two can never
+drift out of sync with each other. If a manifest already exists there with
+``completed: true``, it is loaded directly and no client is ever constructed
+for that candidate; otherwise ``_build_model_key`` + ``run_eval`` run (and
+resume) as usual. This is what
 "reuses existing run artifacts when fingerprints match; re-runs otherwise"
 (spec §6) means operationally: the run directory's own name already encodes
 everything a fingerprint match would require except the runtime-observed
@@ -67,16 +67,28 @@ certificate-absent branch reads it at all) -- ``rescore`` should never
 demand recalibration just to reprint an existing run's numbers.
 
 **Expected-failure exit mapping:** ``RunAborted``, ``RunConfigMismatch``,
-``MissingTracingError``, and ``MissingCertificateError`` are the enumerated
-"expected failure" set -- caught uniformly by
+``MissingTracingError``, ``MissingCertificateError``, and ``MissingApiKeyError``
+are the enumerated "expected failure" set -- caught uniformly by
 ``_clean_exit_on_expected_errors`` and turned into a one-line ``stderr``
 message plus exit code 1, never a traceback. Any other exception (a bad
 ``--config``/``--dataset`` path, a malformed dataset file, ...) is a genuine
 usage bug and is left to propagate normally.
+
+**Missing provider API keys (``MissingApiKeyError``):** ``_build_model_key``
+checks each provider's required env var itself, before constructing any SDK
+client, rather than letting the SDK's own construction-time exception surface
+directly -- ``openai.OpenAI()`` raises ``openai.OpenAIError`` and
+``genai.Client()`` raises ``ValueError`` when their key is absent, and
+neither type is a stable, provider-agnostic contract worth hard-coding into
+the mapping above. See ``MissingApiKeyError``'s own docstring for the
+env-var names (read from the installed SDKs) and the construction-time
+fallback wrap that backs this up.
 """
 
 import hashlib
 import json
+import os
+from collections.abc import Callable
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -87,7 +99,6 @@ import openai
 import typer
 from google import genai
 
-import harness.runner as runner_module
 from harness.config import Config, load_config
 from harness.models import ModelClient
 from harness.models.anthropic_client import AnthropicClient
@@ -101,6 +112,7 @@ from harness.runner import (
     RunAborted,
     RunConfigMismatch,
     RunDir,
+    find_completed_run,
     load_run,
     run_eval,
 )
@@ -189,56 +201,97 @@ def _load_certificate(path: Path = DEFAULT_CERTIFICATE_PATH) -> Certificate | No
 # --------------------------------------------------------------------------
 
 
+class MissingApiKeyError(Exception):
+    """Raised by ``_build_model_key`` when a provider's required API key
+    environment variable is absent. Checked eagerly, before any SDK client is
+    constructed, so a missing key always surfaces as this one clean, one-line
+    message -- never an unmapped SDK exception racing a traceback to the
+    user. Empirically: ``openai.OpenAI()`` raises ``openai.OpenAIError`` and
+    ``genai.Client()`` raises ``ValueError`` at construction when their key is
+    absent; neither type is part of any SDK's stable public contract, so
+    catching either by name in ``_clean_exit_on_expected_errors`` would be
+    brittle across SDK versions -- this eager, provider-agnostic env check is
+    the real fix, not an addition to that mapping."""
+
+    def __init__(self, provider: str, env_var: str) -> None:
+        super().__init__(
+            f"Missing {provider} API key: set {env_var} in the environment before running "
+            "this command."
+        )
+        self.provider = provider
+        self.env_var = env_var
+
+
+def _require_api_key(provider: str, *env_vars: str) -> None:
+    """Fail fast with ``MissingApiKeyError`` unless at least one of
+    ``env_vars`` (a provider's SDK-accepted alternatives -- e.g. Gemini's
+    ``GEMINI_API_KEY``/``GOOGLE_API_KEY``, read from the installed
+    ``google-genai`` package) is set in the environment."""
+
+    if any(os.environ.get(var) for var in env_vars):
+        return
+    raise MissingApiKeyError(provider, env_vars[0])
+
+
+def _construct_or_missing_key(
+    provider: str, env_var: str, build: Callable[[], ModelClient]
+) -> ModelClient:
+    """Runs ``build`` (a provider SDK client construction) and re-raises ANY
+    exception it raises as this same provider's ``MissingApiKeyError`` --
+    a fallback wrap behind ``_require_api_key``'s primary env check, so a
+    future SDK behavior change (a new exception type, a check
+    ``_require_api_key`` doesn't anticipate) still can't reintroduce an
+    unmapped traceback here. Expected to essentially never fire in practice
+    once ``_require_api_key`` has already passed."""
+
+    try:
+        return build()
+    except Exception as exc:
+        raise MissingApiKeyError(provider, env_var) from exc
+
+
 def _build_model_key(label: str, config: Config) -> ModelKey:
     """Constructs the real ``ModelKey`` for ``label`` -- the only place in
     this codebase that instantiates a provider SDK client for a candidate or
     judge role. See the module docstring for the two distinct test
-    techniques this enables."""
+    techniques this enables.
+
+    Every required env var is checked FIRST -- both the candidate's and the
+    judge's, ``_require_api_key`` -- before any SDK client is constructed for
+    EITHER role. This is what turns ``openai.OpenAI()``/``genai.Client()``'s
+    own unmapped construction-time exceptions (see ``MissingApiKeyError``)
+    into a clean, predictable failure instead of a raced traceback:
+    construction never starts at all until every key this call will need is
+    confirmed present, so (for example) a present Anthropic key can never let
+    Anthropic construction run ahead of a still-missing Gemini key. The
+    construction calls themselves are additionally wrapped
+    (``_construct_or_missing_key``) as a fallback in case SDK behavior ever
+    changes in a way the eager checks don't anticipate.
+    """
 
     if label == "a":
-        candidate_client: ModelClient = AnthropicClient(
-            config.models.candidate_a, anthropic.Anthropic()
+        _require_api_key("Anthropic", "ANTHROPIC_API_KEY")
+    else:
+        _require_api_key("OpenAI", "OPENAI_API_KEY")
+    _require_api_key("Gemini", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+
+    if label == "a":
+        candidate_client: ModelClient = _construct_or_missing_key(
+            "Anthropic",
+            "ANTHROPIC_API_KEY",
+            lambda: AnthropicClient(config.models.candidate_a, anthropic.Anthropic()),
         )
     else:
-        candidate_client = OpenAIClient(config.models.candidate_b, openai.OpenAI())
-    judge_client: ModelClient = GeminiClient(config.models.judge, genai.Client())
+        candidate_client = _construct_or_missing_key(
+            "OpenAI",
+            "OPENAI_API_KEY",
+            lambda: OpenAIClient(config.models.candidate_b, openai.OpenAI()),
+        )
+    judge_client: ModelClient = _construct_or_missing_key(
+        "Gemini", "GEMINI_API_KEY", lambda: GeminiClient(config.models.judge, genai.Client())
+    )
+
     return ModelKey(label=label, candidate_client=candidate_client, judge_client=judge_client)
-
-
-def _existing_complete_run(
-    config: Config,
-    label: str,
-    items: list[GoldenItem],
-    k: int,
-    prompt: PromptTemplate,
-    runs_root: Path,
-) -> RunDir | None:
-    """The deterministic run directory for these inputs, iff it already
-    holds a completed manifest -- ``None`` otherwise (missing, or present
-    but incomplete). Computed with zero client construction (module
-    docstring's run-identity-reuse note)."""
-
-    candidate_model_id = (
-        config.models.candidate_a if label == "a" else config.models.candidate_b
-    )
-    run_dir_path = runner_module._run_dir_path(
-        runs_root,
-        label,
-        items,
-        k,
-        prompt.version,
-        config.dataset.version,
-        config.dataset.path,
-        candidate_model_id,
-        config.models.judge,
-    )
-    manifest_path = run_dir_path / "manifest.json"
-    if not manifest_path.exists():
-        return None
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not manifest.get("completed"):
-        return None
-    return RunDir(path=run_dir_path)
 
 
 def _get_or_run(
@@ -253,7 +306,9 @@ def _get_or_run(
     deterministic path; otherwise construct a real client and run (which
     itself resumes from any partial rows, ``run_eval``'s own contract)."""
 
-    existing = _existing_complete_run(config, label, items, config.k, prompt, runs_root)
+    existing = find_completed_run(
+        config, label, k=config.k, dataset=items, prompt=prompt, runs_root=runs_root
+    )
     if existing is not None:
         return existing
     model_key = _build_model_key(label, config)
@@ -277,7 +332,13 @@ def _get_or_run(
 def _clean_exit_on_expected_errors():
     try:
         yield
-    except (RunAborted, RunConfigMismatch, MissingTracingError, MissingCertificateError) as exc:
+    except (
+        RunAborted,
+        RunConfigMismatch,
+        MissingTracingError,
+        MissingCertificateError,
+        MissingApiKeyError,
+    ) as exc:
         typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
 
@@ -335,12 +396,15 @@ def compare(
     with _clean_exit_on_expected_errors():
         cfg = load_config(config)
         effective_cfg, items, reportable = _resolve_dataset(cfg, dataset)
-        trace = TraceContext.for_run(effective_cfg, reportable)
+        # Spec §8 traces per-run, not per-invocation: a single shared
+        # TraceContext here would mix both candidates' spans into one trace.
+        trace_a = TraceContext.for_run(effective_cfg, reportable)
+        trace_b = TraceContext.for_run(effective_cfg, reportable)
         run_dir_a = _get_or_run(
-            effective_cfg, "a", items, EXTRACTION_PROMPT, trace, DEFAULT_RUNS_ROOT
+            effective_cfg, "a", items, EXTRACTION_PROMPT, trace_a, DEFAULT_RUNS_ROOT
         )
         run_dir_b = _get_or_run(
-            effective_cfg, "b", items, EXTRACTION_PROMPT, trace, DEFAULT_RUNS_ROOT
+            effective_cfg, "b", items, EXTRACTION_PROMPT, trace_b, DEFAULT_RUNS_ROOT
         )
         artifact_a = load_run(run_dir_a)
         artifact_b = load_run(run_dir_b)

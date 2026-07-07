@@ -165,6 +165,37 @@ def _write_dataset(path: Path, items: list[GoldenItem]) -> Path:
     return path
 
 
+@dataclass
+class _RecordingProviderClient:
+    """Stand-in for AnthropicClient/OpenAIClient/GeminiClient that RECORDS
+    its constructor args and every ``complete_structured`` call instead of
+    raising -- proves the real construction seam (``_build_model_key``) was
+    genuinely exercised with the right model ids (F2), as opposed to every
+    other test in this module, which replaces ``_build_model_key`` wholesale
+    or forbids construction outright."""
+
+    model: str
+    sdk_client: object
+    calls: list[tuple[str, type]] = field(default_factory=list)
+
+    def complete_structured(self, prompt: str, schema: type[BaseModel]) -> StructuredResult:
+        self.calls.append((prompt, schema))
+        if schema is JudgeVerdict:
+            return judge_pass_result()
+        return success_result()
+
+
+def _recording_factory(
+    registry: list[_RecordingProviderClient],
+) -> Callable[[str, object], _RecordingProviderClient]:
+    def factory(model: str, sdk_client: object) -> _RecordingProviderClient:
+        client = _RecordingProviderClient(model=model, sdk_client=sdk_client)
+        registry.append(client)
+        return client
+
+    return factory
+
+
 def _write_config(
     path: Path, *, dataset_path: Path, dataset_version: int = 1, k: int = 1
 ) -> Path:
@@ -510,3 +541,295 @@ class TestExpectedFailureExits:
         assert result.exit_code == 1
         assert "Traceback" not in result.output
         assert "aborted" in result.output.lower()
+
+
+# --------------------------------------------------------------------------
+# F1: missing provider API keys must exit cleanly, never with an unmapped
+# SDK traceback (``openai.OpenAIError`` / ``ValueError`` from
+# ``genai.Client()`` at construction).
+# --------------------------------------------------------------------------
+
+
+class TestMissingApiKey:
+    def test_missing_openai_key_clean_exit_no_client_constructed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        # With the env check first, none of these raise-on-init stubs should
+        # ever be reached -- proving no client is constructed, not just that
+        # the seam function itself was replaced.
+        _forbid_real_client_construction(monkeypatch)
+
+        items = [make_item("item-0")]
+        dataset_path = _write_dataset(tmp_path / "dev.jsonl", items)
+        config_path = _write_config(
+            tmp_path / "config.yaml", dataset_path=Path("data/golden/golden.jsonl")
+        )
+
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--model",
+                    "b",
+                    "--dataset",
+                    str(dataset_path),
+                    "--config",
+                    str(config_path),
+                ],
+            )
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "error" in result.output.lower()
+        assert "OPENAI_API_KEY" in result.output
+
+    def test_missing_anthropic_key_clean_exit_no_client_constructed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        _forbid_real_client_construction(monkeypatch)
+
+        items = [make_item("item-0")]
+        dataset_path = _write_dataset(tmp_path / "dev.jsonl", items)
+        config_path = _write_config(
+            tmp_path / "config.yaml", dataset_path=Path("data/golden/golden.jsonl")
+        )
+
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--model",
+                    "a",
+                    "--dataset",
+                    str(dataset_path),
+                    "--config",
+                    str(config_path),
+                ],
+            )
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "ANTHROPIC_API_KEY" in result.output
+
+    def test_missing_gemini_key_clean_exit_when_candidate_key_present(self, tmp_path, monkeypatch):
+        """The judge's key (GEMINI_API_KEY/GOOGLE_API_KEY) is required for
+        BOTH labels, checked after the candidate's own key."""
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-anthropic-key")
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        _forbid_real_client_construction(monkeypatch)
+
+        items = [make_item("item-0")]
+        dataset_path = _write_dataset(tmp_path / "dev.jsonl", items)
+        config_path = _write_config(
+            tmp_path / "config.yaml", dataset_path=Path("data/golden/golden.jsonl")
+        )
+
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--model",
+                    "a",
+                    "--dataset",
+                    str(dataset_path),
+                    "--config",
+                    str(config_path),
+                ],
+            )
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "GEMINI_API_KEY" in result.output
+
+    def test_construction_time_exception_is_wrapped_as_missing_api_key_error(
+        self, monkeypatch
+    ):
+        """Fallback wrap (module docstring): even once the env check passes,
+        a provider SDK construction-time exception must never propagate raw
+        -- it is re-raised as this same provider's ``MissingApiKeyError``, so
+        a future SDK behavior change can't reintroduce an unmapped
+        traceback."""
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-anthropic-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy-openai-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "dummy-gemini-key")
+
+        class _RaisesAtConstruction:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                raise RuntimeError("sdk changed its mind")
+
+        monkeypatch.setattr(cli, "AnthropicClient", _RaisesAtConstruction)
+
+        config = load_config(DEFAULT_CONFIG_PATH)
+
+        with pytest.raises(cli.MissingApiKeyError) as exc_info:
+            cli._build_model_key("a", config)
+
+        assert exc_info.value.provider == "Anthropic"
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+# --------------------------------------------------------------------------
+# F2: the production construction seam (_build_model_key actually building
+# AnthropicClient/OpenAIClient/GeminiClient with the right model ids, and
+# the runner wrapping the judge client in Judge) -- previously untested,
+# since every other test in this module replaces `_build_model_key` wholesale
+# or forbids construction outright.
+# --------------------------------------------------------------------------
+
+
+class TestBuildModelKeyConstructionSeam:
+    def test_build_model_key_constructs_expected_provider_clients_per_label(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-anthropic-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy-openai-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "dummy-gemini-key")
+
+        anthropic_instances: list[_RecordingProviderClient] = []
+        openai_instances: list[_RecordingProviderClient] = []
+        gemini_instances: list[_RecordingProviderClient] = []
+        monkeypatch.setattr(cli, "AnthropicClient", _recording_factory(anthropic_instances))
+        monkeypatch.setattr(cli, "OpenAIClient", _recording_factory(openai_instances))
+        monkeypatch.setattr(cli, "GeminiClient", _recording_factory(gemini_instances))
+
+        config = load_config(DEFAULT_CONFIG_PATH)
+
+        model_key_a = cli._build_model_key("a", config)
+
+        assert [c.model for c in anthropic_instances] == [config.models.candidate_a]
+        assert [c.model for c in gemini_instances] == [config.models.judge]
+        assert model_key_a.candidate_client is anthropic_instances[0]
+        assert model_key_a.judge_client is gemini_instances[0]
+        assert openai_instances == []
+
+        model_key_b = cli._build_model_key("b", config)
+
+        assert [c.model for c in openai_instances] == [config.models.candidate_b]
+        assert [c.model for c in gemini_instances] == [config.models.judge, config.models.judge]
+        assert model_key_b.candidate_client is openai_instances[0]
+        assert len(anthropic_instances) == 1  # unaffected by the "b" call
+
+    def test_run_end_to_end_exercises_judge_wrapping_the_gemini_client(
+        self, tmp_path, monkeypatch
+    ):
+        """Drives the real ``_build_model_key`` seam through a full ``eval
+        run`` invocation with RECORDING (non-raising) provider stubs, so the
+        constructed Gemini stub's ``complete_structured`` is only ever
+        called via ``runner.py``'s ``Judge(model_key.judge_client)`` wrapper
+        -- proving Judge genuinely wraps the client this seam built, not
+        some other instance."""
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-anthropic-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy-openai-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "dummy-gemini-key")
+
+        anthropic_instances: list[_RecordingProviderClient] = []
+        gemini_instances: list[_RecordingProviderClient] = []
+        monkeypatch.setattr(cli, "AnthropicClient", _recording_factory(anthropic_instances))
+        monkeypatch.setattr(cli, "GeminiClient", _recording_factory(gemini_instances))
+
+        items = [make_item("item-0")]
+        dataset_path = _write_dataset(tmp_path / "dev.jsonl", items)
+        config_path = _write_config(
+            tmp_path / "config.yaml", dataset_path=Path("data/golden/golden.jsonl")
+        )
+        config = load_config(config_path)
+
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--model",
+                    "a",
+                    "--dataset",
+                    str(dataset_path),
+                    "--config",
+                    str(config_path),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert len(anthropic_instances) == 1
+        assert anthropic_instances[0].model == config.models.candidate_a
+        assert len(gemini_instances) == 1
+        assert gemini_instances[0].model == config.models.judge
+
+        judge_calls = [call for call in gemini_instances[0].calls if call[1] is JudgeVerdict]
+        assert len(judge_calls) == 2  # issue_summary + requested_action, k=1, 1 item
+        candidate_calls = [
+            call for call in anthropic_instances[0].calls if call[1] is TicketExtraction
+        ]
+        assert len(candidate_calls) == 1
+
+
+# --------------------------------------------------------------------------
+# F4: `compare`'s unique failure ordering -- candidate A reused/succeeded,
+# candidate B's run aborts.
+# --------------------------------------------------------------------------
+
+
+class TestCompareUniqueFailureOrdering:
+    def test_candidate_b_abort_exits_cleanly_and_keeps_candidate_a_intact(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("item-0"), make_item("item-1", slice_="adversarial")]
+        dataset_path = _write_dataset(tmp_path / "dev.jsonl", items)
+        config_path = _write_config(
+            tmp_path / "config.yaml", dataset_path=Path("data/golden/golden.jsonl")
+        )
+        effective_cfg, loaded_items, _ = cli._resolve_dataset(
+            load_config(config_path), dataset_path
+        )
+
+        # Setup, not under test: candidate A's run is already complete, so
+        # `compare` reuses it without ever calling `_build_model_key` for "a".
+        judge = FakeModelClient(make_result=lambda *a: judge_pass_result())
+        candidate_a = FakeModelClient(make_result=lambda *a: success_result("candidate-a-v1"))
+        run_eval(
+            effective_cfg,
+            ModelKey(label="a", candidate_client=candidate_a, judge_client=judge),
+            k=effective_cfg.k,
+            dataset=loaded_items,
+            prompt=EXTRACTION_PROMPT,
+            runs_root=DEFAULT_RUNS_ROOT,
+        )
+        run_dir_a_path = next((DEFAULT_RUNS_ROOT).glob("a-*"))
+        rows_a_before = (run_dir_a_path / "rows.jsonl").read_text(encoding="utf-8")
+        manifest_a_before = (run_dir_a_path / "manifest.json").read_text(encoding="utf-8")
+
+        # Behavior under test: candidate B's run aborts mid-run.
+        def factory(label: str, config: object) -> ModelKey:
+            if label == "a":
+                raise AssertionError("_build_model_key must not be called for a's reused run")
+
+            def make_result(idx: int, prompt: str, schema: type) -> StructuredResult:
+                raise TransportExhausted(4, RuntimeError("boom"))
+
+            candidate_b = FakeModelClient(make_result=make_result)
+            return ModelKey(label=label, candidate_client=candidate_b, judge_client=judge)
+
+        monkeypatch.setattr(cli, "_build_model_key", factory)
+
+        result = runner.invoke(
+            app, ["compare", "--dataset", str(dataset_path), "--config", str(config_path)]
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "aborted" in result.output.lower()
+
+        # A's artifacts remain intact on disk -- untouched by B's failure.
+        assert (run_dir_a_path / "rows.jsonl").read_text(encoding="utf-8") == rows_a_before
+        assert (run_dir_a_path / "manifest.json").read_text(encoding="utf-8") == manifest_a_before

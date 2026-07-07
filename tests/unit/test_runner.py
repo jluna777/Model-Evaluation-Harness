@@ -22,6 +22,7 @@ from harness.runner import (
     RunConfigMismatch,
     RunDir,
     _check_manifest_compatible,
+    find_completed_run,
     load_run,
     run_eval,
 )
@@ -846,3 +847,65 @@ class TestTruncatedTrailingLine:
         # No additional candidate calls should be made since both rows
         # survived the stale tmp scenario.
         assert candidate.call_count == 2
+
+
+class TestFindCompletedRun:
+    """F3: the public run-directory lookup that lets callers outside this
+    module (the CLI's run-identity reuse) ask "does a completed run already
+    exist for these inputs?" without recomputing ``_run_dir_path``'s hash by
+    hand -- ``_run_dir_path`` itself stays private."""
+
+    def test_returns_run_dir_when_completed(self, tmp_path):
+        items = [make_item("item-0")]
+        model_key = _model_key()
+        config = _config()
+
+        run_dir = run_eval(
+            config, model_key, k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+
+        found = find_completed_run(
+            config, "a", k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+
+        assert found is not None
+        assert found.path == run_dir.path
+
+    def test_returns_none_for_partial_run(self, tmp_path):
+        items = [make_item(f"item-{i}") for i in range(2)]
+
+        def make_result(idx: int, prompt: str, schema: type) -> StructuredResult:
+            if idx == 0:
+                raise TransportExhausted(4, RuntimeError("boom"))
+            return success_result()
+
+        candidate = FakeModelClient(make_result=make_result)
+        model_key = _model_key(candidate)
+        config = _config()
+
+        with pytest.raises(RunAborted):
+            run_eval(
+                config,
+                model_key,
+                k=1,
+                dataset=items,
+                prompt=EXTRACTION_PROMPT,
+                runs_root=tmp_path,
+                max_workers=1,
+            )
+
+        found = find_completed_run(
+            config, "a", k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+
+        assert found is None
+
+    def test_returns_none_when_absent(self, tmp_path):
+        items = [make_item("item-0")]
+        config = _config()
+
+        found = find_completed_run(
+            config, "a", k=1, dataset=items, prompt=EXTRACTION_PROMPT, runs_root=tmp_path
+        )
+
+        assert found is None
