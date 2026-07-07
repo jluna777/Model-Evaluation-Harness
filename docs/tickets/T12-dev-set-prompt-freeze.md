@@ -24,7 +24,7 @@ Author the 10-item dev set and finalize the extraction prompt text — iterated 
 ## Acceptance criteria
 - [ ] `data/dev/dev.jsonl` contains exactly 10 items; a unit test parses every line against the item schema (each `email` validates as `EmailInput`)
 - [ ] a unit test asserts `EXTRACTION_PROMPT.version == 1`
-- [ ] a unit test asserts the rendered prompt contains this spec §1 sentence **verbatim**: "the ticket describes the primary request — the first actionable request in the newest, non-quoted part of the email."
+- [ ] a unit test asserts the rendered prompt contains this spec §1 sentence **verbatim** (amended 2026-07-07): "the ticket describes the primary request — the first actionable request in the newest, non-quoted part of the email, unless a later statement there explicitly retracts or supersedes it, in which case the superseding request is primary."
 - [ ] `uv run eval run --model a --dataset data/dev/dev.jsonl` exits 0 and the report header shows the "uncalibrated (no certificate)" banner
 - [ ] `uv run eval run --model b --dataset data/dev/dev.jsonl` exits 0, same banner state
 - [ ] `uv run pytest` and `uv run ruff check` exit 0; committed (subject + change summary; no attribution or process-status lines)

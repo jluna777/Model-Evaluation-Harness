@@ -41,7 +41,9 @@ class TestExtractionPromptPlaceholder:
 # string that must appear in the frozen prompt (T12 acceptance criterion).
 TIE_BREAK_SENTENCE = (
     "the ticket describes the primary request — the first actionable request "
-    "in the newest, non-quoted part of the email."
+    "in the newest, non-quoted part of the email, unless a later statement "
+    "there explicitly retracts or supersedes it, in which case the superseding "
+    "request is primary."
 )
 
 

@@ -27,7 +27,7 @@ Extract a structured support ticket from a customer support email.
 
 **Normalization for entity fields:** trim, casefold, collapse internal whitespace; `None` matches only `None`. Fields absent from the email have reference value `None`; OpenAI strict mode cannot omit fields, so `None`/null is the required "not present" encoding for both providers.
 
-**Tie-break rule (multi-request emails), canonical wording:** *the ticket describes the primary request — the first actionable request in the newest, non-quoted part of the email.* This sentence appears verbatim in the extraction prompt and governs every reference answer.
+**Tie-break rule (multi-request emails), canonical wording (amended 2026-07-07):** *the ticket describes the primary request — the first actionable request in the newest, non-quoted part of the email, unless a later statement there explicitly retracts or supersedes it, in which case the superseding request is primary.* This sentence appears verbatim in the extraction prompt and governs every reference answer. Secondary requests are omitted from reference answers. Multi-ticket extraction (one ticket per request, variable-length output) is a noted v2 direction — it would showcase set-valued scoring but requires alignment machinery cut from v1.
 
 **Extraction prompts:** one shared, versioned prompt template for both candidates; schema delivered via each provider's native structured-output mechanism (Anthropic `output_config.format`, OpenAI `json_schema` strict).
 
