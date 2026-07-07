@@ -251,15 +251,21 @@ def _adversarial_replicate_composites(
 
 
 def _measure_adversarial_noise_floor(
-    items: Sequence[GoldenItem], rows: Sequence[RunRow], mode: CompositeMode
+    items: Sequence[GoldenItem], rows: Sequence[RunRow], mode: CompositeMode, *, k_run: int
 ) -> float:
     """The adversarial-slice composite's run-to-run standard error, measured
-    across the baseline's own K_baseline replicates (spec §7, D3): each
-    replicate's adversarial-slice composite is treated as one independent
-    sample of what a fresh run would report, and the standard error of their
-    mean is this baseline's noise floor -- verified against the fixed
-    10-point guardrail threshold via ``check_guardrail_floor``, at baseline
-    time, never at gate time.
+    at the gate-run replicate count (spec §7, D3). Each baseline replicate
+    samples a single-replicate composite; a gate run reports a K_run-replicate
+    average (where K_run = config.k, typically 3), so its standard error is
+    SD/sqrt(K_run). The SD is estimated from the baseline's K_baseline
+    replicates (typically 6): the stdev of per-replicate adversarial-slice
+    composites is the population SD estimate, then divided by sqrt(K_run) to
+    get the noise floor for a gate run. This baseline's noise floor is verified
+    against the fixed 10-point guardrail threshold via ``check_guardrail_floor``,
+    at baseline time, never at gate time.
+
+    ``len(per_replicate) >= 2`` is a minimum-samples gate for estimating the
+    SD (a stdev needs at least two samples); this is independent of ``k_run``.
 
     Raises ``ValueError`` if fewer than two replicate-level composites are
     measurable (no adversarial items in ``items``, or too many/all
@@ -275,7 +281,7 @@ def _measure_adversarial_noise_floor(
             f"error; got {len(per_replicate)} (check the dataset has adversarial items and "
             "k_baseline > 1, and that they are not all excluded by missing judged fields)"
         )
-    return statistics.stdev(per_replicate) / math.sqrt(len(per_replicate))
+    return statistics.stdev(per_replicate) / math.sqrt(k_run)
 
 
 def _baseline_to_dict(baseline: BaselineFile) -> dict:
@@ -391,7 +397,7 @@ def generate_baseline(
         fingerprint_components.calibration_verdict,
     )
     noise_floor_se = _measure_adversarial_noise_floor(
-        run_artifact.items, run_artifact.rows, composite_mode
+        run_artifact.items, run_artifact.rows, composite_mode, k_run=config.k
     )
 
     baseline = BaselineFile(

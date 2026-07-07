@@ -463,10 +463,10 @@ class TestMeasureAdversarialNoiseFloorArithmetic:
             rows.append(_row("adv-0", replicate, adv_scores))
             rows.append(_row("nom-0", replicate, _all_seven_scores(1)))
 
-        se = _measure_adversarial_noise_floor(items, rows, CompositeMode.FULL_7)
+        se = _measure_adversarial_noise_floor(items, rows, CompositeMode.FULL_7, k_run=6)
 
         expected_values = [100.0, 600.0 / 7.0, 100.0, 600.0 / 7.0]
-        expected_se = statistics.stdev(expected_values) / math.sqrt(len(expected_values))
+        expected_se = statistics.stdev(expected_values) / math.sqrt(6)
         assert se == pytest.approx(expected_se)
         assert se > 0.0
 
@@ -484,7 +484,7 @@ class TestMeasureAdversarialNoiseFloorArithmetic:
         # field must exclude it, mirroring the gate's own missing != fail
         # exclusion) -- both usable replicates are identical (composite
         # 100), so the standard error over them is exactly zero.
-        se = _measure_adversarial_noise_floor(items, rows, CompositeMode.FULL_7)
+        se = _measure_adversarial_noise_floor(items, rows, CompositeMode.FULL_7, k_run=3)
 
         assert se == 0.0
 
@@ -495,4 +495,102 @@ class TestMeasureAdversarialNoiseFloorArithmetic:
         rows = [_row("adv-0", 0, _all_seven_scores(1))]
 
         with pytest.raises(ValueError):
-            _measure_adversarial_noise_floor(items, rows, CompositeMode.FULL_7)
+            _measure_adversarial_noise_floor(items, rows, CompositeMode.FULL_7, k_run=3)
+
+    def test_discriminating_case_k_run_3_fails_guardrail_but_k_baseline_6_would_pass(self):
+        """Discriminating case verifying the fix: SE denominator must use k_run (gate run
+        replicate count = 3), not len(per_replicate) (baseline k = 6).
+
+        Per-replicate adversarial composites alternate 100 / (6/7*100 ≈ 85.71) across
+        6 baseline replicates -> stdev ≈ 50/7 ≈ 7.14.
+
+        - With k_run=3: SE = 7.14/sqrt(3) ≈ 4.12 → 3*SE ≈ 12.36 > 10 → FAILS (correct)
+        - Old formula sqrt(6): SE = 7.14/sqrt(6) ≈ 2.92 → 3*SE ≈ 8.75 ≤ 10 → PASSES (wrong)
+
+        This test uses the corrected API and asserts the check FAILS, pinning k_run=3.
+        """
+        from harness.gate.baseline import _measure_adversarial_noise_floor
+
+        items = [make_item("adv-0", slice_="adversarial")]
+        # Create 6 baseline replicates with alternating perfect/one-field-wrong pattern.
+        rows = []
+        for replicate in range(6):
+            adv_scores = _all_seven_scores(1)
+            if replicate % 2 == 1:
+                adv_scores["category"] = 0
+            rows.append(_row("adv-0", replicate, adv_scores))
+
+        # Compute SE with k_run=3 (gate run replicate count).
+        se = _measure_adversarial_noise_floor(items, rows, CompositeMode.FULL_7, k_run=3)
+
+        # Hand-compute the expected SE:
+        # Replicates have composites: [100, 600/7, 100, 600/7, 100, 600/7]
+        expected_values = [100.0, 600.0 / 7.0, 100.0, 600.0 / 7.0, 100.0, 600.0 / 7.0]
+        expected_stdev = statistics.stdev(expected_values)
+        expected_se = expected_stdev / math.sqrt(3)  # k_run=3, NOT len(per_replicate)=6
+        assert se == pytest.approx(expected_se)
+
+        # The guardrail floor check must FAIL (3*SE ≈ 12.36 > 10).
+        baseline = _minimal_baseline(adversarial_noise_floor_se=se)
+        assert check_guardrail_floor(baseline) is False
+
+
+class TestGenerateBaselineNoneJudgeErrorRoundTrip:
+    """Verify that None judge-error scores (verdict None for a field) survive
+    round-trip through JSON write and load (F2)."""
+
+    def test_none_judge_error_scores_round_trip_through_json(self, tmp_path):
+        """Generate a baseline with a judge that returns errors (verdict None)
+        for at least one field of at least one item, write to JSON, reload,
+        and verify the None is preserved exactly (not coerced to 0 or missing)."""
+
+        items = _two_item_dataset()
+
+        # Create a fake judge that returns a judge error (verdict=None) for
+        # issue_summary on the first call (replicate 0, item 0), then passes
+        # normally for all other calls.
+        def judge_with_error(idx: int, prompt: str, schema: type[BaseModel]) -> StructuredResult:
+            if idx == 0:  # First judge call -> error
+                return StructuredResult(
+                    output=None,
+                    failure="refusal",  # Judge refusal = error, not fail
+                    raw="Judge refused to respond",
+                    usage=Usage(input_tokens=5, output_tokens=0),
+                    served_model_version="judge-v1",
+                )
+            else:
+                return judge_pass_result()
+
+        model_key = _model_key(
+            candidate=FakeModelClient(make_result=lambda *a: success_result()),
+            judge=FakeModelClient(make_result=judge_with_error),
+        )
+        config = _config()
+
+        baseline = generate_baseline(
+            config,
+            model_key,
+            dataset=items,
+            runs_root=tmp_path / "runs",
+            baselines_root=tmp_path / "baselines",
+        )
+
+        # Verify the baseline has the None value in the first row's judged field.
+        first_row = baseline.rows[0]
+        assert first_row.replicate == 0
+        assert first_row.item_id == "nom-0"
+        # The first judge call fails, so issue_summary should be None.
+        assert first_row.field_scores["issue_summary"] is None
+        # Other fields should still have valid scores (0 or 1).
+        assert first_row.field_scores["requested_action"] in (0, 1)
+        assert first_row.field_scores["category"] in (0, 1)
+
+        # Reload the baseline from disk and verify None is preserved.
+        baseline_path = tmp_path / "baselines" / "a.json"
+        reloaded = load_baseline(baseline_path)
+
+        reloaded_first_row = reloaded.rows[0]
+        assert reloaded_first_row.field_scores["issue_summary"] is None
+        # Verify other fields are still valid (not corrupted by JSON round-trip).
+        assert reloaded_first_row.field_scores["requested_action"] in (0, 1)
+        assert reloaded_first_row.field_scores["category"] in (0, 1)
