@@ -103,7 +103,7 @@ The model interface is a thin internal protocol (`complete_structured(email, sch
 
 - Every candidate and judge call is a span in a per-run Langfuse trace (run id, fingerprint, item id, replicate index; scores attached per item).
 - **Scope of degradation (bounded):** runs that produce *reported* numbers — baseline updates, README/published numbers, calibration certification — require Langfuse credentials and fail fast without them. Dev iteration may run keyless with a one-line warning; such runs are flagged `untraced` in their report header and can never feed baselines or the README. A mid-run Langfuse transport failure does not abort measurement: the run completes, is flagged untraced, and gate verdicts stand (baseline updates and published numbers still require complete traces).
-- v1 targets Langfuse Cloud free tier; keys via environment variables.
+- v1 targets Langfuse Cloud free tier; keys via environment variables (optionally loaded from a git-ignored `.env` file at the repo root; OS-level variables take precedence).
 
 ## 9. CLI and reports
 

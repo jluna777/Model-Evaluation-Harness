@@ -97,6 +97,7 @@ from typing import Annotated
 import anthropic
 import openai
 import typer
+from dotenv import find_dotenv, load_dotenv
 from google import genai
 
 from harness.config import Config, load_config
@@ -120,6 +121,12 @@ from harness.schema import Certificate, GoldenItem
 from harness.tracing import MissingTracingError, TraceContext
 
 app = typer.Typer(help="Structured-extraction eval harness: run, compare, rescore.")
+
+
+@app.callback(invoke_without_command=False)
+def _load_env_callback() -> None:
+    """Load .env file with override=False so real environment variables always win."""
+    load_dotenv(find_dotenv(usecwd=True), override=False)
 
 DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
 DEFAULT_CERTIFICATE_PATH = Path("data/calibration/certificate.json")
