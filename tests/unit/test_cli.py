@@ -649,13 +649,13 @@ class TestMissingApiKey:
         assert "Traceback" not in result.output
         assert "GEMINI_API_KEY" in result.output
 
-    def test_construction_time_exception_is_wrapped_as_missing_api_key_error(
+    def test_construction_time_exception_is_wrapped_as_client_construction_error(
         self, monkeypatch
     ):
         """Fallback wrap (module docstring): even once the env check passes,
         a provider SDK construction-time exception must never propagate raw
-        -- it is re-raised as this same provider's ``MissingApiKeyError``, so
-        a future SDK behavior change can't reintroduce an unmapped
+        -- it is re-raised as ``ClientConstructionError`` with the true cause
+        visible, so a future SDK behavior change can't reintroduce an unmapped
         traceback."""
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-anthropic-key")
@@ -670,11 +670,31 @@ class TestMissingApiKey:
 
         config = load_config(DEFAULT_CONFIG_PATH)
 
-        with pytest.raises(cli.MissingApiKeyError) as exc_info:
+        with pytest.raises(cli.ClientConstructionError) as exc_info:
             cli._build_model_key("a", config)
 
         assert exc_info.value.provider == "Anthropic"
+        assert "RuntimeError: sdk changed its mind" in str(exc_info.value)
         assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+    def test_missing_api_key_caught_by_env_check(self, monkeypatch):
+        """Verify that a genuinely-missing API key is caught by the eager
+        env-var check ``_require_api_key``, not by the construction fallback,
+        producing ``MissingApiKeyError``."""
+
+        # Clear the Gemini key so the check fails
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-anthropic-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy-openai-key")
+
+        config = load_config(DEFAULT_CONFIG_PATH)
+
+        with pytest.raises(cli.MissingApiKeyError) as exc_info:
+            cli._build_model_key("a", config)
+
+        assert exc_info.value.provider == "Gemini"
+        assert "GEMINI_API_KEY" in str(exc_info.value)
 
 
 # --------------------------------------------------------------------------

@@ -222,6 +222,19 @@ class MissingApiKeyError(Exception):
         self.env_var = env_var
 
 
+class ClientConstructionError(Exception):
+    """Raised when a provider SDK client construction fails with an unrelated
+    error (not a missing API key, which is caught by ``_require_api_key``
+    first). Reports the true exception type and message so the operator is not
+    misdirected."""
+
+    def __init__(self, provider: str, exc: Exception) -> None:
+        super().__init__(
+            f"failed to construct {provider} client: {type(exc).__name__}: {exc}"
+        )
+        self.provider = provider
+
+
 def _require_api_key(provider: str, *env_vars: str) -> None:
     """Fail fast with ``MissingApiKeyError`` unless at least one of
     ``env_vars`` (a provider's SDK-accepted alternatives -- e.g. Gemini's
@@ -233,11 +246,11 @@ def _require_api_key(provider: str, *env_vars: str) -> None:
     raise MissingApiKeyError(provider, env_vars[0])
 
 
-def _construct_or_missing_key(
-    provider: str, env_var: str, build: Callable[[], ModelClient]
+def _construct_client(
+    provider: str, build: Callable[[], ModelClient]
 ) -> ModelClient:
     """Runs ``build`` (a provider SDK client construction) and re-raises ANY
-    exception it raises as this same provider's ``MissingApiKeyError`` --
+    exception it raises as ``ClientConstructionError`` with the true cause --
     a fallback wrap behind ``_require_api_key``'s primary env check, so a
     future SDK behavior change (a new exception type, a check
     ``_require_api_key`` doesn't anticipate) still can't reintroduce an
@@ -247,7 +260,7 @@ def _construct_or_missing_key(
     try:
         return build()
     except Exception as exc:
-        raise MissingApiKeyError(provider, env_var) from exc
+        raise ClientConstructionError(provider, exc) from exc
 
 
 def _build_model_key(label: str, config: Config) -> ModelKey:
@@ -265,7 +278,7 @@ def _build_model_key(label: str, config: Config) -> ModelKey:
     confirmed present, so (for example) a present Anthropic key can never let
     Anthropic construction run ahead of a still-missing Gemini key. The
     construction calls themselves are additionally wrapped
-    (``_construct_or_missing_key``) as a fallback in case SDK behavior ever
+    (``_construct_client``) as a fallback in case SDK behavior ever
     changes in a way the eager checks don't anticipate.
     """
 
@@ -276,19 +289,17 @@ def _build_model_key(label: str, config: Config) -> ModelKey:
     _require_api_key("Gemini", "GEMINI_API_KEY", "GOOGLE_API_KEY")
 
     if label == "a":
-        candidate_client: ModelClient = _construct_or_missing_key(
+        candidate_client: ModelClient = _construct_client(
             "Anthropic",
-            "ANTHROPIC_API_KEY",
             lambda: AnthropicClient(config.models.candidate_a, anthropic.Anthropic()),
         )
     else:
-        candidate_client = _construct_or_missing_key(
+        candidate_client = _construct_client(
             "OpenAI",
-            "OPENAI_API_KEY",
             lambda: OpenAIClient(config.models.candidate_b, openai.OpenAI()),
         )
-    judge_client: ModelClient = _construct_or_missing_key(
-        "Gemini", "GEMINI_API_KEY", lambda: GeminiClient(config.models.judge, genai.Client())
+    judge_client: ModelClient = _construct_client(
+        "Gemini", lambda: GeminiClient(config.models.judge, genai.Client())
     )
 
     return ModelKey(label=label, candidate_client=candidate_client, judge_client=judge_client)
@@ -338,6 +349,7 @@ def _clean_exit_on_expected_errors():
         MissingTracingError,
         MissingCertificateError,
         MissingApiKeyError,
+        ClientConstructionError,
     ) as exc:
         typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
