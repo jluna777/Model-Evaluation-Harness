@@ -14,13 +14,15 @@ same numbers to both the exit-code logic and this module's renderer.
 
 - A certificate present -> render judge version, overall kappa +/- its CI,
   verdict, and a per-candidate kappa breakdown. ``Certificate`` (schema.py)
-  carries ``kappa_ci`` for the *overall* kappa only -- there is no
+  originally carried ``kappa_ci`` for the *overall* kappa only -- there was no
   per-candidate CI field on the committed certificate, despite spec §5's
-  prose ("Per-candidate kappas are reported with CIs"). This module renders
-  what the schema actually carries (per-candidate kappa *point estimates*,
-  the overall CI) rather than inventing a per-candidate CI with no backing
-  data; the gap is noted inline in the rendered header so a reader isn't
-  misled into thinking one figure is the other.
+  prose ("Per-candidate kappas are reported with CIs"). T14 closed that
+  ledgered gap additively: ``Certificate.per_candidate_kappa_ci`` (``None`` by
+  default) now carries the same cluster-bootstrap CIs ``calibrate.py``
+  computes per candidate. This module renders the CI per candidate when the
+  field is populated, and falls back to the original point-estimate-only
+  line (byte-identical to pre-T14 output) when it is ``None`` -- e.g. a
+  certificate produced before this field existed.
 - A certificate absent, ``reportable=False`` -> render the dev-stage
   "UNCALIBRATED (no certificate)" banner. This is the allowed state for dev
   iteration (spec §8).
@@ -389,12 +391,24 @@ def _certificate_section(
             f"- Test-retest intra-annotator consistency ceiling κ = "
             f"{certificate.ceiling_kappa:.3f}"
         )
-    lines.append(
-        "- Per-candidate κ (point estimate only -- the certificate carries a CI "
-        "for the overall κ above, not per-candidate):"
-    )
-    for label in sorted(certificate.per_candidate_kappa):
-        lines.append(f"  - candidate {label}: κ = {certificate.per_candidate_kappa[label]:.3f}")
+    if certificate.per_candidate_kappa_ci is not None:
+        lines.append("- Per-candidate κ with 95% cluster-bootstrap CI:")
+        for label in sorted(certificate.per_candidate_kappa):
+            kappa = certificate.per_candidate_kappa[label]
+            ci = certificate.per_candidate_kappa_ci.get(label)
+            if ci is None:
+                lines.append(f"  - candidate {label}: κ = {kappa:.3f} (CI not available)")
+            else:
+                lines.append(
+                    f"  - candidate {label}: κ = {kappa:.3f} (95% CI [{ci[0]:.3f}, {ci[1]:.3f}])"
+                )
+    else:
+        lines.append(
+            "- Per-candidate κ (point estimate only -- the certificate carries a CI "
+            "for the overall κ above, not per-candidate):"
+        )
+        for label in sorted(certificate.per_candidate_kappa):
+            lines.append(f"  - candidate {label}: κ = {certificate.per_candidate_kappa[label]:.3f}")
 
     if certificate.verdict == "inadequate":
         lines.append("")

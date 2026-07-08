@@ -107,7 +107,16 @@ class CalibrationLabel(BaseModel):
 
 
 class Certificate(BaseModel):
-    """Committed judge calibration certificate (spec §5)."""
+    """Committed judge calibration certificate (spec §5).
+
+    ``per_candidate_kappa_ci`` (additive, T14): per-candidate cluster-bootstrap
+    CIs, keyed the same as ``per_candidate_kappa``. T01 only stored per-candidate
+    kappa *point estimates* (``kappa_ci`` covers the overall kappa only) even
+    though spec §5's report header prose calls for "κ ± CI per candidate" -- a
+    ledgered gap from T10's review. ``None`` (the default) reproduces that
+    original, CI-less shape exactly for any certificate that predates this
+    field; ``reports.py``'s rendering is unchanged for that case (see
+    ``_certificate_section``)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -115,6 +124,7 @@ class Certificate(BaseModel):
     overall_kappa: float
     kappa_ci: tuple[float, float]
     per_candidate_kappa: dict[str, float]
+    per_candidate_kappa_ci: dict[str, tuple[float, float]] | None = None
     verdict: Literal["adequate", "adequate_with_caveat", "inadequate"]
     ceiling_kappa: float | None = None
     label_file_hash: str

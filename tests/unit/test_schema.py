@@ -159,3 +159,30 @@ class TestCertificate:
         )
         assert certificate.verdict == "adequate"
         assert certificate.kappa_ci == (0.55, 0.85)
+
+    def test_per_candidate_kappa_ci_defaults_to_none(self):
+        # Additive T14 field: absent input -> None, reproducing the original
+        # CI-less shape exactly (no behavior change for pre-T14 certificates).
+        certificate = Certificate(
+            judge_version="deadbeef",
+            overall_kappa=0.72,
+            kappa_ci=(0.55, 0.85),
+            per_candidate_kappa={"a": 0.7, "b": 0.74},
+            verdict="adequate",
+            label_file_hash="sha256:abc123",
+            date="2026-07-04",
+        )
+        assert certificate.per_candidate_kappa_ci is None
+
+    def test_per_candidate_kappa_ci_round_trips_when_present(self):
+        certificate = Certificate(
+            judge_version="deadbeef",
+            overall_kappa=0.72,
+            kappa_ci=(0.55, 0.85),
+            per_candidate_kappa={"a": 0.7, "b": 0.74},
+            per_candidate_kappa_ci={"a": (0.5, 0.85), "b": (0.55, 0.9)},
+            verdict="adequate",
+            label_file_hash="sha256:abc123",
+            date="2026-07-04",
+        )
+        assert certificate.per_candidate_kappa_ci == {"a": (0.5, 0.85), "b": (0.55, 0.9)}

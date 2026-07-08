@@ -1,12 +1,28 @@
-"""Typer CLI: ``run`` / ``compare`` / ``rescore`` (spec §9, ticket T11).
+"""Typer CLI: ``run`` / ``compare`` / ``gate`` / ``calibrate`` / ``rescore``
+(spec §9, tickets T11/T14).
 
-This module is the composition root for Phase A: it is the ONLY place that
+This module is the composition root for Phase A: it is the primary place that
 constructs real provider SDK clients (``AnthropicClient``/``OpenAIClient``/
 ``GeminiClient``, bundled into a ``runner.ModelKey`` -- see ``runner.py``'s
 module docstring for why the runner itself never imports provider SDKs) and
 the only place that decides whether a run is *reportable* (spec §8) from the
-``--dataset`` flag. ``eval calibrate`` is wired in T14 -- this module stops
-at ``run``/``compare``/``gate``/``rescore``.
+``--dataset`` flag.
+
+**``eval calibrate`` (T14):** always reportable (spec §5/§8: judge
+calibration must be traceable) and never accepts a ``--dataset`` override --
+its item source is always ``--emails`` (default
+``data/calibration/emails.jsonl``). It reuses the same ``_get_or_run`` seam
+``run``/``compare`` use to obtain each candidate's persisted calibration
+``RunArtifact`` (``harness.calibrate``'s module docstring explains why this,
+rather than a parallel pipeline, is the design), then constructs a SECOND,
+judge-only client seam (``_build_judge_client``) to re-judge those artifacts'
+triples with the CURRENT judge -- calibrate has no use for a candidate client
+of its own once each candidate's run is in hand, whether that run was just
+freshly executed or reused from disk. All of the actual statistics/decision
+logic (agreement, verdict, self-consistency, the retest ceiling, the
+certificate) lives in ``harness.calibrate``; this module is CLI plumbing only
+(dataset/label loading, tracing, client construction, writing the
+certificate, printing the report).
 
 **``eval gate`` (T16):** always reportable (spec §7/§8, no ``--dataset``
 override -- the golden set is the only dataset a baseline is ever compared
@@ -134,6 +150,7 @@ import os
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -144,9 +161,11 @@ import typer
 from dotenv import find_dotenv, load_dotenv
 from google import genai
 
+import harness.calibrate as calibrate_module
 from harness.config import Config, load_config
 from harness.gate import gate as gate_module
 from harness.gate.baseline import DEFAULT_BASELINES_ROOT, BaselineFile, load_baseline
+from harness.judge.judge import Judge
 from harness.models import ModelClient
 from harness.models.anthropic_client import AnthropicClient
 from harness.models.gemini_client import GeminiClient
@@ -171,7 +190,9 @@ from harness.runner import (
 from harness.schema import Certificate, GoldenItem
 from harness.tracing import MissingTracingError, TraceContext
 
-app = typer.Typer(help="Structured-extraction eval harness: run, compare, gate, rescore.")
+app = typer.Typer(
+    help="Structured-extraction eval harness: run, compare, gate, calibrate, rescore."
+)
 
 
 @app.callback(invoke_without_command=False)
@@ -181,6 +202,8 @@ def _load_env_callback() -> None:
 
 DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
 DEFAULT_CERTIFICATE_PATH = Path("data/calibration/certificate.json")
+DEFAULT_CALIBRATION_EMAILS_PATH = Path("data/calibration/emails.jsonl")
+DEFAULT_CALIBRATION_LABELS_PATH = Path("data/calibration/labels.jsonl")
 
 
 class CandidateLabel(StrEnum):
@@ -246,6 +269,31 @@ def _resolve_dataset(
         }
     )
     return effective_config, items, False
+
+
+def _resolve_calibration_dataset(
+    config: Config, emails_path: Path
+) -> tuple[Config, list[GoldenItem]]:
+    """Returns ``(effective_config, items)`` for ``eval calibrate``'s
+    ``--emails`` file: same content-derived ``dataset.path``/``dataset.version``
+    override technique ``_resolve_dataset`` uses for a dev-stage ``--dataset``
+    (``_dev_dataset_version``), so the calibration run's directory identity
+    (``_get_or_run``/``run_eval``) is never confused with a golden run using
+    the same config. Unlike ``_resolve_dataset``, this never implies
+    ``reportable=False`` -- calibration is ALWAYS reportable regardless of
+    which dataset backs it (spec §5/§8); ``reportable`` is decided by the
+    caller, not by which item source was used.
+    """
+
+    items = _load_dataset(emails_path)
+    effective_config = config.model_copy(
+        update={
+            "dataset": config.dataset.model_copy(
+                update={"path": str(emails_path), "version": _dev_dataset_version(emails_path)}
+            )
+        }
+    )
+    return effective_config, items
 
 
 def _load_certificate(path: Path = DEFAULT_CERTIFICATE_PATH) -> Certificate | None:
@@ -322,10 +370,12 @@ def _construct_client(
 
 
 def _build_model_key(label: str, config: Config) -> ModelKey:
-    """Constructs the real ``ModelKey`` for ``label`` -- the only place in
-    this codebase that instantiates a provider SDK client for a candidate or
-    judge role. See the module docstring for the two distinct test
-    techniques this enables.
+    """Constructs the real ``ModelKey`` for ``label`` -- the sole place that
+    bundles a candidate client with a judge client for ``run``/``compare``/
+    ``gate``. See the module docstring for the two distinct test techniques
+    this enables. (``_build_judge_client`` below is a second, deliberate
+    construction seam for ``GeminiClient`` alone -- see its own docstring for
+    why ``eval calibrate`` needs a judge client independent of this one.)
 
     Every required env var is checked FIRST -- both the candidate's and the
     judge's, ``_require_api_key`` -- before any SDK client is constructed for
@@ -361,6 +411,20 @@ def _build_model_key(label: str, config: Config) -> ModelKey:
     )
 
     return ModelKey(label=label, candidate_client=candidate_client, judge_client=judge_client)
+
+
+def _build_judge_client(config: Config) -> ModelClient:
+    """Constructs a standalone Gemini judge client for ``eval calibrate``
+    (T14) -- independent of any candidate role, unlike ``_build_model_key``'s
+    bundled candidate+judge pair. Calibrate needs a fresh judge (to re-judge
+    calibration triples and measure self-consistency) regardless of whether
+    either candidate's calibration run is freshly executed or reused from
+    disk (``_get_or_run``'s reuse path never returns a ``ModelKey`` at all),
+    so it cannot get a judge client through ``_build_model_key`` without also
+    depending on an unrelated candidate's API key/construction succeeding."""
+
+    _require_api_key("Gemini", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+    return _construct_client("Gemini", lambda: GeminiClient(config.models.judge, genai.Client()))
 
 
 def _get_or_run(
@@ -674,6 +738,78 @@ def gate(
     assert outcome is not None
     typer.echo(outcome.rendered)
     raise typer.Exit(code=outcome.exit_code)
+
+
+@app.command()
+def calibrate(
+    retest: Annotated[
+        bool,
+        typer.Option(
+            "--retest",
+            help="Also compute the test-retest consistency ceiling from round=retest labels.",
+        ),
+    ] = False,
+    date_override: Annotated[
+        str | None,
+        typer.Option(
+            "--date",
+            help="Override the certificate date (YYYY-MM-DD); default: the most recent "
+            "label_date in the labels file.",
+        ),
+    ] = None,
+    emails: Annotated[
+        Path, typer.Option("--emails", help="Calibration emails JSONL path.")
+    ] = DEFAULT_CALIBRATION_EMAILS_PATH,
+    labels_path: Annotated[
+        Path, typer.Option("--labels", help="Calibration labels JSONL path.")
+    ] = DEFAULT_CALIBRATION_LABELS_PATH,
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Judge calibration: agreement report + committed certificate (spec §5).
+    Always reportable -- fails fast with ``MissingTracingError`` if Langfuse
+    credentials are absent, before any candidate or judge client is
+    constructed. Writes ``data/calibration/certificate.json``, which every
+    ``run``/``compare``/``gate`` report header consumes."""
+
+    with _clean_exit_on_expected_errors():
+        cfg = load_config(config)
+        effective_cfg, calib_items = _resolve_calibration_dataset(cfg, emails)
+        calib_labels = calibrate_module.load_calibration_labels(labels_path)
+
+        # Fail-fast anchor (spec §5/§8, T9/T11): both TraceContexts are
+        # constructed -- calibrate is always reportable -- before ANY
+        # candidate or judge client (_get_or_run/_build_judge_client below).
+        trace_a = TraceContext.for_run(effective_cfg, True)
+        trace_b = TraceContext.for_run(effective_cfg, True)
+
+        run_dir_a = _get_or_run(
+            effective_cfg, "a", calib_items, EXTRACTION_PROMPT, trace_a, DEFAULT_RUNS_ROOT
+        )
+        run_dir_b = _get_or_run(
+            effective_cfg, "b", calib_items, EXTRACTION_PROMPT, trace_b, DEFAULT_RUNS_ROOT
+        )
+        run_a = load_run(run_dir_a)
+        run_b = load_run(run_dir_b)
+
+        judge = Judge(_build_judge_client(effective_cfg))
+        resolved_date = date.fromisoformat(date_override) if date_override is not None else None
+        label_file_hash = calibrate_module.hash_label_file(labels_path)
+
+        result = calibrate_module.run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=calib_labels,
+            judge=judge,
+            label_file_hash=label_file_hash,
+            date_override=resolved_date,
+            retest=retest,
+        )
+        certificate = calibrate_module.build_certificate(result)
+        calibrate_module.write_certificate(certificate, DEFAULT_CERTIFICATE_PATH)
+        report = calibrate_module.render_calibration_report(result)
+
+    typer.echo(report)
+    typer.echo(f"Certificate written to {DEFAULT_CERTIFICATE_PATH}")
 
 
 @app.command()

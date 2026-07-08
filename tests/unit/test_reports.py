@@ -403,6 +403,63 @@ class TestAdequateWithCaveat:
         assert "Composite mode used for every aggregate below: **FULL_7**." in actual
 
 
+class TestPerCandidateKappaCI:
+    """T14, additive: ``Certificate.per_candidate_kappa_ci`` renders a CI per
+    candidate when present, and leaves the original point-estimate-only
+    rendering byte-identical when absent (asserted by every other golden
+    fixture in this module, none of which carry the new field)."""
+
+    def test_renders_ci_per_candidate_when_present(self):
+        artifact = _run_report_artifact()
+        certificate = _certificate("adequate_with_per_candidate_ci")
+
+        actual = render_run_report(
+            artifact,
+            certificate=certificate,
+            reportable=True,
+            seed=_SEED,
+            n_resamples=_N_RESAMPLES,
+        )
+
+        assert "Per-candidate κ with 95% cluster-bootstrap CI:" in actual
+        assert "candidate a: κ = 0.700 (95% CI [0.500, 0.860])" in actual
+        assert "candidate b: κ = 0.740 (95% CI [0.580, 0.880])" in actual
+        # The old point-estimate-only line must not appear once a CI exists.
+        assert "point estimate only" not in actual
+
+    def test_falls_back_to_point_estimate_only_line_when_ci_absent(self):
+        artifact = _run_report_artifact()
+        certificate = _certificate("adequate")
+        assert certificate.per_candidate_kappa_ci is None
+
+        actual = render_run_report(
+            artifact,
+            certificate=certificate,
+            reportable=True,
+            seed=_SEED,
+            n_resamples=_N_RESAMPLES,
+        )
+
+        assert "point estimate only" in actual
+        assert "95% cluster-bootstrap CI" not in actual
+
+    def test_missing_candidate_entry_in_ci_dict_falls_back_per_candidate(self):
+        base = _certificate("adequate_with_per_candidate_ci")
+        certificate = base.model_copy(update={"per_candidate_kappa_ci": {"a": (0.5, 0.86)}})
+        artifact = _run_report_artifact()
+
+        actual = render_run_report(
+            artifact,
+            certificate=certificate,
+            reportable=True,
+            seed=_SEED,
+            n_resamples=_N_RESAMPLES,
+        )
+
+        assert "candidate a: κ = 0.700 (95% CI [0.500, 0.860])" in actual
+        assert "candidate b: κ = 0.740 (CI not available)" in actual
+
+
 class TestUntracedBanner:
     def test_run_report_shows_untraced_banner(self):
         artifact = dataclasses.replace(_run_report_artifact(), untraced=True)
