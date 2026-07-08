@@ -168,7 +168,17 @@ def make_label(
     round_: str = "initial",
     label_date_: str = "2026-06-01",
     label_id: str | None = None,
+    candidate_value: str = "unused-value",
 ) -> CalibrationLabel:
+    """``candidate_value`` (finding F1) defaults to an arbitrary placeholder
+    for tests that never pair this label against a real judged triple (date/
+    hash-file/round-trip tests, and retest-round labels, which are only ever
+    compared to each other, never to a candidate output). Any test that DOES
+    flow through ``pair_with_labels``/``run_calibration`` for its ``"initial"``
+    round labels must pass the SAME ``candidate_value`` string the
+    corresponding ``Triple``/candidate output actually carries, or the F1
+    binding check will (correctly) raise ``CalibrationBindingError``."""
+
     return CalibrationLabel(
         label_id=label_id or f"lbl-{item_id}-{candidate}-{field}-{round_}",
         item_id=item_id,
@@ -178,6 +188,7 @@ def make_label(
         critique="scripted",
         label_date=label_date_,
         round=round_,
+        output_sha256=calibrate.hash_output(candidate_value),
     )
 
 
@@ -339,8 +350,8 @@ class TestPairWithLabels:
             JudgedTriple(triples[2], verdict="pass", error=None, rationale="ok"),
         ]
         labels = [
-            make_label("cal-001", "a", "issue_summary", "pass"),
-            make_label("cal-001", "a", "requested_action", "pass"),
+            make_label("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
+            make_label("cal-001", "a", "requested_action", "pass", candidate_value="v2"),
         ]
 
         paired, judge_errors, unlabeled = pair_with_labels(judged, labels, round_="initial")
@@ -371,6 +382,143 @@ class TestPairWithLabels:
 
         assert paired == []
         assert unlabeled == 1
+
+
+# --------------------------------------------------------------------------
+# pair_with_labels: output-binding check (finding F1)
+# --------------------------------------------------------------------------
+
+
+class TestPairWithLabelsOutputBinding:
+    def test_hash_mismatch_raises_calibration_binding_error_naming_the_key(self):
+        email = make_item("cal-001").email
+        triple = Triple("cal-001", "a", "issue_summary", email, "ref", "v1")
+        judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
+        # Label was written against a DIFFERENT candidate_value than the one
+        # actually judged now -- e.g. the run directory was regenerated.
+        labels = [make_label("cal-001", "a", "issue_summary", "pass", candidate_value="stale-v1")]
+
+        with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
+            pair_with_labels(judged, labels, round_="initial")
+
+        assert excinfo.value.mismatches == (("cal-001", "a", "issue_summary"),)
+        assert "cal-001" in str(excinfo.value)
+
+    def test_one_mismatch_blocks_all_pairing_not_just_the_bad_key(self):
+        """All-or-nothing (F1): a single mismatched label must prevent EVERY
+        pair from being returned, including otherwise-correctly-bound ones."""
+
+        email = make_item("cal-001").email
+        good_triple = Triple("cal-001", "a", "issue_summary", email, "ref", "good-value")
+        bad_triple = Triple("cal-002", "a", "issue_summary", email, "ref", "good-value-2")
+        judged = [
+            JudgedTriple(good_triple, verdict="pass", error=None, rationale="ok"),
+            JudgedTriple(bad_triple, verdict="pass", error=None, rationale="ok"),
+        ]
+        labels = [
+            make_label("cal-001", "a", "issue_summary", "pass", candidate_value="good-value"),
+            make_label(
+                "cal-002", "a", "issue_summary", "pass", candidate_value="wrong-recorded-value"
+            ),
+        ]
+
+        with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
+            pair_with_labels(judged, labels, round_="initial")
+
+        assert excinfo.value.mismatches == (("cal-002", "a", "issue_summary"),)
+
+    def test_matching_hash_pairs_normally(self):
+        email = make_item("cal-001").email
+        triple = Triple("cal-001", "a", "issue_summary", email, "ref", "exact-value")
+        judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
+        labels = [
+            make_label("cal-001", "a", "issue_summary", "pass", candidate_value="exact-value")
+        ]
+
+        paired, judge_errors, unlabeled = pair_with_labels(judged, labels, round_="initial")
+
+        assert len(paired) == 1
+        assert judge_errors == 0
+        assert unlabeled == 0
+
+    def test_unlabeled_triple_is_never_hash_checked(self):
+        """A triple with no matching label at all can't mismatch -- there is
+        no label to compare against, so it is simply counted unlabeled."""
+
+        email = make_item("cal-001").email
+        triple = Triple("cal-001", "a", "issue_summary", email, "ref", "anything")
+        judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
+
+        paired, judge_errors, unlabeled = pair_with_labels(judged, [], round_="initial")
+
+        assert paired == []
+        assert judge_errors == 0
+        assert unlabeled == 1
+
+
+# --------------------------------------------------------------------------
+# hash_output
+# --------------------------------------------------------------------------
+
+
+class TestHashOutput:
+    def test_matches_manual_sha256_utf8_no_trimming(self):
+        import hashlib
+
+        value = "  candidate value with spaces  \n"
+
+        assert calibrate.hash_output(value) == hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def test_different_strings_give_different_hashes(self):
+        assert calibrate.hash_output("a") != calibrate.hash_output("b")
+
+    def test_trimmed_and_untrimmed_strings_differ(self):
+        # Documents the "no trimming" normalization rule explicitly.
+        assert calibrate.hash_output("value") != calibrate.hash_output(" value ")
+
+
+# --------------------------------------------------------------------------
+# labeling_template_rows
+# --------------------------------------------------------------------------
+
+
+class TestLabelingTemplateRows:
+    def test_emits_one_prefilled_row_per_triple_with_correct_hash(self):
+        email = make_item("cal-001").email
+        triples = [
+            Triple("cal-001", "a", "issue_summary", email, "ref-1", "candidate-value-1"),
+            Triple("cal-001", "a", "requested_action", email, "ref-2", "candidate-value-2"),
+        ]
+
+        rows = calibrate.labeling_template_rows(triples)
+
+        assert len(rows) == 2
+        assert rows[0] == {
+            "item_id": "cal-001",
+            "candidate": "a",
+            "field": "issue_summary",
+            "candidate_value": "candidate-value-1",
+            "output_sha256": calibrate.hash_output("candidate-value-1"),
+            "verdict": "",
+            "critique": "",
+        }
+        assert rows[1]["output_sha256"] == calibrate.hash_output("candidate-value-2")
+
+    def test_empty_triples_gives_empty_rows(self):
+        assert calibrate.labeling_template_rows([]) == []
+
+    def test_rows_are_born_correctly_bound_for_calibration_label(self):
+        """Every row's output_sha256 must equal hash_output(candidate_value)
+        exactly, since a future generator will feed candidate_value/
+        output_sha256 straight into a CalibrationLabel once verdict/critique
+        are filled in by hand."""
+
+        email = make_item("cal-001").email
+        triples = [Triple("cal-001", "b", "issue_summary", email, "ref", "some output text")]
+
+        rows = calibrate.labeling_template_rows(triples)
+
+        assert rows[0]["output_sha256"] == calibrate.hash_output(rows[0]["candidate_value"])
 
 
 # --------------------------------------------------------------------------
@@ -957,7 +1105,9 @@ def _calibration_fixture():
                 value = cv(item_id, candidate, f)
                 label_verdict = "fail" if key in fail_pairs else "pass"
                 if key != unlabeled:
-                    labels.append(make_label(item_id, candidate, f, label_verdict))
+                    labels.append(
+                        make_label(item_id, candidate, f, label_verdict, candidate_value=value)
+                    )
                 # Every triple is judged regardless of whether it ends up
                 # labeled -- judge_triples judges the full triple set, and
                 # pairing (not judging) is what excludes the unlabeled one.
@@ -1070,6 +1220,375 @@ class TestRunCalibrationIntegration:
                 label_file_hash="fixture-hash",
                 n_resamples=50,
             )
+
+
+# --------------------------------------------------------------------------
+# judgment_records_from_judged / pair_judgments_with_labels (finding F2)
+# --------------------------------------------------------------------------
+
+
+class TestJudgmentRecordsFromJudged:
+    def test_converts_judged_triples_with_correct_hashes(self):
+        email = make_item("cal-001").email
+        triple = Triple("cal-001", "a", "issue_summary", email, "ref", "the-value")
+        judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
+
+        records = calibrate.judgment_records_from_judged(judged, judge_version="jv-x")
+
+        assert len(records) == 1
+        record = records[0]
+        assert record.item_id == "cal-001"
+        assert record.candidate == "a"
+        assert record.field == "issue_summary"
+        assert record.verdict == "pass"
+        assert record.error is None
+        assert record.rationale == "ok"
+        assert record.output_sha256 == calibrate.hash_output("the-value")
+        assert record.judge_version == "jv-x"
+
+    def test_preserves_error_and_none_verdict(self):
+        email = make_item("cal-001").email
+        triple = Triple("cal-001", "b", "requested_action", email, "ref", "some-value")
+        judged = [JudgedTriple(triple, verdict=None, error="refusal", rationale=None)]
+
+        records = calibrate.judgment_records_from_judged(judged, judge_version="jv-x")
+
+        assert records[0].verdict is None
+        assert records[0].error == "refusal"
+
+
+class TestPairJudgmentsWithLabels:
+    def test_pairs_matching_and_excludes_judge_errors_and_unlabeled(self):
+        judgments = [
+            calibrate.JudgmentRecord(
+                "cal-001", "a", "issue_summary", "pass", None, "ok",
+                calibrate.hash_output("v1"), "jv",
+            ),
+            calibrate.JudgmentRecord(
+                "cal-001", "a", "requested_action", None, "refusal", None,
+                calibrate.hash_output("v2"), "jv",
+            ),
+            calibrate.JudgmentRecord(
+                "cal-002", "a", "issue_summary", "pass", None, "ok",
+                calibrate.hash_output("v3"), "jv",
+            ),
+        ]
+        labels = [
+            make_label("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
+            make_label("cal-001", "a", "requested_action", "pass", candidate_value="v2"),
+        ]
+
+        paired, judge_errors, unlabeled = calibrate.pair_judgments_with_labels(
+            judgments, labels, round_="initial"
+        )
+
+        assert len(paired) == 1
+        assert judge_errors == 1
+        assert unlabeled == 1
+
+    def test_persisted_hash_mismatch_raises_binding_error(self):
+        judgments = [
+            calibrate.JudgmentRecord(
+                "cal-001", "a", "issue_summary", "pass", None, "ok", "deadbeef" * 8, "jv",
+            ),
+        ]
+        labels = [make_label("cal-001", "a", "issue_summary", "pass", candidate_value="v1")]
+
+        with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
+            calibrate.pair_judgments_with_labels(judgments, labels, round_="initial")
+
+        assert excinfo.value.mismatches == (("cal-001", "a", "issue_summary"),)
+
+
+# --------------------------------------------------------------------------
+# write_judgments_jsonl / load_judgments_jsonl round trip (finding F2)
+# --------------------------------------------------------------------------
+
+
+class TestJudgmentsFileRoundTrip:
+    def test_round_trips_meta_judgments_and_self_consistency(self, tmp_path):
+        path = tmp_path / "judgments.jsonl"
+        judgments = [
+            calibrate.JudgmentRecord(
+                "cal-001", "a", "issue_summary", "pass", None, "ok",
+                calibrate.hash_output("v1"), "jv-1",
+            ),
+            calibrate.JudgmentRecord(
+                "cal-002", "b", "requested_action", None, "refusal", None,
+                calibrate.hash_output("v2"), "jv-1",
+            ),
+        ]
+        self_consistency = [
+            calibrate.SelfConsistencyRecord("cal-001", "a", "issue_summary", 0, "pass", "jv-1"),
+            calibrate.SelfConsistencyRecord("cal-001", "a", "issue_summary", 1, "fail", "jv-1"),
+        ]
+
+        calibrate.write_judgments_jsonl(
+            path,
+            judgments=judgments,
+            self_consistency=self_consistency,
+            judge_version="jv-1",
+            written_at="2026-06-01T00:00:00+00:00",
+        )
+        loaded = calibrate.load_judgments_jsonl(path)
+
+        assert loaded.judge_version == "jv-1"
+        assert loaded.written_at == "2026-06-01T00:00:00+00:00"
+        assert loaded.judgments == tuple(judgments)
+        assert loaded.self_consistency == tuple(self_consistency)
+
+    def test_write_is_atomic_no_leftover_temp_file(self, tmp_path):
+        path = tmp_path / "judgments.jsonl"
+
+        calibrate.write_judgments_jsonl(
+            path, judgments=[], self_consistency=[], judge_version="jv-1"
+        )
+
+        assert path.exists()
+        assert not (tmp_path / "judgments.jsonl.tmp").exists()
+
+    def test_overwrite_fully_replaces_prior_content(self, tmp_path):
+        path = tmp_path / "judgments.jsonl"
+        calibrate.write_judgments_jsonl(
+            path,
+            judgments=[
+                calibrate.JudgmentRecord(
+                    "cal-001", "a", "issue_summary", "pass", None, "ok", "h1", "jv-1"
+                )
+            ],
+            self_consistency=[],
+            judge_version="jv-1",
+        )
+
+        calibrate.write_judgments_jsonl(
+            path, judgments=[], self_consistency=[], judge_version="jv-2"
+        )
+
+        loaded = calibrate.load_judgments_jsonl(path)
+        assert loaded.judge_version == "jv-2"
+        assert loaded.judgments == ()
+
+    def test_missing_meta_row_raises(self, tmp_path):
+        path = tmp_path / "judgments.jsonl"
+        row = {
+            "kind": "judgment",
+            "item_id": "x",
+            "candidate": "a",
+            "field": "issue_summary",
+            "verdict": "pass",
+            "error": None,
+            "rationale": "ok",
+            "output_sha256": "h",
+            "judge_version": "jv",
+        }
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="meta"):
+            calibrate.load_judgments_jsonl(path)
+
+    def test_unrecognized_row_kind_raises(self, tmp_path):
+        path = tmp_path / "judgments.jsonl"
+        lines = [
+            json.dumps({"kind": "meta", "judge_version": "jv-1", "written_at": "2026-01-01"}),
+            json.dumps({"kind": "mystery"}),
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="unrecognized"):
+            calibrate.load_judgments_jsonl(path)
+
+
+# --------------------------------------------------------------------------
+# run_calibration_offline: zero-API recompute (finding F2)
+# --------------------------------------------------------------------------
+
+
+class TestRunCalibrationOffline:
+    def _judgments_file_from_live_result(
+        self, result: CalibrationResult
+    ) -> calibrate.JudgmentsFile:
+        return calibrate.JudgmentsFile(
+            judge_version=result.judge_version,
+            written_at="2026-06-01T00:00:00+00:00",
+            judgments=tuple(
+                calibrate.judgment_records_from_judged(
+                    result.judged_triples, judge_version=result.judge_version
+                )
+            ),
+            self_consistency=result.self_consistency_records,
+        )
+
+    def test_offline_recompute_matches_live_result(self):
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=200,
+            seed=0,
+        )
+        judgments_file = self._judgments_file_from_live_result(live_result)
+
+        offline_result = calibrate.run_calibration_offline(
+            judgments=judgments_file,
+            labels=labels,
+            label_file_hash="fixture-hash",
+            n_resamples=200,
+            seed=0,
+        )
+
+        assert offline_result.overall.kappa == pytest.approx(live_result.overall.kappa)
+        assert offline_result.overall.ci == pytest.approx(live_result.overall.ci)
+        assert offline_result.verdict == live_result.verdict
+        assert offline_result.judge_errors_excluded == live_result.judge_errors_excluded
+        assert offline_result.unlabeled_excluded == live_result.unlabeled_excluded
+        assert offline_result.self_consistency.n_triples == live_result.self_consistency.n_triples
+        assert offline_result.self_consistency.flip_rate == pytest.approx(
+            live_result.self_consistency.flip_rate
+        )
+        assert offline_result.date == live_result.date
+        # Offline never re-derives judged_triples/self_consistency_records --
+        # it already consumed a persisted copy of them.
+        assert offline_result.judged_triples == ()
+        assert offline_result.self_consistency_records == ()
+
+    def test_offline_never_touches_judge_or_client(self):
+        """No ``judge``/``Judge`` argument even exists on this call --
+        proves by signature, not just by absence of a fake, that zero calls
+        can be made."""
+
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            seed=0,
+        )
+        judgments_file = self._judgments_file_from_live_result(live_result)
+
+        import inspect
+
+        sig = inspect.signature(calibrate.run_calibration_offline)
+        assert "judge" not in sig.parameters
+
+        calibrate.run_calibration_offline(
+            judgments=judgments_file, labels=labels, label_file_hash="fixture-hash", n_resamples=50
+        )
+
+    def test_stale_judge_version_raises(self):
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            seed=0,
+        )
+        judgments_file = self._judgments_file_from_live_result(live_result)
+        stale = calibrate.JudgmentsFile(
+            judge_version="some-old-judge-version-hash",
+            written_at=judgments_file.written_at,
+            judgments=judgments_file.judgments,
+            self_consistency=judgments_file.self_consistency,
+        )
+
+        with pytest.raises(calibrate.StaleJudgmentsError, match="Re-run"):
+            calibrate.run_calibration_offline(
+                judgments=stale, labels=labels, label_file_hash="fixture-hash", n_resamples=50
+            )
+
+    def test_output_hash_mismatch_against_label_raises_binding_error(self):
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            seed=0,
+        )
+        judgments_file = self._judgments_file_from_live_result(live_result)
+        # Corrupt exactly one persisted judgment's hash -- simulating
+        # judgments.jsonl no longer matching labels.jsonl.
+        corrupted = list(judgments_file.judgments)
+        corrupted[0] = calibrate.JudgmentRecord(
+            item_id=corrupted[0].item_id,
+            candidate=corrupted[0].candidate,
+            field=corrupted[0].field,
+            verdict=corrupted[0].verdict,
+            error=corrupted[0].error,
+            rationale=corrupted[0].rationale,
+            output_sha256="0" * 64,
+            judge_version=corrupted[0].judge_version,
+        )
+        corrupted_file = calibrate.JudgmentsFile(
+            judge_version=judgments_file.judge_version,
+            written_at=judgments_file.written_at,
+            judgments=tuple(corrupted),
+            self_consistency=judgments_file.self_consistency,
+        )
+
+        with pytest.raises(calibrate.CalibrationBindingError):
+            calibrate.run_calibration_offline(
+                judgments=corrupted_file, labels=labels, label_file_hash="fixture-hash",
+                n_resamples=50,
+            )
+
+    def test_no_matching_labels_raises(self):
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            seed=0,
+        )
+        judgments_file = self._judgments_file_from_live_result(live_result)
+
+        with pytest.raises(ValueError, match="no labeled judgment"):
+            calibrate.run_calibration_offline(
+                judgments=judgments_file, labels=[], label_file_hash="fixture-hash",
+                n_resamples=50,
+            )
+
+    def test_retest_ceiling_computed_purely_from_labels(self):
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            seed=0,
+        )
+        judgments_file = self._judgments_file_from_live_result(live_result)
+        retest_labels = [
+            make_label("cal-001", "a", "issue_summary", "pass", round_="retest"),
+            make_label("cal-002", "a", "issue_summary", "fail", round_="retest"),
+            make_label("cal-003", "a", "issue_summary", "pass", round_="retest"),
+        ]
+
+        offline_result = calibrate.run_calibration_offline(
+            judgments=judgments_file,
+            labels=labels + retest_labels,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            retest=True,
+        )
+
+        assert offline_result.ceiling is not None
+        assert offline_result.ceiling.kappa == pytest.approx(1.0)
 
 
 # --------------------------------------------------------------------------
@@ -1222,6 +1741,18 @@ def _seed_calibration_runs(effective_cfg, items: list[GoldenItem]) -> None:
         )
 
 
+def _happy_path_candidate_value(item_id: str, candidate: str, field: str) -> str:
+    """The exact ``candidate_value`` ``_CalibrationCandidateClient`` produces
+    for ``(item_id, candidate, field)`` -- ``issue_summary=f"{item_id}-
+    {candidate}-issue"``/``requested_action=f"{item_id}-{candidate}-action"``
+    -- so ``_happy_path_labels`` can bind (F1) each label's ``output_sha256``
+    to the SAME value ``build_triples`` will reconstruct from the seeded run.
+    """
+
+    short = "issue" if field == "issue_summary" else "action"
+    return f"{item_id}-{candidate}-{short}"
+
+
 def _happy_path_labels(item_ids: list[str]) -> list[CalibrationLabel]:
     """Owner labels matching ``_CalibrationCandidateClient``'s output exactly
     -- perfect agreement -- with one "fail" per candidate (so neither
@@ -1233,7 +1764,15 @@ def _happy_path_labels(item_ids: list[str]) -> list[CalibrationLabel]:
         for candidate in ("a", "b"):
             for f in ("issue_summary", "requested_action"):
                 verdict = "fail" if (item_id, candidate, f) in fail_pairs else "pass"
-                labels.append(make_label(item_id, candidate, f, verdict))
+                labels.append(
+                    make_label(
+                        item_id,
+                        candidate,
+                        f,
+                        verdict,
+                        candidate_value=_happy_path_candidate_value(item_id, candidate, f),
+                    )
+                )
     return labels
 
 
@@ -1341,6 +1880,16 @@ class TestCalibrateCLIHappyPath:
         assert certificate.per_candidate_kappa_ci is not None
         assert certificate.label_file_hash == hash_label_file(labels_path)
 
+        # Finding F2: the live run must persist its judge output so a later
+        # `--offline` invocation can recompute without any API calls.
+        judgments_path = tmp_path / "data" / "calibration" / "judgments.jsonl"
+        assert judgments_path.exists()
+        assert "Judgments written to" in result.output
+        judgments = calibrate.load_judgments_jsonl(judgments_path)
+        assert judgments.judge_version == judge_version()
+        assert len(judgments.judgments) == len(item_ids) * 2 * 2  # 2 candidates x 2 fields
+        assert len(judgments.self_consistency) > 0
+
     def test_date_option_overrides_certificate_date(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         item_ids = ["cal-001", "cal-002", "cal-003"]
@@ -1426,3 +1975,257 @@ class TestCalibrateCLIHappyPath:
         cert_path = tmp_path / "data" / "calibration" / "certificate.json"
         certificate = Certificate.model_validate(json.loads(cert_path.read_text(encoding="utf-8")))
         assert certificate.ceiling_kappa is not None
+
+
+# --------------------------------------------------------------------------
+# `eval calibrate` forces K=1 regardless of config.k (finding F3)
+# --------------------------------------------------------------------------
+
+
+class TestCalibrateForcesK1:
+    def test_calibrate_runs_candidates_at_k1_regardless_of_config_k(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        item_ids = ["cal-001", "cal-002", "cal-003"]
+        items = [_cli_item(i) for i in item_ids]
+        emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
+        labels_path = _write_labels(tmp_path / "labels.jsonl", _happy_path_labels(item_ids))
+        # config.k = 3 -- calibrate must still run each candidate at k=1 (F3),
+        # never inheriting this. No pre-seeded runs here on purpose: this
+        # test needs _build_model_key to actually fire so it can observe how
+        # many candidate calls a fresh run makes.
+        config_path = _write_calibrate_config(tmp_path / "config.yaml", k=3)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        registry: dict[str, list[_CalibrationCandidateClient]] = {}
+
+        def factory(label: str, config: object) -> ModelKey:
+            candidate_client = _CalibrationCandidateClient(candidate=label)
+            registry.setdefault(label, []).append(candidate_client)
+            return ModelKey(
+                label=label,
+                candidate_client=candidate_client,
+                judge_client=_AlwaysPassJudgeClient(),
+            )
+
+        monkeypatch.setattr(cli, "_build_model_key", factory)
+        monkeypatch.setattr(cli, "_build_judge_client", lambda config: _happy_path_judge_client())
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(emails_path),
+                "--labels",
+                str(labels_path),
+                "--config",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        for label in ("a", "b"):
+            assert len(registry[label]) == 1  # _build_model_key called exactly once per candidate
+            calls = registry[label][0].calls
+            # Exactly one candidate call per item -- NOT k=3 x len(item_ids).
+            assert len(calls) == len(item_ids)
+
+
+# --------------------------------------------------------------------------
+# `eval calibrate --offline` (finding F2): zero client construction, no
+# tracing requirement, and the loud-failure contracts (stale judge_version,
+# output_sha256 mismatch).
+# --------------------------------------------------------------------------
+
+
+class _RaisingProviderClient:
+    """Stand-in for AnthropicClient/OpenAIClient/GeminiClient that raises on
+    construction -- proves --offline never reaches real provider SDK client
+    construction (mirrors test_cli.py's ``TestRescore`` pattern, finding F2)."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            f"{self.__class__.__name__} must not be constructed in --offline mode"
+        )
+
+
+def _forbid_real_provider_client_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "AnthropicClient", _RaisingProviderClient)
+    monkeypatch.setattr(cli, "OpenAIClient", _RaisingProviderClient)
+    monkeypatch.setattr(cli, "GeminiClient", _RaisingProviderClient)
+
+
+def _seed_live_judgments(tmp_path: Path) -> tuple[Path, Path]:
+    """Runs `eval calibrate` live once through the CLI (candidate runs pre-
+    seeded/faked via _build_model_key, judge faked via _build_judge_client,
+    TraceContext faked) to produce a real, on-disk judgments.jsonl +
+    certificate.json this module's ``--offline`` tests can then consume.
+    Returns ``(labels_path, judgments_path)``."""
+
+    item_ids = ["cal-001", "cal-002", "cal-003"]
+    items = [_cli_item(i) for i in item_ids]
+    emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
+    labels_path = _write_labels(tmp_path / "labels.jsonl", _happy_path_labels(item_ids))
+    config_path = _write_calibrate_config(tmp_path / "config.yaml", k=1)
+
+    cfg = load_config(config_path)
+    effective_cfg, calib_items = cli._resolve_calibration_dataset(cfg, emails_path)
+    _seed_calibration_runs(effective_cfg, calib_items)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cli, "TraceContext", _FakeTraceContext)
+        mp.setattr(
+            cli,
+            "_build_model_key",
+            lambda label, config: (_ for _ in ()).throw(AssertionError("must reuse")),
+        )
+        mp.setattr(cli, "_build_judge_client", lambda config: _happy_path_judge_client())
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(emails_path),
+                "--labels",
+                str(labels_path),
+                "--config",
+                str(config_path),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+
+    judgments_path = tmp_path / "data" / "calibration" / "judgments.jsonl"
+    return labels_path, judgments_path
+
+
+class TestCalibrateCLIOffline:
+    def test_offline_recompute_matches_live_certificate_with_zero_client_construction(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        labels_path, judgments_path = _seed_live_judgments(tmp_path)
+        cert_path = tmp_path / "data" / "calibration" / "certificate.json"
+        live_certificate = Certificate.model_validate(
+            json.loads(cert_path.read_text(encoding="utf-8"))
+        )
+
+        def _forbid(*args: object, **kwargs: object) -> None:
+            raise AssertionError("must not be called in --offline mode")
+
+        monkeypatch.setattr(cli, "_build_model_key", _forbid)
+        monkeypatch.setattr(cli, "_build_judge_client", _forbid)
+        _forbid_real_provider_client_construction(monkeypatch)
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--offline",
+                "--labels",
+                str(labels_path),
+                "--judgments",
+                str(judgments_path),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Judge Calibration Report" in result.output
+        offline_certificate = Certificate.model_validate(
+            json.loads(cert_path.read_text(encoding="utf-8"))
+        )
+        assert offline_certificate.overall_kappa == pytest.approx(live_certificate.overall_kappa)
+        assert offline_certificate.kappa_ci == pytest.approx(live_certificate.kappa_ci)
+        assert offline_certificate.verdict == live_certificate.verdict
+
+    def test_offline_requires_no_langfuse_credentials_and_never_touches_trace_context(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        labels_path, judgments_path = _seed_live_judgments(tmp_path)
+        monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+        monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+
+        def _forbid_for_run(*args: object, **kwargs: object) -> None:
+            raise AssertionError("TraceContext must never be constructed in --offline mode")
+
+        monkeypatch.setattr(cli.TraceContext, "for_run", staticmethod(_forbid_for_run))
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--offline",
+                "--labels",
+                str(labels_path),
+                "--judgments",
+                str(judgments_path),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+
+    def test_stale_judge_version_gives_clean_exit_one(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        labels_path, judgments_path = _seed_live_judgments(tmp_path)
+        judgments = calibrate.load_judgments_jsonl(judgments_path)
+        calibrate.write_judgments_jsonl(
+            judgments_path,
+            judgments=judgments.judgments,
+            self_consistency=judgments.self_consistency,
+            judge_version="stale-judge-version-hash",
+        )
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--offline",
+                "--labels",
+                str(labels_path),
+                "--judgments",
+                str(judgments_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "judge_version" in result.output.lower() or "stale" in result.output.lower()
+
+    def test_output_hash_mismatch_gives_clean_exit_one(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        labels_path, judgments_path = _seed_live_judgments(tmp_path)
+        judgments = calibrate.load_judgments_jsonl(judgments_path)
+        first = judgments.judgments[0]
+        corrupted_first = calibrate.JudgmentRecord(
+            item_id=first.item_id,
+            candidate=first.candidate,
+            field=first.field,
+            verdict=first.verdict,
+            error=first.error,
+            rationale=first.rationale,
+            output_sha256="0" * 64,
+            judge_version=first.judge_version,
+        )
+        calibrate.write_judgments_jsonl(
+            judgments_path,
+            judgments=[corrupted_first, *judgments.judgments[1:]],
+            self_consistency=judgments.self_consistency,
+            judge_version=judgments.judge_version,
+        )
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--offline",
+                "--labels",
+                str(labels_path),
+                "--judgments",
+                str(judgments_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert first.item_id in result.output

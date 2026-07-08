@@ -140,9 +140,24 @@ class TestCalibrationLabel:
             critique="Matches the reference intent.",
             label_date="2026-06-01",
             round="initial",
+            output_sha256="a" * 64,
         )
         assert label.verdict == "pass"
         assert label.round == "initial"
+        assert label.output_sha256 == "a" * 64
+
+    def test_output_sha256_is_required(self):
+        with pytest.raises(ValidationError):
+            CalibrationLabel(
+                label_id="lbl-001",
+                item_id="cal-001",
+                candidate="a",
+                field="issue_summary",
+                verdict="pass",
+                critique="Matches the reference intent.",
+                label_date="2026-06-01",
+                round="initial",
+            )
 
 
 class TestCertificate:

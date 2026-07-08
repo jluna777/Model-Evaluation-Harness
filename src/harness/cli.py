@@ -8,9 +8,9 @@ module docstring for why the runner itself never imports provider SDKs) and
 the only place that decides whether a run is *reportable* (spec §8) from the
 ``--dataset`` flag.
 
-**``eval calibrate`` (T14):** always reportable (spec §5/§8: judge
-calibration must be traceable) and never accepts a ``--dataset`` override --
-its item source is always ``--emails`` (default
+**``eval calibrate`` (T14):** always reportable when run live (spec §5/§8:
+judge calibration must be traceable) and never accepts a ``--dataset``
+override -- its item source is always ``--emails`` (default
 ``data/calibration/emails.jsonl``). It reuses the same ``_get_or_run`` seam
 ``run``/``compare`` use to obtain each candidate's persisted calibration
 ``RunArtifact`` (``harness.calibrate``'s module docstring explains why this,
@@ -22,7 +22,25 @@ freshly executed or reused from disk. All of the actual statistics/decision
 logic (agreement, verdict, self-consistency, the retest ceiling, the
 certificate) lives in ``harness.calibrate``; this module is CLI plumbing only
 (dataset/label loading, tracing, client construction, writing the
-certificate, printing the report).
+certificate/judgments file, printing the report).
+
+Three T14 review findings, distinct from ``eval gate``'s own F1-F3 below:
+(F1) every candidate/judge client this command's live path constructs is
+still routed through the usual ``_get_or_run``/``_build_judge_client`` seams,
+but ``harness.calibrate.pair_with_labels`` now verifies each label's
+``output_sha256`` against the candidate output it is actually being paired
+with -- ``CalibrationBindingError`` (mapped to a clean exit 1 alongside
+``_clean_exit_on_expected_errors``'s existing set) if a regenerated run
+directory has silently drifted the two apart. (F2) the live path persists
+its full judge output to ``judgments.jsonl`` (``--judgments``, default
+``data/calibration/judgments.jsonl``); ``--offline`` recomputes the report +
+certificate from that file plus the labels file with ZERO client
+construction and no tracing requirement at all (it makes no calls of any
+kind to report on) -- see ``harness.calibrate.run_calibration_offline``.
+(F3) the live path always overrides ``config.k`` to 1 for both candidate
+runs (``calibrate_cfg = effective_cfg.model_copy(update={"k": 1})``):
+calibration is defined at one candidate output per item, and the loaded
+config's own ``k`` (3 by default) would triple spend for no benefit.
 
 **``eval gate`` (T16):** always reportable (spec §7/§8, no ``--dataset``
 override -- the golden set is the only dataset a baseline is ever compared
@@ -204,6 +222,7 @@ DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
 DEFAULT_CERTIFICATE_PATH = Path("data/calibration/certificate.json")
 DEFAULT_CALIBRATION_EMAILS_PATH = Path("data/calibration/emails.jsonl")
 DEFAULT_CALIBRATION_LABELS_PATH = Path("data/calibration/labels.jsonl")
+DEFAULT_CALIBRATION_JUDGMENTS_PATH = Path("data/calibration/judgments.jsonl")
 
 
 class CandidateLabel(StrEnum):
@@ -489,6 +508,13 @@ def _clean_exit_on_expected_errors():
         MissingCertificateError,
         MissingApiKeyError,
         ClientConstructionError,
+        # T14 findings F1/F2: a calibration label bound to a different
+        # candidate output than the one actually judged (live or, offline,
+        # persisted in judgments.jsonl), or offline judgments.jsonl produced
+        # by a since-changed judge -- both are setup/data-integrity problems
+        # discovered before any statistic can be trusted, never a traceback.
+        calibrate_module.CalibrationBindingError,
+        calibrate_module.StaleJudgmentsError,
     ) as exc:
         typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
@@ -749,6 +775,17 @@ def calibrate(
             help="Also compute the test-retest consistency ceiling from round=retest labels.",
         ),
     ] = False,
+    offline: Annotated[
+        bool,
+        typer.Option(
+            "--offline",
+            help="Recompute the report + certificate purely from data/calibration/"
+            "judgments.jsonl (a prior live run's persisted judge output) and the labels "
+            "file -- zero API calls, zero client construction (finding F2). Fails loudly "
+            "if judgments.jsonl is stale against the current judge, or misaligned with "
+            "labels.jsonl.",
+        ),
+    ] = False,
     date_override: Annotated[
         str | None,
         typer.Option(
@@ -763,35 +800,89 @@ def calibrate(
     labels_path: Annotated[
         Path, typer.Option("--labels", help="Calibration labels JSONL path.")
     ] = DEFAULT_CALIBRATION_LABELS_PATH,
+    judgments_path: Annotated[
+        Path,
+        typer.Option(
+            "--judgments",
+            help="Persisted judge-results JSONL path: a live run writes this; --offline "
+            "reads it.",
+        ),
+    ] = DEFAULT_CALIBRATION_JUDGMENTS_PATH,
     config: ConfigOption = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Judge calibration: agreement report + committed certificate (spec §5).
-    Always reportable -- fails fast with ``MissingTracingError`` if Langfuse
-    credentials are absent, before any candidate or judge client is
-    constructed. Writes ``data/calibration/certificate.json``, which every
-    ``run``/``compare``/``gate`` report header consumes."""
+
+    Live (default): always reportable -- fails fast with ``MissingTracingError``
+    if Langfuse credentials are absent, before any candidate or judge client is
+    constructed -- and persists its judge output to ``judgments.jsonl``
+    (finding F2) so a later ``--offline`` run can recompute for free. Both
+    candidates are always run at K=1 regardless of ``config.k`` (finding F3:
+    calibration is defined at one candidate output per item).
+
+    ``--offline``: a pure recompute from ``judgments.jsonl`` + the labels
+    file. It makes zero calls of any kind, so it constructs no client at all
+    and has no tracing requirement -- there is nothing here for Langfuse to
+    ever observe.
+
+    Both modes write ``data/calibration/certificate.json``, which every
+    ``run``/``compare``/``gate`` report header consumes.
+    """
+
+    if offline:
+        with _clean_exit_on_expected_errors():
+            calib_labels = calibrate_module.load_calibration_labels(labels_path)
+            judgments = calibrate_module.load_judgments_jsonl(judgments_path)
+            resolved_date = (
+                date.fromisoformat(date_override) if date_override is not None else None
+            )
+            label_file_hash = calibrate_module.hash_label_file(labels_path)
+
+            result = calibrate_module.run_calibration_offline(
+                judgments=judgments,
+                labels=calib_labels,
+                label_file_hash=label_file_hash,
+                date_override=resolved_date,
+                retest=retest,
+            )
+            certificate = calibrate_module.build_certificate(result)
+            calibrate_module.write_certificate(certificate, DEFAULT_CERTIFICATE_PATH)
+            report = calibrate_module.render_calibration_report(result)
+
+        typer.echo(report)
+        typer.echo(f"Certificate written to {DEFAULT_CERTIFICATE_PATH}")
+        return
 
     with _clean_exit_on_expected_errors():
         cfg = load_config(config)
         effective_cfg, calib_items = _resolve_calibration_dataset(cfg, emails)
+        # Finding F3: calibration is defined at ONE candidate output per item
+        # (CalibrationLabel carries no replicate index, and build_triples
+        # always takes the lowest-replicate row per item) -- force k=1 for
+        # both candidate runs regardless of config.k, which defaults to 3 for
+        # run/compare and would triple calibration spend for zero benefit.
+        # Overridden via model_copy (the same technique _resolve_dataset uses
+        # for its own config overrides) so _get_or_run's reuse-identity
+        # computation and run_eval's own manifest agree on k=1 for every
+        # calibration run -- config.k is never inherited here.
+        calibrate_cfg = effective_cfg.model_copy(update={"k": 1})
         calib_labels = calibrate_module.load_calibration_labels(labels_path)
 
         # Fail-fast anchor (spec §5/§8, T9/T11): both TraceContexts are
         # constructed -- calibrate is always reportable -- before ANY
         # candidate or judge client (_get_or_run/_build_judge_client below).
-        trace_a = TraceContext.for_run(effective_cfg, True)
-        trace_b = TraceContext.for_run(effective_cfg, True)
+        trace_a = TraceContext.for_run(calibrate_cfg, True)
+        trace_b = TraceContext.for_run(calibrate_cfg, True)
 
         run_dir_a = _get_or_run(
-            effective_cfg, "a", calib_items, EXTRACTION_PROMPT, trace_a, DEFAULT_RUNS_ROOT
+            calibrate_cfg, "a", calib_items, EXTRACTION_PROMPT, trace_a, DEFAULT_RUNS_ROOT
         )
         run_dir_b = _get_or_run(
-            effective_cfg, "b", calib_items, EXTRACTION_PROMPT, trace_b, DEFAULT_RUNS_ROOT
+            calibrate_cfg, "b", calib_items, EXTRACTION_PROMPT, trace_b, DEFAULT_RUNS_ROOT
         )
         run_a = load_run(run_dir_a)
         run_b = load_run(run_dir_b)
 
-        judge = Judge(_build_judge_client(effective_cfg))
+        judge = Judge(_build_judge_client(calibrate_cfg))
         resolved_date = date.fromisoformat(date_override) if date_override is not None else None
         label_file_hash = calibrate_module.hash_label_file(labels_path)
 
@@ -808,8 +899,22 @@ def calibrate(
         calibrate_module.write_certificate(certificate, DEFAULT_CERTIFICATE_PATH)
         report = calibrate_module.render_calibration_report(result)
 
+        # Finding F2: persist this live run's full judge output so a future
+        # `eval calibrate --offline` can recompute the same report +
+        # certificate with zero API calls / zero client construction.
+        judgment_records = calibrate_module.judgment_records_from_judged(
+            result.judged_triples, judge_version=result.judge_version
+        )
+        calibrate_module.write_judgments_jsonl(
+            judgments_path,
+            judgments=judgment_records,
+            self_consistency=result.self_consistency_records,
+            judge_version=result.judge_version,
+        )
+
     typer.echo(report)
     typer.echo(f"Certificate written to {DEFAULT_CERTIFICATE_PATH}")
+    typer.echo(f"Judgments written to {judgments_path}")
 
 
 @app.command()

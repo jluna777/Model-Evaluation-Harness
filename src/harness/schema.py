@@ -92,7 +92,27 @@ class GoldenItem(BaseModel):
 
 
 class CalibrationLabel(BaseModel):
-    """One owner-authored pass/fail label over a judged field (spec §5)."""
+    """One owner-authored pass/fail label over a judged field (spec §5).
+
+    ``output_sha256`` (REQUIRED, T14 finding F1 -- binding): the sha256 hex
+    digest of the EXACT ``candidate_value`` string the owner was looking at
+    when they wrote this label. The exact normalization is: the raw string,
+    encoded UTF-8, with NO trimming or other normalization of any kind (not
+    even leading/trailing whitespace) -- see ``harness.calibrate.hash_output``,
+    the one function that must be used to produce this value.
+
+    This field exists because a label otherwise pairs to a judged triple by
+    ``(item_id, candidate, field)`` alone, which is silently wrong the moment
+    the run directory that produced that triple's candidate output is
+    regenerated -- e.g. temp>0 candidate-model nondeterminism, and
+    ``results/`` is gitignored so regeneration is the ordinary case, not an
+    edge case. Without this hash, a relabeled-looking key could actually be
+    paired against a DIFFERENT candidate output than the one the owner
+    labeled, silently corrupting the agreement statistic. ``harness.
+    calibrate.pair_with_labels`` recomputes this hash from each reconstructed
+    triple's live ``candidate_value`` and requires an exact match before any
+    pairing proceeds (all-or-nothing, ``CalibrationBindingError`` otherwise).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -104,6 +124,7 @@ class CalibrationLabel(BaseModel):
     critique: str
     label_date: date
     round: Literal["initial", "retest"]
+    output_sha256: str
 
 
 class Certificate(BaseModel):
