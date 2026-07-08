@@ -84,6 +84,7 @@ if TYPE_CHECKING:
 
 LANGFUSE_PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
 LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
+LANGFUSE_HOST_ENV = "LANGFUSE_HOST"
 
 
 class MissingTracingError(Exception):
@@ -130,13 +131,24 @@ def _new_trace_id(run_id: str | None) -> str:
     return secrets.token_hex(16)
 
 
+def _resolve_langfuse_host(config: Config) -> str:
+    """Resolve the Langfuse host: environment variable wins over config.
+    Matches the project's OS-env-over-.env-over-config precedence."""
+
+    env_host = os.environ.get(LANGFUSE_HOST_ENV)
+    if env_host:
+        return env_host
+    return config.langfuse.host
+
+
 def _build_default_client(config: Config, public_key: str, secret_key: str) -> LangfuseClientLike:
     """Constructs the real Langfuse client (production path only -- no test
     reaches this, since every test supplies ``client_factory``)."""
 
     from langfuse import Langfuse
 
-    return Langfuse(public_key=public_key, secret_key=secret_key, host=config.langfuse.host)
+    host = _resolve_langfuse_host(config)
+    return Langfuse(public_key=public_key, secret_key=secret_key, host=host)
 
 
 @dataclass

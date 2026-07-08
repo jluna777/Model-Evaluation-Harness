@@ -24,7 +24,12 @@ from harness.models import StructuredResult, Usage
 from harness.prompts import EXTRACTION_PROMPT
 from harness.runner import ModelKey, load_run, run_eval
 from harness.schema import EmailInput, GoldenExpected, GoldenItem, GoldenMeta
-from harness.tracing import MissingTracingError, TraceContext
+from harness.tracing import (
+    LANGFUSE_HOST_ENV,
+    MissingTracingError,
+    TraceContext,
+    _resolve_langfuse_host,
+)
 
 DEFAULT_CONFIG_PATH = Path(__file__).parents[2] / "configs" / "default.yaml"
 
@@ -182,6 +187,35 @@ class TestMissingTracingErrorFailsFast:
         trace = TraceContext.for_run(_config(), reportable=True, client_factory=lambda: fake_client)
 
         assert trace.untraced is False
+
+
+class TestLangfuseHostResolution:
+    """Acceptance anchor for Langfuse host precedence: environment variable
+    wins over config, matching the project's OS-env-over-.env-over-config."""
+
+    def test_env_host_overrides_config_host(self, monkeypatch):
+        monkeypatch.setenv(LANGFUSE_HOST_ENV, "https://us.cloud.langfuse.com")
+        config = _config()
+
+        resolved_host = _resolve_langfuse_host(config)
+
+        assert resolved_host == "https://us.cloud.langfuse.com"
+
+    def test_config_host_used_when_env_not_set(self, monkeypatch):
+        monkeypatch.delenv(LANGFUSE_HOST_ENV, raising=False)
+        config = _config()
+
+        resolved_host = _resolve_langfuse_host(config)
+
+        assert resolved_host == config.langfuse.host
+
+    def test_config_host_used_when_env_empty(self, monkeypatch):
+        monkeypatch.setenv(LANGFUSE_HOST_ENV, "")
+        config = _config()
+
+        resolved_host = _resolve_langfuse_host(config)
+
+        assert resolved_host == config.langfuse.host
 
 
 class TestKeylessDevRunProceeds:
