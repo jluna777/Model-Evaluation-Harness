@@ -25,6 +25,7 @@ from harness.prompts import EXTRACTION_PROMPT
 from harness.runner import ModelKey, load_run, run_eval
 from harness.schema import EmailInput, GoldenExpected, GoldenItem, GoldenMeta
 from harness.tracing import (
+    LANGFUSE_BASE_URL_ENV,
     LANGFUSE_HOST_ENV,
     MissingTracingError,
     TraceContext,
@@ -194,6 +195,7 @@ class TestLangfuseHostResolution:
     wins over config, matching the project's OS-env-over-.env-over-config."""
 
     def test_env_host_overrides_config_host(self, monkeypatch):
+        monkeypatch.delenv(LANGFUSE_BASE_URL_ENV, raising=False)
         monkeypatch.setenv(LANGFUSE_HOST_ENV, "https://us.cloud.langfuse.com")
         config = _config()
 
@@ -202,6 +204,7 @@ class TestLangfuseHostResolution:
         assert resolved_host == "https://us.cloud.langfuse.com"
 
     def test_config_host_used_when_env_not_set(self, monkeypatch):
+        monkeypatch.delenv(LANGFUSE_BASE_URL_ENV, raising=False)
         monkeypatch.delenv(LANGFUSE_HOST_ENV, raising=False)
         config = _config()
 
@@ -210,12 +213,31 @@ class TestLangfuseHostResolution:
         assert resolved_host == config.langfuse.host
 
     def test_config_host_used_when_env_empty(self, monkeypatch):
+        monkeypatch.setenv(LANGFUSE_BASE_URL_ENV, "")
         monkeypatch.setenv(LANGFUSE_HOST_ENV, "")
         config = _config()
 
         resolved_host = _resolve_langfuse_host(config)
 
         assert resolved_host == config.langfuse.host
+
+    def test_base_url_is_canonical_and_wins_over_deprecated_host(self, monkeypatch):
+        monkeypatch.setenv(LANGFUSE_BASE_URL_ENV, "https://us.cloud.langfuse.com")
+        monkeypatch.setenv(LANGFUSE_HOST_ENV, "https://cloud.langfuse.com")
+        config = _config()
+
+        resolved_host = _resolve_langfuse_host(config)
+
+        assert resolved_host == "https://us.cloud.langfuse.com"
+
+    def test_empty_base_url_falls_through_to_deprecated_host(self, monkeypatch):
+        monkeypatch.setenv(LANGFUSE_BASE_URL_ENV, "")
+        monkeypatch.setenv(LANGFUSE_HOST_ENV, "https://us.cloud.langfuse.com")
+        config = _config()
+
+        resolved_host = _resolve_langfuse_host(config)
+
+        assert resolved_host == "https://us.cloud.langfuse.com"
 
 
 class TestKeylessDevRunProceeds:

@@ -84,7 +84,8 @@ if TYPE_CHECKING:
 
 LANGFUSE_PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
 LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
-LANGFUSE_HOST_ENV = "LANGFUSE_HOST"
+LANGFUSE_BASE_URL_ENV = "LANGFUSE_BASE_URL"  # canonical in langfuse >= 3.x
+LANGFUSE_HOST_ENV = "LANGFUSE_HOST"  # deprecated alias, still honored by the SDK
 
 
 class MissingTracingError(Exception):
@@ -132,12 +133,15 @@ def _new_trace_id(run_id: str | None) -> str:
 
 
 def _resolve_langfuse_host(config: Config) -> str:
-    """Resolve the Langfuse host: environment variable wins over config.
-    Matches the project's OS-env-over-.env-over-config precedence."""
+    """Resolve the Langfuse host: environment variables win over config.
+    Matches the project's OS-env-over-.env-over-config precedence.
+    LANGFUSE_BASE_URL is the SDK's canonical variable; LANGFUSE_HOST is its
+    deprecated alias, checked second for compatibility."""
 
-    env_host = os.environ.get(LANGFUSE_HOST_ENV)
-    if env_host:
-        return env_host
+    for env_name in (LANGFUSE_BASE_URL_ENV, LANGFUSE_HOST_ENV):
+        env_host = os.environ.get(env_name)
+        if env_host:
+            return env_host
     return config.langfuse.host
 
 
