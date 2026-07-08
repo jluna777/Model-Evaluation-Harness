@@ -13,15 +13,23 @@ override -- the golden set is the only dataset a baseline is ever compared
 against) and always runs both candidates. Delegates every decision --
 fingerprint check, judge-error budget, the statistical + adversarial-guardrail
 decision rule, rendering -- to ``harness.gate.gate.evaluate_gate`` (pure) and
-``harness.gate.gate.update_baseline`` (the one impure entry point, for
-``--update-baseline``); this module only handles CLI plumbing (dataset/config/
+``harness.gate.gate.update_baselines`` (the impure entry point, for
+``--update-baseline``, atomically committing both candidates together --
+finding F3); this module only handles CLI plumbing (dataset/config/
 certificate loading, tracing, client construction via the same
 ``_build_model_key``/``_get_or_run`` seams ``run``/``compare`` use, and the
 gate's own exit-code mapping -- see ``_gate_clean_exit``, which differs from
-``_clean_exit_on_expected_errors`` in one binding way: spec §7 explicitly
-buckets an aborted run under the gate's exit-2 "measurement error" outcome,
-whereas ``run``/``compare`` treat the same ``RunAborted`` as an ordinary
-exit-1 expected failure).
+``_clean_exit_on_expected_errors`` in a binding way, revised by finding F1:
+every gate condition that fires before a completed measurement exists --
+including ``RunAborted``, a run-config mismatch, missing tracing/certificate/
+API-key credentials, and an SDK construction failure -- is exit 2
+"measurement error", not exit 1; only a failed ``--update-baseline`` guardrail
+check (which DID complete a real measurement) stays exit 1. ``eval gate``
+also always forces a fresh ``run_eval`` execution for every candidate
+(finding F2) -- it never reuses ``run``/``compare``'s persisted run
+directories, since a stale completed run could silently replay scores
+produced by since-changed scoring code, defeating the gate's own threat
+model.).
 
 **Client-injection seam (binding for T11's tests):** ``_build_model_key`` is
 the SOLE call site that ever constructs ``AnthropicClient``/``OpenAIClient``/
@@ -56,6 +64,26 @@ served model versions, which only exist *after* a run completes -- there is
 no way to predict those before running, so directory-identity match is the
 actual reuse test, not a pre-run comparison of two not-yet-computed
 fingerprints.
+
+``eval gate`` deliberately opts OUT of this reuse (finding F2): a persisted,
+completed run directory can only ever prove "these inputs were run once,
+under whatever scoring code existed at the time" -- it says nothing about
+whether the harness's *own* scoring/judging code has changed since, which is
+exactly the kind of drift the gate exists to protect against (spec §7's
+threat model explicitly includes "harness/scoring code changes"). So every
+``eval gate`` invocation (plain, ``--seed-regression``, and
+``--update-baseline`` alike) routes its ``run_eval`` calls through a runs_root
+nested under a fresh, invocation-unique nonce directory (``_fresh_gate_runs_root``)
+rather than the shared ``DEFAULT_RUNS_ROOT`` ``run``/``compare`` use -- so the
+run-directory path ``_get_or_run``/``run_eval`` compute from this call's
+inputs is guaranteed to not already exist, and ``find_completed_run`` (and
+``run_eval``'s own resume-by-identity check) can never find anything to
+reuse. This was chosen over threading a ``force_fresh`` flag into
+``_get_or_run``/``run_eval``'s resume machinery itself (``runner.py``)
+because it needs zero changes to that machinery: ``run``/``compare`` keep
+their existing reuse behavior completely untouched, and the guarantee here
+holds by construction (a fresh directory can have nothing stale in it) rather
+than by teaching the resume logic a new bypass mode to get right.
 
 **Dev vs golden dataset (spec §8):** ``--dataset <path>`` selects dev-stage,
 never-reportable iteration; omitting it uses the config's own golden
@@ -103,6 +131,7 @@ fallback wrap that backs this up.
 import hashlib
 import json
 import os
+import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from enum import StrEnum
@@ -123,7 +152,12 @@ from harness.models.anthropic_client import AnthropicClient
 from harness.models.gemini_client import GeminiClient
 from harness.models.openai_client import OpenAIClient
 from harness.prompts import DEGRADED_DEMO_PROMPT, EXTRACTION_PROMPT, PromptTemplate
-from harness.reports import MissingCertificateError, render_compare_report, render_run_report
+from harness.reports import (
+    MissingCertificateError,
+    render_compare_report,
+    render_run_report,
+    require_certificate,
+)
 from harness.runner import (
     DEFAULT_RUNS_ROOT,
     ModelKey,
@@ -358,6 +392,23 @@ def _get_or_run(
     )
 
 
+def _fresh_gate_runs_root(base: Path = DEFAULT_RUNS_ROOT) -> Path:
+    """A per-invocation, guaranteed-unused runs_root nested under ``base``
+    (finding F2): every ``eval gate`` invocation (plain, ``--seed-regression``,
+    and ``--update-baseline`` alike) calls this once and threads the result
+    through every ``_get_or_run``/``update_baselines`` call it makes, so the
+    run-directory path those compute from this call's own inputs can never
+    already exist on disk -- ``_get_or_run``'s ``find_completed_run`` reuse
+    check (and ``run_eval``'s own resume-by-identity check) always miss, and
+    ``eval gate`` always drives a full, fresh measurement. See the module
+    docstring's "Run-identity reuse" section for why this -- not a
+    ``force_fresh`` flag threaded into ``runner.py``'s resume machinery -- is
+    the fix: it needs zero changes to ``run``/``compare``'s existing reuse
+    behavior."""
+
+    return base / "gate" / uuid.uuid4().hex
+
+
 # --------------------------------------------------------------------------
 # Expected-failure exit mapping (module docstring).
 # --------------------------------------------------------------------------
@@ -379,41 +430,47 @@ def _clean_exit_on_expected_errors():
         raise typer.Exit(code=1) from exc
 
 
-# Spec §7's four enumerated measurement-error conditions for the GATE
-# specifically -- exit 2. Note RunAborted is here (exit 2) even though
-# `run`/`compare` map the very same exception to exit 1 above: spec §7
-# explicitly lists "aborted run" under the gate's measurement-error bucket
-# (see gate.py's module docstring for the full exit-code rationale).
+# Every condition that fires BEFORE a completed measurement exists to render
+# a verdict on -- exit 2 (finding F1, revised from the original four
+# spec-enumerated conditions alone). Note RunAborted is here (exit 2) even
+# though `run`/`compare` map the very same exception to exit 1 above: spec §7
+# explicitly lists "aborted run" under the gate's measurement-error bucket.
+# RunConfigMismatch/MissingTracingError/MissingCertificateError/
+# MissingApiKeyError/ClientConstructionError all fire strictly before any
+# measurement is even attempted (a run-identity clash, missing tracing
+# credentials, a missing certificate, a missing API key, or an SDK
+# construction failure -- none of these ever reflect "a completed measurement
+# whose verdict is fail", exit 1's other meaning) -- see gate.py's module
+# docstring for the full exit-code rationale.
 _GATE_MEASUREMENT_ERRORS = (
     gate_module.MissingBaselineError,
     gate_module.FingerprintMismatchError,
     gate_module.JudgeErrorBudgetExceededError,
+    gate_module.NominalItemSetMismatchError,
     RunAborted,
+    RunConfigMismatch,
+    MissingTracingError,
+    MissingCertificateError,
+    MissingApiKeyError,
+    ClientConstructionError,
 )
 
 
 @contextmanager
 def _gate_clean_exit():
-    """``eval gate``'s own expected-failure exit mapping (module docstring):
-    the four spec §7 measurement-error conditions get exit 2; every other
-    expected/setup failure (missing tracing/API key, a client construction
-    failure, a run-config mismatch, or a failed ``--update-baseline``
-    guardrail check) gets the same clean exit 1 ``run``/``compare`` already
-    use for their own expected failures."""
+    """``eval gate``'s own expected-failure exit mapping (module docstring,
+    finding F1): every measurement-error/setup-precondition condition above
+    gets exit 2; ``GuardrailFloorError`` (``--update-baseline`` only) is the
+    one exception left at exit 1, since it fires only AFTER a real baseline
+    candidate has been fully measured and refused for cause -- "a completed
+    measurement whose verdict is fail", not a measurement error."""
 
     try:
         yield
     except _GATE_MEASUREMENT_ERRORS as exc:
         typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=2) from exc
-    except (
-        RunConfigMismatch,
-        MissingTracingError,
-        MissingCertificateError,
-        MissingApiKeyError,
-        ClientConstructionError,
-        gate_module.GuardrailFloorError,
-    ) as exc:
+    except gate_module.GuardrailFloorError as exc:
         typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
 
@@ -522,9 +579,13 @@ def gate(
     config: ConfigOption = DEFAULT_CONFIG_PATH,
 ) -> None:
     """CI gate decision vs the committed baseline (spec §7). Exit 0 = pass,
-    1 = regression detected (or another expected/setup failure), 2 =
-    measurement error (missing baseline, fingerprint mismatch, judge-error
-    budget exceeded, or an aborted run)."""
+    1 = regression detected (or a failed ``--update-baseline`` guardrail
+    check -- the one setup-adjacent failure that still completed a real
+    measurement), 2 = measurement error: missing baseline, fingerprint
+    mismatch, judge-error budget exceeded, a nominal item-set mismatch, an
+    aborted run, or any setup precondition that fires before a measurement
+    is even attempted (missing tracing/certificate/API-key credentials, an
+    SDK construction failure, a run-config mismatch) -- finding F1."""
 
     if update_baseline and seed_regression:
         typer.secho(
@@ -539,6 +600,22 @@ def gate(
         cfg = load_config(config)
         items = _load_dataset(Path(cfg.dataset.path))
         certificate = _load_certificate(DEFAULT_CERTIFICATE_PATH)
+        # Finding F5: checked immediately after certificate load, before any
+        # tracing/client construction/run -- previously a missing certificate
+        # was only discovered deep inside `evaluate_gate`'s call to
+        # `render_gate_summary`, AFTER both candidates' runs had already
+        # spent real API calls. `--update-baseline` is exempt: it has its own
+        # deliberate uncalibrated-placeholder fallback (see
+        # `gate_module.update_baselines`'s docstring) and is the only gate
+        # path that is allowed to proceed without a committed certificate.
+        if not update_baseline:
+            require_certificate(certificate, reportable=True)
+        # Finding F2: every eval gate invocation gets its own fresh,
+        # guaranteed-unused runs_root, so it always drives a full, fresh
+        # run_eval execution for both candidates -- see
+        # `_fresh_gate_runs_root`'s docstring and the module docstring's
+        # "Run-identity reuse" section.
+        gate_runs_root = _fresh_gate_runs_root(DEFAULT_RUNS_ROOT)
 
         if update_baseline:
             # Spec §8 traces per-run, not per-invocation (mirrors `compare`'s
@@ -547,18 +624,25 @@ def gate(
             # call) before either client is built.
             baseline_trace_a = TraceContext.for_run(cfg, True)
             baseline_trace_b = TraceContext.for_run(cfg, True)
-            for label, label_trace in (("a", baseline_trace_a), ("b", baseline_trace_b)):
-                model_key = _build_model_key(label, cfg)
-                baseline = gate_module.update_baseline(
-                    cfg,
-                    model_key,
-                    dataset=items,
-                    prompt=EXTRACTION_PROMPT,
-                    certificate=certificate,
-                    runs_root=DEFAULT_RUNS_ROOT,
-                    baselines_root=DEFAULT_BASELINES_ROOT,
-                    trace=label_trace,
-                )
+            # Both model keys are built upfront, before any generation --
+            # matches the atomicity of the commit itself (finding F3): if
+            # either candidate's credentials/construction fails, nothing has
+            # been generated or spent for either candidate yet.
+            model_key_a = _build_model_key("a", cfg)
+            model_key_b = _build_model_key("b", cfg)
+            baseline_a, baseline_b = gate_module.update_baselines(
+                cfg,
+                model_key_a,
+                model_key_b,
+                dataset=items,
+                prompt=EXTRACTION_PROMPT,
+                certificate=certificate,
+                runs_root=gate_runs_root,
+                baselines_root=DEFAULT_BASELINES_ROOT,
+                trace_a=baseline_trace_a,
+                trace_b=baseline_trace_b,
+            )
+            for label, baseline in (("a", baseline_a), ("b", baseline_b)):
                 typer.echo(
                     f"Baseline written: {DEFAULT_BASELINES_ROOT / f'{label}.json'} "
                     f"(fingerprint {baseline.fingerprint[:12]}...)"
@@ -572,8 +656,8 @@ def gate(
         baseline_b = _load_baseline_or_raise("b", DEFAULT_BASELINES_ROOT / "b.json")
 
         prompt = DEGRADED_DEMO_PROMPT if seed_regression else EXTRACTION_PROMPT
-        run_dir_a = _get_or_run(cfg, "a", items, prompt, trace_a, DEFAULT_RUNS_ROOT)
-        run_dir_b = _get_or_run(cfg, "b", items, prompt, trace_b, DEFAULT_RUNS_ROOT)
+        run_dir_a = _get_or_run(cfg, "a", items, prompt, trace_a, gate_runs_root)
+        run_dir_b = _get_or_run(cfg, "b", items, prompt, trace_b, gate_runs_root)
         run_a = load_run(run_dir_a)
         run_b = load_run(run_dir_b)
 

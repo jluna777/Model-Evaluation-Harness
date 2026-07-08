@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from typer.testing import CliRunner
 
 import harness.cli as cli
+import harness.runner as runner_module
 from harness.cli import app
 from harness.config import Config, load_config
 from harness.gate import gate
@@ -48,7 +49,15 @@ from harness.gate.baseline import (
 from harness.judge.judge import JudgeVerdict
 from harness.models import StructuredResult, Usage
 from harness.prompts import DEGRADED_DEMO_PROMPT, EXTRACTION_PROMPT
-from harness.runner import ModelKey, RunArtifact, RunDir, RunRow, load_run
+from harness.runner import (
+    DEFAULT_RUNS_ROOT,
+    ModelKey,
+    RunArtifact,
+    RunDir,
+    RunRow,
+    load_run,
+    run_eval,
+)
 from harness.schema import (
     Certificate,
     EmailInput,
@@ -515,6 +524,87 @@ class TestNominalPairedDeltas:
         deltas, excluded = gate.nominal_paired_deltas(baseline, run, CompositeMode.FULL_7)
 
         assert deltas == [0.0]  # the adversarial item's regression must never appear here
+
+
+class TestNominalPairedDeltasItemSetMismatch:
+    """F4: baseline/run nominal item-set disagreement must raise, fail-closed
+    -- never be silently intersected. Judge-error exclusion (item-level, via
+    a missing replicate field) remains the only legitimate way an item can be
+    absent from ``deltas``; a genuine item-SET difference is always a
+    measurement error instead."""
+
+    def test_run_missing_a_baseline_item_raises_naming_counts_and_ids(self):
+        baseline_items = [make_item("nom-0"), make_item("nom-1"), make_item("nom-2")]
+        run_items = [make_item("nom-0"), make_item("nom-1")]  # missing nom-2
+        baseline = _make_baseline(baseline_items, _all_rows(baseline_items, 6))
+        run = _make_run_artifact(run_items, _all_rows(run_items, 3))
+
+        with pytest.raises(gate.NominalItemSetMismatchError) as exc_info:
+            gate.nominal_paired_deltas(baseline, run, CompositeMode.FULL_7)
+
+        message = str(exc_info.value)
+        assert "3 item(s)" in message  # baseline count
+        assert "2 item(s)" in message  # run count
+        assert "nom-2" in message
+        assert exc_info.value.only_baseline == ("nom-2",)
+        assert exc_info.value.only_run == ()
+
+    def test_run_has_an_extra_item_raises_naming_it(self):
+        baseline_items = [make_item("nom-0")]
+        run_items = [make_item("nom-0"), make_item("nom-1")]  # extra nom-1
+        baseline = _make_baseline(baseline_items, _all_rows(baseline_items, 6))
+        run = _make_run_artifact(run_items, _all_rows(run_items, 3))
+
+        with pytest.raises(gate.NominalItemSetMismatchError) as exc_info:
+            gate.nominal_paired_deltas(baseline, run, CompositeMode.FULL_7)
+
+        assert "nom-1" in str(exc_info.value)
+        assert exc_info.value.only_run == ("nom-1",)
+
+    def test_more_than_five_missing_ids_are_truncated_to_five_examples(self):
+        baseline_items = [make_item(f"nom-{i}") for i in range(8)]
+        run_items = [make_item("nom-0")]  # missing nom-1..nom-7 (7 items)
+        baseline = _make_baseline(baseline_items, _all_rows(baseline_items, 6))
+        run = _make_run_artifact(run_items, _all_rows(run_items, 3))
+
+        with pytest.raises(gate.NominalItemSetMismatchError) as exc_info:
+            gate.nominal_paired_deltas(baseline, run, CompositeMode.FULL_7)
+
+        assert len(exc_info.value.only_baseline) == 7
+        # Only up to 5 examples are named in the message itself.
+        message = str(exc_info.value)
+        named = [item_id for item_id in exc_info.value.only_baseline if item_id in message]
+        assert len(named) == 5
+
+    def test_identical_item_sets_do_not_raise(self):
+        items = [make_item("nom-0"), make_item("nom-1")]
+        baseline = _make_baseline(items, _all_rows(items, 6))
+        run = _make_run_artifact(items, _all_rows(items, 3))
+
+        deltas, excluded = gate.nominal_paired_deltas(baseline, run, CompositeMode.FULL_7)
+
+        assert deltas == [0.0, 0.0]
+        assert excluded == 0
+
+    def test_judge_error_exclusion_is_unaffected_and_still_the_only_legitimate_shrinkage(self):
+        """A judge-error item-level exclusion must NOT be mistaken for an
+        item-set mismatch: the item is present on both sides (same id sets),
+        only its score is excluded."""
+
+        items = [make_item("nom-0"), make_item("nom-1")]
+        baseline = _make_baseline(items, _all_rows(items, 6))
+
+        def scores(item_id: str, replicate: int) -> dict[str, int | None]:
+            if item_id == "nom-0":
+                return {**_all_fields(1), "issue_summary": None}
+            return _all_fields(1)
+
+        run = _make_run_artifact(items, _all_rows(items, 3, scores))
+
+        deltas, excluded = gate.nominal_paired_deltas(baseline, run, CompositeMode.FULL_7)
+
+        assert excluded == 1
+        assert deltas == [0.0]
 
 
 # --------------------------------------------------------------------------
@@ -1143,10 +1233,15 @@ class TestGateCliSeedRegression:
         assert "DEMO MODE" in result.output
 
         # Two "a-*" run dirs exist: one from baseline generation (k_baseline,
-        # EXTRACTION_PROMPT) and one from this gate invocation (k,
-        # DEGRADED_DEMO_PROMPT) -- distinct hashes since prompt_version/k
-        # differ. Find the demo one specifically by its recorded prompt_version.
-        run_dirs = list((Path("results") / "runs").glob("a-*"))
+        # EXTRACTION_PROMPT, directly under results/runs/) and one from this
+        # gate invocation (k, DEGRADED_DEMO_PROMPT, nested under this gate
+        # invocation's own fresh results/runs/gate/<nonce>/ root -- finding
+        # F2, `eval gate` never shares run directories with baseline
+        # generation or a prior gate invocation) -- distinct hashes since
+        # prompt_version/k differ either way. `rglob` finds both regardless
+        # of nesting; find the demo one specifically by its recorded
+        # prompt_version.
+        run_dirs = list((Path("results") / "runs").rglob("a-*"))
         artifacts = [load_run(RunDir(path=p)) for p in run_dirs]
         demo_artifacts = [a for a in artifacts if a.prompt_version == DEGRADED_DEMO_PROMPT.version]
         assert len(demo_artifacts) == 1
@@ -1170,9 +1265,10 @@ class TestGateCliTracingFailFast:
         # Gate runs are always reportable=True: TraceContext.for_run raises
         # MissingTracingError directly (never the keyless-warn-and-proceed
         # path, which is reportable=False only -- see tracing.py).
+        # F1: MissingTracingError fires before any measurement -> exit 2.
         result = runner.invoke(app, ["gate", "--config", str(config_path)])
 
-        assert result.exit_code != 0
+        assert result.exit_code == 2, result.output
         assert "Traceback" not in result.output
         assert "credentials" in result.output.lower() or "langfuse" in result.output.lower()
 
@@ -1190,9 +1286,12 @@ class TestGateCliTracingFailFast:
 
         monkeypatch.setattr(cli, "_build_model_key", _forbid_factory)
 
+        # F1: MissingTracingError fires before any measurement -> exit 2,
+        # even under --update-baseline (its own uncalibrated-certificate
+        # relaxation does not extend to tracing).
         result = runner.invoke(app, ["gate", "--config", str(config_path), "--update-baseline"])
 
-        assert result.exit_code != 0
+        assert result.exit_code == 2, result.output
         assert "Traceback" not in result.output
 
 
@@ -1257,10 +1356,14 @@ class TestGateCliUpdateBaseline:
 
         result = runner.invoke(app, ["gate", "--config", str(config_path), "--update-baseline"])
 
-        assert result.exit_code != 0
+        # F1: GuardrailFloorError stays exit 1 -- it fires only after a real
+        # baseline candidate has been fully measured and refused for cause,
+        # unlike every other gate setup/measurement-error condition (exit 2).
+        assert result.exit_code == 1, result.output
         assert "Traceback" not in result.output
         assert "guardrail" in result.output.lower()
         assert not (Path("baselines") / "a.json").exists()
+        assert not (Path("baselines") / "b.json").exists()
 
     def test_mutually_exclusive_flags_rejected(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -1274,3 +1377,330 @@ class TestGateCliUpdateBaseline:
 
         assert result.exit_code != 0
         assert "Traceback" not in result.output
+
+
+# --------------------------------------------------------------------------
+# F1: setup/measurement-precondition failures that fire before any candidate
+# is actually measured must exit 2 for `eval gate` -- not the exit 1
+# `run`/`compare` use for their OWN expected failures. Only
+# `GuardrailFloorError` (TestGateCliUpdateBaseline.
+# test_refuses_to_write_when_guardrail_floor_fails, a completed, refused
+# measurement) and a genuinely computed regression (TestGateCliPassAndFail.
+# test_only_candidate_b_regressing_fails_the_gate) stay exit 1.
+# --------------------------------------------------------------------------
+
+
+class TestGateCliExitCodeReclassification:
+    def test_missing_api_key_exits_2(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path)])
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.output
+        assert "ANTHROPIC_API_KEY" in result.output
+
+    def test_client_construction_error_exits_2(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-anthropic-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy-openai-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "dummy-gemini-key")
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        class _RaisesAtConstruction:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                raise RuntimeError("sdk changed its mind")
+
+        monkeypatch.setattr(cli, "AnthropicClient", _RaisesAtConstruction)
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path)])
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.output
+        assert "Anthropic" in result.output
+
+    def test_run_config_mismatch_exits_2(self, tmp_path, monkeypatch):
+        """F2 means `eval gate` never reuses an arbitrary pre-existing run
+        dir under its normal (randomized, per-invocation) runs_root, so the
+        only way to still exercise RunConfigMismatch end-to-end through the
+        real CLI surface is to pin `_fresh_gate_runs_root`'s output and
+        pre-seed an incompatible manifest at the exact path it will
+        compute -- mirrors ``tests/unit/test_cli.py``'s own
+        ``test_run_config_mismatch_clean_exit``."""
+
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        fixed_root = Path("results") / "runs" / "gate-fixed-for-test"
+        monkeypatch.setattr(cli, "_fresh_gate_runs_root", lambda *a, **k: fixed_root)
+
+        run_dir_path = runner_module._run_dir_path(
+            fixed_root,
+            "a",
+            items,
+            cfg.k,
+            EXTRACTION_PROMPT.version,
+            cfg.dataset.version,
+            cfg.dataset.path,
+            cfg.models.candidate_a,
+            cfg.models.judge,
+        )
+        run_dir_path.mkdir(parents=True)
+        manifest = {
+            "model_key": "a",
+            "candidate_model_id": cfg.models.candidate_a,
+            "judge_model_id": cfg.models.judge,
+            "k": 999,  # deliberately mismatched vs cfg.k
+            "prompt_version": EXTRACTION_PROMPT.version,
+            "dataset_path": cfg.dataset.path,
+            "dataset_version": cfg.dataset.version,
+            "item_ids": [item.id for item in items],
+            "items": [item.model_dump(mode="json") for item in items],
+            "served_versions": {},
+            "judge_version": "irrelevant-fixture-value",
+            "composite_mode": "FULL_7",
+            "calibration_verdict": "uncalibrated",
+            "fingerprint": None,
+            "completed": False,
+            "untraced": True,
+            "created_at": "2026-07-04T00:00:00+00:00",
+        }
+        (run_dir_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        registry: dict[str, list[FakeModelClient]] = {}
+        monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path)])
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.output
+        assert "k" in result.output
+
+
+# --------------------------------------------------------------------------
+# F2: `eval gate` must never reuse a persisted run directory, even one that
+# exactly matches its own run-identity computation under the OLD, unfixed
+# shared runs_root -- a persisted run only proves "these inputs were run
+# once", not "under today's scoring code" (spec §7's threat model explicitly
+# includes harness/scoring code changes).
+# --------------------------------------------------------------------------
+
+
+class TestGateAlwaysMeasuresFresh:
+    def test_seeded_completed_run_at_the_pre_fix_shared_path_is_ignored(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        # Seed a COMPLETE run at exactly the identity path `_get_or_run`
+        # would have reused from, pre-F2 (the shared DEFAULT_RUNS_ROOT, no
+        # per-invocation nonce) -- proves the fix, not just that a fresh
+        # nonce happens to dodge some unrelated directory.
+        seed_judge = FakeModelClient(make_result=lambda *a: judge_pass_result())
+        seed_candidate_a = FakeModelClient(make_result=lambda *a: success_result())
+        seed_candidate_b = FakeModelClient(make_result=lambda *a: success_result())
+        run_eval(
+            cfg,
+            ModelKey(label="a", candidate_client=seed_candidate_a, judge_client=seed_judge),
+            k=cfg.k,
+            dataset=items,
+            prompt=EXTRACTION_PROMPT,
+            runs_root=DEFAULT_RUNS_ROOT,
+        )
+        run_eval(
+            cfg,
+            ModelKey(label="b", candidate_client=seed_candidate_b, judge_client=seed_judge),
+            k=cfg.k,
+            dataset=items,
+            prompt=EXTRACTION_PROMPT,
+            runs_root=DEFAULT_RUNS_ROOT,
+        )
+        assert seed_candidate_a.call_count > 0
+        assert seed_candidate_b.call_count > 0
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        registry: dict[str, list[FakeModelClient]] = {}
+        monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path)])
+
+        assert result.exit_code == 0, result.output
+        # `eval gate` must have driven its OWN fresh clients, not the seeded
+        # ones -- proving no stale-run reuse (call counts > 0).
+        assert len(registry["candidate"]) == 2
+        assert registry["candidate"][0].call_count > 0
+        assert registry["candidate"][1].call_count > 0
+
+
+# --------------------------------------------------------------------------
+# F3: --update-baseline must commit both candidates' baselines atomically --
+# generate + guardrail-check BOTH into staging first, and promote both only
+# if both pass.
+# --------------------------------------------------------------------------
+
+
+class TestGateCliUpdateBaselineAtomicity:
+    def test_candidate_b_guardrail_failure_leaves_pre_existing_baselines_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path, k_baseline=6)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        baseline_a_before = (Path("baselines") / "a.json").read_text(encoding="utf-8")
+        baseline_b_before = (Path("baselines") / "b.json").read_text(encoding="utf-8")
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        def factory(label: str, config: object) -> ModelKey:
+            if label == "b":
+                candidate = _alternating_candidate_for_item("adv-0")
+            else:
+                candidate = FakeModelClient(make_result=lambda *a: success_result())
+            judge = FakeModelClient(make_result=lambda *a: judge_pass_result())
+            return ModelKey(label=label, candidate_client=candidate, judge_client=judge)
+
+        monkeypatch.setattr(cli, "_build_model_key", factory)
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path), "--update-baseline"])
+
+        assert result.exit_code == 1, result.output  # GuardrailFloorError, F1
+        assert "Traceback" not in result.output
+        assert "guardrail" in result.output.lower()
+        # Neither committed baseline was touched -- a's own (passing) staged
+        # regeneration must never be promoted just because it individually
+        # passed; the previous bug promoted it before b's check even ran.
+        assert (Path("baselines") / "a.json").read_text(encoding="utf-8") == baseline_a_before
+        assert (Path("baselines") / "b.json").read_text(encoding="utf-8") == baseline_b_before
+
+    def test_candidate_b_guardrail_failure_with_no_pre_existing_baselines_leaves_both_absent(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path, k_baseline=6)
+        _write_certificate_file("adequate")
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        def factory(label: str, config: object) -> ModelKey:
+            if label == "b":
+                candidate = _alternating_candidate_for_item("adv-0")
+            else:
+                candidate = FakeModelClient(make_result=lambda *a: success_result())
+            judge = FakeModelClient(make_result=lambda *a: judge_pass_result())
+            return ModelKey(label=label, candidate_client=candidate, judge_client=judge)
+
+        monkeypatch.setattr(cli, "_build_model_key", factory)
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path), "--update-baseline"])
+
+        assert result.exit_code == 1, result.output
+        assert not (Path("baselines") / "a.json").exists()
+        assert not (Path("baselines") / "b.json").exists()
+
+
+# --------------------------------------------------------------------------
+# F4: a run missing (or adding) a nominal item relative to the committed
+# baseline must exit 2, naming the id(s) -- never silently intersected.
+# --------------------------------------------------------------------------
+
+
+class TestGateCliNominalItemSetMismatch:
+    def test_run_missing_one_nominal_item_exits_2_naming_the_id(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item(f"nom-{i}") for i in range(3)]
+        items.append(make_item("adv-0", slice_="adversarial"))
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        # Overwrite the golden dataset file, dropping "nom-2", WITHOUT
+        # bumping dataset_version (spec's dataset_version is a config-level
+        # pin, not derived from item content -- so this mismatch sails past
+        # the fingerprint check entirely; exactly the gap F4 closes).
+        reduced_items = [item for item in items if item.id != "nom-2"]
+        _write_golden_dataset(reduced_items)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        registry: dict[str, list[FakeModelClient]] = {}
+        monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path)])
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.output
+        assert "nom-2" in result.output
+
+
+# --------------------------------------------------------------------------
+# F5: the reportable-requires-certificate check must fire immediately after
+# certificate load -- before any tracing/client construction/run.
+# --------------------------------------------------------------------------
+
+
+class TestGateCliMissingCertificateEarlyCheck:
+    def test_no_certificate_with_baselines_present_exits_2_before_any_client_call(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+        # Certificate removed AFTER baseline generation: baselines are
+        # present and valid, only the certificate is now missing.
+        (Path("data") / "calibration" / "certificate.json").unlink()
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        def _forbid_factory(*args: object, **kwargs: object) -> ModelKey:
+            raise AssertionError(
+                "_build_model_key must not be called before the certificate check"
+            )
+
+        monkeypatch.setattr(cli, "_build_model_key", _forbid_factory)
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path)])
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.output
+        assert "certificate" in result.output.lower()

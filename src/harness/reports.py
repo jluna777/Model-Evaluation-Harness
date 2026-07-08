@@ -112,6 +112,25 @@ class MissingCertificateError(Exception):
     iteration, and is not a fallback for a reportable run missing one."""
 
 
+def require_certificate(certificate: Certificate | None, *, reportable: bool) -> None:
+    """Raises ``MissingCertificateError`` iff ``reportable`` and
+    ``certificate is None`` -- factored out of ``_certificate_section`` so a
+    caller can run the same check eagerly (``cli.py``'s ``eval gate``, gate.py
+    T16 finding F5) instead of only discovering a missing certificate deep
+    inside rendering, after both candidates' runs have already spent real API
+    calls. ``_certificate_section`` below still performs this same check on
+    every render call -- this is a second, defensive gate, not a replacement
+    for it."""
+
+    if certificate is None and reportable:
+        raise MissingCertificateError(
+            "This report is reportable (spec §8) and requires a committed "
+            "calibration certificate (data/calibration/certificate.json); none "
+            "was supplied. A reportable run with no certificate is refused, "
+            "not rendered with the uncalibrated banner."
+        )
+
+
 # --------------------------------------------------------------------------
 # Small pure helpers shared by all three renderers.
 # --------------------------------------------------------------------------
@@ -345,14 +364,8 @@ def _certificate_section(
     "uncalibrated" banner.
     """
 
+    require_certificate(certificate, reportable=reportable)
     if certificate is None:
-        if reportable:
-            raise MissingCertificateError(
-                "This report is reportable (spec §8) and requires a committed "
-                "calibration certificate (data/calibration/certificate.json); none "
-                "was supplied. A reportable run with no certificate is refused, "
-                "not rendered with the uncalibrated banner."
-            )
         banner = (
             "> **UNCALIBRATED (no certificate)** -- this is a dev-stage report with "
             "no judge calibration certificate on file. Composite scores below use "
@@ -919,4 +932,5 @@ __all__ = [
     "render_compare_report",
     "render_gate_summary",
     "render_run_report",
+    "require_certificate",
 ]

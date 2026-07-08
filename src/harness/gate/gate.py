@@ -7,8 +7,9 @@ every number ``GateSummaryData``/``CandidateGateResult`` carry and never
 renders markdown itself (mirrors ``reports.py``'s purity contract: this
 module is pure over already-loaded ``BaselineFile``/``RunArtifact``/
 ``Config``/``Certificate`` objects, no API calls, no filesystem access,
-except ``update_baseline`` which is deliberately the one impure entry point,
-since generating a baseline necessarily drives real candidate/judge calls).
+except ``update_baseline``/``update_baselines`` which are deliberately the
+impure entry points, since generating a baseline necessarily drives real
+candidate/judge calls).
 
 **Two layers, deliberately separated (see tests/unit/gate/test_gate.py's
 module docstring for the corresponding test split):**
@@ -38,20 +39,27 @@ silently averaged over fewer samples than the other items got.
 
 **Exit-code convention (this module's own design decision, since spec §7
 enumerates measurement-error exit-2 conditions precisely but the CLI layer
-also has setup-time errors spec doesn't classify):** exit 2 is reserved for
-exactly the four spec-enumerated measurement-error conditions raised as
-exceptions here (``MissingBaselineError``, ``FingerprintMismatchError``,
-``JudgeErrorBudgetExceededError``) plus ``runner.RunAborted`` (spec §7
-explicitly lists "aborted run" under measurement error for the *gate*,
-distinct from ``run``/``compare``'s own exit-1 treatment of the same
-exception) -- all mapped at the CLI layer (``cli.py``'s ``_gate_clean_exit``).
-Every other expected/setup failure (missing tracing credentials, a missing
-API key, a provider SDK construction failure, a run-config mismatch, a failed
-guardrail check on ``--update-baseline``) is treated the same way ``run``/
-``compare`` already treat their own expected failures: a clean one-line exit
-1, since none of those are "a completed measurement whose verdict is fail"
-(exit 1's OTHER meaning, "regression detected") or one of spec's four
-measurement-error conditions specifically.
+also has setup-time errors spec doesn't classify -- revised, finding F1):**
+exit 2 covers every condition that fires BEFORE a completed measurement
+exists to render a verdict on: the spec-enumerated exceptions raised here
+(``MissingBaselineError``, ``FingerprintMismatchError``,
+``JudgeErrorBudgetExceededError``, ``NominalItemSetMismatchError`` -- finding
+F4's fail-closed item-set check), ``runner.RunAborted`` (spec §7 explicitly
+lists "aborted run" under measurement error for the *gate*, distinct from
+``run``/``compare``'s own exit-1 treatment of the same exception), AND every
+setup-time precondition failure that necessarily precedes any measurement --
+``RunConfigMismatch``, ``MissingTracingError``, ``MissingCertificateError``,
+``MissingApiKeyError``, ``ClientConstructionError`` (all previously
+mismapped to exit 1 -- F1 corrected this: none of these can ever be "a
+completed measurement whose verdict is fail", exit 1's OTHER meaning, so
+lumping them in with that outcome was wrong from the start). All mapped at
+the CLI layer (``cli.py``'s ``_gate_clean_exit``).
+
+``GuardrailFloorError`` (raised only by ``--update-baseline``, never by the
+decision-rule path) is the one deliberate exception to "setup failure -> exit
+2": it fires only AFTER a real baseline candidate has been fully measured, so
+it is exit 1 -- "a completed measurement whose verdict is fail" -- not a
+measurement error.
 """
 
 from __future__ import annotations
@@ -170,6 +178,41 @@ class JudgeErrorBudgetExceededError(Exception):
         self.budget = budget
 
 
+class NominalItemSetMismatchError(Exception):
+    """Raised by ``nominal_paired_deltas`` when the baseline's and run's
+    nominal-slice item id sets disagree (finding F4, fail-closed).
+
+    The previous behavior silently intersected the two id sets, so an item
+    present on only one side (dataset drift, a mismeasured run, a truncated
+    dataset file, ...) simply vanished from the paired-delta computation with
+    no disclosure at all -- indistinguishable from a legitimate judge-error
+    exclusion, which *is* always disclosed via ``excluded_count``. Judge-error
+    exclusion remains the ONLY legitimate way an item can be dropped from the
+    computation; any disagreement in the item sets themselves is a
+    measurement error, never silently tolerated. Names both sides' counts and
+    up to 5 example ids missing from each side so the operator can act on it
+    immediately without re-deriving the diff by hand.
+    """
+
+    def __init__(self, baseline_ids: set[str], run_ids: set[str]) -> None:
+        only_baseline = sorted(baseline_ids - run_ids)
+        only_run = sorted(run_ids - baseline_ids)
+        example_baseline = ", ".join(only_baseline[:5]) or "none"
+        example_run = ", ".join(only_run[:5]) or "none"
+        super().__init__(
+            "Nominal-slice item sets disagree between baseline and run (spec §7, "
+            f"fail-closed): baseline has {len(baseline_ids)} item(s), run has "
+            f"{len(run_ids)} item(s); {len(only_baseline)} present only in the baseline "
+            f"(e.g. {example_baseline}), {len(only_run)} present only in the run "
+            f"(e.g. {example_run}). This is never silently intersected -- investigate "
+            "dataset drift or a mismeasured run before re-running the gate."
+        )
+        self.baseline_ids = frozenset(baseline_ids)
+        self.run_ids = frozenset(run_ids)
+        self.only_baseline = tuple(only_baseline)
+        self.only_run = tuple(only_run)
+
+
 class GuardrailFloorError(Exception):
     """Raised by ``update_baseline`` when the freshly measured adversarial
     noise floor fails ``check_guardrail_floor`` (spec §7/D3): the committed
@@ -244,11 +287,20 @@ def nominal_paired_deltas(
     are legitimate zero-valued entries in ``deltas``, diluting the mean
     exactly like ``sign_flip_test``'s own zero-delta convention (its module
     docstring).
+
+    Raises ``NominalItemSetMismatchError`` (finding F4, fail-closed) if the
+    baseline's and run's nominal-slice item id sets are not IDENTICAL --
+    never silently intersected. Judge-error exclusion (the item-level
+    ``excluded_count`` below) remains the only legitimate way an item can be
+    absent from ``deltas``; a difference in the item sets themselves always
+    signals a measurement error instead.
     """
 
     baseline_ids = {item.id for item in baseline.items if item.meta.slice == "nominal"}
     run_ids = {item.id for item in run.items if item.meta.slice == "nominal"}
-    shared_ids = sorted(baseline_ids & run_ids)
+    if baseline_ids != run_ids:
+        raise NominalItemSetMismatchError(baseline_ids, run_ids)
+    shared_ids = sorted(baseline_ids)
 
     deltas: list[float] = []
     excluded = 0
@@ -513,6 +565,86 @@ def wrap_demo_mode_banner(rendered: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _resolve_baseline_mode_and_verdict(
+    certificate: Certificate | None,
+) -> tuple[CompositeMode, str]:
+    """Real certificate values (``composite_mode``/``calibration_verdict``)
+    when ``certificate`` is supplied; the uncalibrated placeholder
+    (``FULL_7``/``"uncalibrated"``), with an explicit ``warnings.warn``, when
+    it is not -- acceptable ONLY for ``--update-baseline`` (see
+    ``update_baseline``/``update_baselines``'s own docstrings)."""
+
+    if certificate is not None:
+        return _resolve_composite_mode(certificate), certificate.verdict
+    warnings.warn(
+        "No calibration certificate found -- generating this baseline with the "
+        "uncalibrated placeholder (composite_mode=FULL_7, "
+        "calibration_verdict='uncalibrated'). This is acceptable for "
+        "--update-baseline only; a normal `eval gate` run still requires a "
+        "committed calibration certificate.",
+        stacklevel=3,
+    )
+    return CompositeMode.FULL_7, "uncalibrated"
+
+
+def _stage_baseline(
+    config: Config,
+    model_key: ModelKey,
+    *,
+    dataset: Sequence[GoldenItem],
+    prompt: PromptTemplate,
+    certificate: Certificate | None,
+    runs_root: str | Path,
+    staging_root: Path,
+    trace: TraceContext | None,
+) -> BaselineFile:
+    """Generates ``model_key``'s candidate baseline into ``staging_root``
+    (never a committed ``baselines_root`` path) and guardrail-checks it,
+    raising ``GuardrailFloorError`` on failure (finding F3).
+
+    Deliberately does NOT promote to the committed path and does NOT clean up
+    ``staging_root`` itself -- the caller (``update_baseline`` for one
+    candidate, ``update_baselines`` for the atomic two-candidate commit) owns
+    that lifecycle, so multiple candidates can share one staging directory
+    and be promoted together only once every one of them has passed.
+    """
+
+    mode, calibration_verdict = _resolve_baseline_mode_and_verdict(certificate)
+
+    baseline = generate_baseline(
+        config,
+        model_key,
+        dataset=dataset,
+        prompt=prompt,
+        composite_mode=mode,
+        calibration_verdict=calibration_verdict,
+        runs_root=runs_root,
+        baselines_root=staging_root,
+        trace=trace,
+    )
+
+    if not check_guardrail_floor(baseline):
+        raise GuardrailFloorError(
+            model_key.label,
+            baseline.adversarial_noise_floor_se,
+            GUARDRAIL_THRESHOLD_POINTS,
+            GUARDRAIL_SE_MULTIPLIER,
+        )
+    return baseline
+
+
+def _promote_staged_baseline(staging_root: Path, baselines_root: Path, label: str) -> None:
+    """Copies one candidate's already-staged, already-guardrail-passed
+    baseline file from ``staging_root`` to its committed
+    ``baselines_root / f"{label}.json"`` path. Never called for a candidate
+    that hasn't already passed ``_stage_baseline``'s guardrail check."""
+
+    final_path = baselines_root / f"{label}.json"
+    staged_path = staging_root / f"{label}.json"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_text(staged_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+
 def update_baseline(
     config: Config,
     model_key: ModelKey,
@@ -524,75 +656,109 @@ def update_baseline(
     baselines_root: str | Path = DEFAULT_BASELINES_ROOT,
     trace: TraceContext | None = None,
 ) -> BaselineFile:
-    """Generates a fresh, guardrail-verified baseline for one candidate and
+    """Generates a fresh, guardrail-verified baseline for ONE candidate and
     commits it to ``baselines_root / f"{model_key.label}.json"`` -- refusing
     to touch that path at all if the freshly measured adversarial noise
     floor fails ``check_guardrail_floor`` (spec §7/D3, ``GuardrailFloorError``).
 
-    Uses REAL certificate values (``composite_mode``/``calibration_verdict``)
-    when ``certificate`` is supplied. Falls back to the uncalibrated
-    placeholder (``FULL_7``/``"uncalibrated"``) with an explicit
-    ``warnings.warn`` when it is not -- acceptable ONLY for this
-    baseline-generation path (a normal gate run still requires a committed
-    certificate via ``render_gate_summary``'s existing
-    ``MissingCertificateError`` enforcement; this relaxation is deliberate
-    and specific to ``--update-baseline``, per the ticket).
+    A thin single-candidate wrapper around ``_stage_baseline``/
+    ``_promote_staged_baseline``: generate + guardrail-check into a
+    ``.staging`` subdirectory of ``baselines_root`` first, so a failing
+    guardrail check never creates or overwrites the real committed baseline
+    file, then promote and clean up staging. Kept for callers that
+    deliberately want to update a single candidate in isolation; ``eval gate
+    --update-baseline`` itself calls ``update_baselines`` (finding F3) so
+    both candidates commit atomically as a pair -- see that function's
+    docstring for why a single-candidate commit is unsafe for the CLI's own
+    two-candidate contract.
 
     ``trace`` (additive, keyword-only, default ``None``) is threaded straight
     through to ``generate_baseline``/``run_eval`` -- the caller (``cli.py``)
     is expected to have already validated it via ``TraceContext.for_run(config,
     True)`` (spec §7/§8: baseline generation is a reportable run and must be
     traced) before calling this function.
-
-    Generates into a ``.staging`` subdirectory of ``baselines_root`` first,
-    so a failing guardrail check never creates or overwrites the real
-    committed baseline file -- "refuses to write" is an observable
-    filesystem guarantee, not just a returned error.
     """
-
-    if certificate is not None:
-        mode = _resolve_composite_mode(certificate)
-        calibration_verdict = certificate.verdict
-    else:
-        warnings.warn(
-            "No calibration certificate found -- generating this baseline with the "
-            "uncalibrated placeholder (composite_mode=FULL_7, "
-            "calibration_verdict='uncalibrated'). This is acceptable for "
-            "--update-baseline only; a normal `eval gate` run still requires a "
-            "committed calibration certificate.",
-            stacklevel=2,
-        )
-        mode = CompositeMode.FULL_7
-        calibration_verdict = "uncalibrated"
 
     baselines_root = Path(baselines_root)
     staging_root = baselines_root / ".staging"
     try:
-        baseline = generate_baseline(
+        baseline = _stage_baseline(
             config,
             model_key,
             dataset=dataset,
             prompt=prompt,
-            composite_mode=mode,
-            calibration_verdict=calibration_verdict,
+            certificate=certificate,
             runs_root=runs_root,
-            baselines_root=staging_root,
+            staging_root=staging_root,
             trace=trace,
         )
-
-        if not check_guardrail_floor(baseline):
-            raise GuardrailFloorError(
-                model_key.label,
-                baseline.adversarial_noise_floor_se,
-                GUARDRAIL_THRESHOLD_POINTS,
-                GUARDRAIL_SE_MULTIPLIER,
-            )
-
-        final_path = baselines_root / f"{model_key.label}.json"
-        staged_path = staging_root / f"{model_key.label}.json"
-        final_path.parent.mkdir(parents=True, exist_ok=True)
-        final_path.write_text(staged_path.read_text(encoding="utf-8"), encoding="utf-8")
+        _promote_staged_baseline(staging_root, baselines_root, model_key.label)
         return baseline
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def update_baselines(
+    config: Config,
+    model_key_a: ModelKey,
+    model_key_b: ModelKey,
+    *,
+    dataset: Sequence[GoldenItem],
+    prompt: PromptTemplate = EXTRACTION_PROMPT,
+    certificate: Certificate | None,
+    runs_root: str | Path = DEFAULT_RUNS_ROOT,
+    baselines_root: str | Path = DEFAULT_BASELINES_ROOT,
+    trace_a: TraceContext | None = None,
+    trace_b: TraceContext | None = None,
+) -> tuple[BaselineFile, BaselineFile]:
+    """Atomically regenerates BOTH candidates' committed baselines for ``eval
+    gate --update-baseline`` (finding F3).
+
+    Stages + guardrail-checks candidate a, then candidate b, into ONE shared
+    ``.staging`` directory; promotes BOTH to their committed paths ONLY if
+    both stagings pass. On ANY failure -- either candidate's
+    ``GuardrailFloorError``, or any other exception raised while staging
+    either one -- staging is removed and BOTH existing committed baseline
+    files are left completely untouched (unchanged if they already existed,
+    still absent if they didn't).
+
+    This replaces the previous per-candidate loop (``update_baseline`` called
+    once per label, each commit independent), which could promote candidate
+    a's baseline to the committed path and only THEN discover candidate b's
+    guardrail failure -- leaving a newly-updated but b stale, an inconsistent
+    committed pair with no way to tell from the files alone that anything
+    was wrong. A CI gate must never observe a and b baselines that were
+    generated under different circumstances relative to each other; the
+    all-or-nothing promotion here is what makes that structurally impossible.
+    """
+
+    baselines_root = Path(baselines_root)
+    staging_root = baselines_root / ".staging"
+    try:
+        baseline_a = _stage_baseline(
+            config,
+            model_key_a,
+            dataset=dataset,
+            prompt=prompt,
+            certificate=certificate,
+            runs_root=runs_root,
+            staging_root=staging_root,
+            trace=trace_a,
+        )
+        baseline_b = _stage_baseline(
+            config,
+            model_key_b,
+            dataset=dataset,
+            prompt=prompt,
+            certificate=certificate,
+            runs_root=runs_root,
+            staging_root=staging_root,
+            trace=trace_b,
+        )
+
+        _promote_staged_baseline(staging_root, baselines_root, model_key_a.label)
+        _promote_staged_baseline(staging_root, baselines_root, model_key_b.label)
+        return baseline_a, baseline_b
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
 
@@ -607,11 +773,13 @@ __all__ = [
     "GuardrailFloorError",
     "JudgeErrorBudgetExceededError",
     "MissingBaselineError",
+    "NominalItemSetMismatchError",
     "adversarial_composite_delta",
     "decide_candidate_result",
     "evaluate_gate",
     "judge_error_rate",
     "nominal_paired_deltas",
     "update_baseline",
+    "update_baselines",
     "wrap_demo_mode_banner",
 ]
