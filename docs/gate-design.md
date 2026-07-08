@@ -19,9 +19,11 @@ The gate protects against (spec §7, D3):
 
 It deliberately does **not** gate:
 
-- **Prompt changes** — excluded from the fingerprint's protected set on
-  purpose; a mismatch routes to `--update-baseline` (§6), a human-reviewed
-  re-baseline, not an automatic pass/fail.
+- **Prompt changes** — `prompt_version` is a fingerprint component like the
+  others, but a prompt change is never adjudicated by the statistical rule:
+  any prompt bump forces a fingerprint mismatch (exit 2), and that mismatch
+  is the mechanism that routes the operator to a human-reviewed
+  `--update-baseline` (§6) — not an automatic pass/fail.
 - **Fine-grained adversarial-slice regressions** — the statistical rule
   (§2) runs on the nominal slice only. The coarse guardrail (§4) is the
   adversarial slice's sole protection, by design: it closes the
@@ -38,7 +40,7 @@ resampled mean ≤ the observed mean — the regression direction only.
 **Exactness.** Full enumeration of all `2**m` sign assignments over the `m`
 nonzero deltas when `m ≤ 20` (truly exact). Above that, 10,000 seeded Monte
 Carlo sign resamples with the bias-corrected `p̂ = (b + 1) / (B + 1)` (never
-zero). At n=32 with a healthy delta distribution, exact mode is expected.
+zero). At n=32 with a healthy delta distribution, exact mode is expected — a prediction, not a guarantee; the no-change runs (§8) will show the observed m values.
 
 **Fail condition.** `p < α AND mean_regression > margin`, α = 0.05,
 margin = 2.0 points (`configs/default.yaml`, `decide_candidate_result`).
@@ -57,7 +59,7 @@ of a blunter gate; v1 does not adopt it.)
 **Family rate.** The gate fails if *either* candidate trips (spec §7).
 Treating the two tests as independent: `1 - (1 - 0.05)² ≈ 0.0975` — printed
 as "≤ ~9.8% worst case." The two candidates share judge and dataset, so
-true independence isn't guaranteed; the unconditional union bound without
+true independence isn't guaranteed; the assumption-free union bound without
 it is ≤ 2α = 0.10 — the ~10% order of magnitude holds either way.
 
 **Sparse-delta resolution limits.** Minimum attainable one-sided p at `m`
@@ -156,8 +158,10 @@ API keys are available.
 
 **Planned protocol:** 10 sequential `eval gate` invocations, no
 code/prompt/dataset/config change between runs, against the committed
-`baselines/{a,b}.json`; each a fresh run (§6) with cleared scratch/run
-directories between invocations so no run's outputs leak into another's;
+`baselines/{a,b}.json`; each a fresh run (§6): the per-invocation
+run root already makes cross-run leakage structurally impossible, and
+scratch directories are additionally cleared between invocations as disk
+hygiene;
 full API keys and Langfuse credentials present throughout (gate runs are
 reportable and fail fast without tracing, spec §8). Recorded per run: run
 index, exit code, per-candidate one-sided p, mean delta. Observed
