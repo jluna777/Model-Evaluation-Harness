@@ -1,0 +1,178 @@
+# CI gate wiring (spec section 11, ticket T18). Runs `eval gate` (spec
+# section 7/9, T16) on same-repo PRs that touch the measurement surface,
+# posts the gate's markdown report to the job summary and as a PR comment,
+# and exposes the `--seed-regression` demo via workflow_dispatch (spec
+# section 7's documented two-command demo sequence).
+#
+# NOTE: this file is kept plain ASCII on purpose (no section-sign / emoji
+# characters) so it stays trivially readable by tools that assume a default
+# (non-UTF-8) text encoding -- e.g. `open()` without an explicit encoding on
+# a Windows dev box, which is exactly this repo's offline verification path
+# for this file.
+#
+# Sequencing note: this workflow is only exercisable once baselines/{a,b}.json
+# are committed (T16) and the five repository secrets below are configured
+# (owner action, T18 ticket notes) -- both are outside this file's scope.
+name: Eval Gate
+
+on:
+  pull_request:
+    # Path filter = exactly the measurement surface (spec section 11's
+    # enumeration): src/, prompts, data/, baselines/, configs/, and this
+    # workflow file itself (so a change to the gate's own CI wiring is
+    # always re-verified).
+    paths:
+      - "src/**" # harness source, including src/harness/prompts.py
+      - "src/harness/prompts.py" # spec section 11 lists "prompts" as its own entry;
+      # already covered by src/** above -- named explicitly here for
+      # fidelity to the spec's literal enumeration, not because it adds
+      # coverage.
+      - "data/**" # golden/calibration/dev datasets
+      - "baselines/**" # committed gate baselines (T16)
+      - "configs/**" # default.yaml: model ids, prompt version, gate margin/alpha, K
+      - ".github/workflows/eval-gate.yml" # the gate wiring itself
+  workflow_dispatch:
+    inputs:
+      demo:
+        description: >-
+          Run the seed-regression demo (`eval gate --seed-regression`, spec
+          section 7) instead of the real gate. Demo mode never writes
+          baselines/: the CLI makes --seed-regression and --update-baseline
+          mutually exclusive (harness.cli's `gate` command raises before
+          doing anything if both are passed), and this workflow never
+          passes --update-baseline in the demo branch below -- so there is
+          no code path here that can touch baselines/ during a demo run.
+        required: false
+        type: boolean
+        default: false
+
+# Minimal permissions: read the repo, write PR comments (the one write this
+# workflow needs -- spec section 11 / ticket T18). Nothing else is granted.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    name: eval gate
+    # ubuntu-latest: CI standardizes on Linux even though local dev on this
+    # repo is Windows -- the harness is OS-neutral (paths via pathlib,
+    # subprocess-free), so this is a CI convenience choice, not a
+    # compatibility requirement.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Fork PRs skip the gate entirely: a fork PR cannot be trusted with the
+    # provider/Langfuse secrets below (GitHub never exposes secrets to
+    # fork-PR workflow runs by default, but this guard also keeps the job
+    # from even attempting -- and failing loudly on missing keys -- for
+    # fork contributors). workflow_dispatch has no PR context at all, so it
+    # is always allowed through.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          # Matches the dev environment's pinned uv version; bump deliberately
+          # alongside any intentional uv upgrade, not incidentally.
+          version: "0.9.1"
+          python-version: "3.12" # pyproject.toml: requires-python = ">=3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Clean results/runs (belt-and-braces)
+        # `eval gate` already guarantees a fresh, invocation-unique runs_root
+        # nested under results/runs/gate/<uuid> for every call (see
+        # harness.cli's module docstring, "Run-identity reuse" /
+        # `_fresh_gate_runs_root`) -- so `find_completed_run` can never reuse
+        # a stale run for this invocation even without this step. This step
+        # is a second, independent guarantee at the CI-environment level: a
+        # reused runner (self-hosted) or a previous job's leftover state
+        # should never be something a gate invocation has to reason about.
+        shell: bash
+        run: rm -rf results/runs
+
+      - name: Run eval gate
+        id: gate
+        shell: bash
+        env:
+          # Exactly five secrets (spec section 11 / ticket T18): three
+          # provider candidate/judge keys + two Langfuse tracing keys. CI
+          # gate runs are always reportable (harness.cli's `gate` command
+          # never passes --dataset), so tracing credentials are mandatory
+          # here, not optional -- spec section 8's fail-fast contract
+          # applies.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          # LANGFUSE_BASE_URL (harness.tracing's canonical Langfuse SDK env
+          # var, checked before config.langfuse.host -- see
+          # `_resolve_langfuse_host`) is wired as a repository VARIABLE, not
+          # a sixth secret: it is a host URL (e.g. a self-hosted Langfuse
+          # instance or an EU-region Cloud endpoint), not a credential, and
+          # `vars.*` is available in this GitHub org/repo. If it is left
+          # unset, this resolves to an empty string, `_resolve_langfuse_host`
+          # treats empty as absent, and the harness falls back to
+          # configs/default.yaml's `langfuse.host` (Langfuse Cloud) --
+          # exactly the same fallback a developer's unset-env-var shell gets.
+          LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL }}
+          # workflow_dispatch's `demo` input selects --seed-regression;
+          # every other trigger (pull_request) runs the plain gate.
+          GATE_ARGS: ${{ (github.event_name == 'workflow_dispatch' && inputs.demo) && '--seed-regression' || '' }}
+        run: |
+          set +e
+          uv run eval gate $GATE_ARGS > gate-report.md 2>&1
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          cat gate-report.md
+
+      - name: Write job summary
+        shell: bash
+        run: cat gate-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }} # automatic Actions token, not one of the five secrets above
+        shell: bash
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file gate-report.md
+
+      # Exit-code contract (spec section 7, harness.gate.gate's module
+      # docstring): 0 = pass, 1 = regression detected, 2 = measurement
+      # error. GitHub Actions treats 1 and 2 as failed checks identically by
+      # default, so the three steps below give each outcome its own step
+      # name AND an `::error::` annotation -- both render distinctly in the
+      # PR UI (the step list in the run log, and the annotations block
+      # surfaced on the PR itself), satisfying spec section 7's "CI renders
+      # each state distinctly."
+      - name: "PASS: gate result"
+        if: steps.gate.outputs.exit_code == '0'
+        shell: bash
+        run: echo "Gate passed -- no regression detected against the committed baseline."
+
+      - name: "FAIL: regression detected"
+        if: steps.gate.outputs.exit_code == '1'
+        shell: bash
+        run: |
+          echo "::error title=Gate: regression detected::eval gate exited 1 -- a statistically significant regression (sign-flip test) or the adversarial guardrail fired against the committed baseline. See the job summary or PR comment for the full report."
+          exit 1
+
+      - name: "FAIL: measurement error (gate could not measure)"
+        if: steps.gate.outputs.exit_code == '2'
+        shell: bash
+        run: |
+          echo "::error title=Gate: measurement error::eval gate exited 2 -- the gate could not produce a trustworthy measurement (missing/mismatched baseline, judge-error budget exceeded, an aborted run, or a setup precondition failure such as missing credentials). This is NOT a candidate regression -- see the job summary or PR comment for details."
+          exit 1
