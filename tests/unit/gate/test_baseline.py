@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,7 @@ from harness.prompts import EXTRACTION_PROMPT
 from harness.runner import ModelKey, RunRow
 from harness.schema import EmailInput, GoldenExpected, GoldenItem, GoldenMeta, TicketExtraction
 from harness.scoring.composite import CompositeMode
+from harness.tracing import TraceContext
 
 DEFAULT_CONFIG_PATH = Path(__file__).parents[3] / "configs" / "default.yaml"
 
@@ -594,3 +596,93 @@ class TestGenerateBaselineNoneJudgeErrorRoundTrip:
         # Verify other fields are still valid (not corrupted by JSON round-trip).
         assert reloaded_first_row.field_scores["requested_action"] in (0, 1)
         assert reloaded_first_row.field_scores["category"] in (0, 1)
+
+
+@dataclass
+class _FakeSpan:
+    """Minimal fake matching the ``SpanLike`` protocol -- mirrors
+    ``tests/unit/test_tracing.py``'s own ``FakeSpan``."""
+
+    def end(self) -> None:
+        pass
+
+    def score(self, *, name: str, value: float, data_type: str | None = None) -> None:
+        pass
+
+
+@dataclass
+class _FakeLangfuseClient:
+    """Fake Langfuse transport double (no network, ever) -- mirrors
+    ``tests/unit/test_tracing.py``'s own ``FakeLangfuseClient``, trimmed to
+    just what T16's trace-threading test needs."""
+
+    span_count: int = 0
+    flush_calls: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def start_span(self, *, name, trace_context=None, metadata=None):
+        with self._lock:
+            self.span_count += 1
+        return _FakeSpan()
+
+    def flush(self) -> None:
+        self.flush_calls += 1
+
+
+class TestGenerateBaselineTracing:
+    """T16: ``generate_baseline``'s additive ``trace`` parameter must reach
+    ``run_eval`` -- otherwise a baseline generated via ``eval gate
+    --update-baseline`` could never actually be traced despite spec §7/§8
+    requiring it (a gap this ticket closes; see ``gate.update_baseline``'s
+    docstring)."""
+
+    def test_trace_is_threaded_through_to_run_eval_and_baseline_is_traced(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "dummy-public-key")
+        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "dummy-secret-key")
+        items = _two_item_dataset()
+        model_key = _model_key()
+        config = _config()
+        fake_client = _FakeLangfuseClient()
+        trace = TraceContext.for_run(config, reportable=True, client_factory=lambda: fake_client)
+
+        run_dir = tmp_path / "runs"
+        generate_baseline(
+            config,
+            model_key,
+            dataset=items,
+            runs_root=run_dir,
+            baselines_root=tmp_path / "baselines",
+            trace=trace,
+        )
+
+        from harness.runner import RunDir, load_run
+
+        completed_run_dirs = list(run_dir.glob("a-*"))
+        assert len(completed_run_dirs) == 1
+        artifact = load_run(RunDir(path=completed_run_dirs[0]))
+
+        assert artifact.untraced is False
+        assert fake_client.span_count > 0
+        assert fake_client.flush_calls >= 1
+
+    def test_omitted_trace_still_defaults_to_untraced(self, tmp_path):
+        items = _two_item_dataset()
+        model_key = _model_key()
+        config = _config()
+
+        baseline = generate_baseline(
+            config,
+            model_key,
+            dataset=items,
+            runs_root=tmp_path / "runs",
+            baselines_root=tmp_path / "baselines",
+        )
+
+        from harness.runner import RunDir, load_run
+
+        run_dirs = list((tmp_path / "runs").glob("a-*"))
+        artifact = load_run(RunDir(path=run_dirs[0]))
+        assert artifact.untraced is True
+        assert baseline is not None

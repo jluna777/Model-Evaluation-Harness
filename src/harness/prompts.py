@@ -7,6 +7,19 @@ fingerprint (``config.py``). ``EXTRACTION_PROMPT`` is frozen as
 against golden or calibration items (spec §3, constitution Principle 6). Any
 future wording change must bump ``version`` and go through the
 ``eval gate --update-baseline`` procedure (spec §7).
+
+``DEGRADED_DEMO_PROMPT`` (T16) exists solely for ``eval gate
+--seed-regression``'s documented demo mode: it is a deliberately weakened
+variant of ``EXTRACTION_PROMPT`` -- stripped of the three-step
+primary-request rule (newest-text-only eligibility, within-text supersession,
+quoted-content reference resolution) and of every per-field definition -- so
+a candidate run against it measurably regresses (worse primary-request
+selection on multi-request/threaded emails, worse entity resolution) without
+touching any real, committed prompt version. It is never used for a real run,
+never affects ``EXTRACTION_PROMPT``, and its ``version`` is a deliberately
+out-of-band negative sentinel (never a real, incrementing prompt version) so
+its run directory can never collide with, or be mistaken for, a real prompt
+version's run (run identity folds in ``prompt_version``, ``runner.py``).
 """
 
 from dataclasses import dataclass
@@ -67,6 +80,24 @@ EXTRACTION_PROMPT = PromptTemplate(
         "the primary issue.\n\n"
         "A field is null only when the email genuinely does not mention it -- never guess "
         "or invent a value to fill a missing field.\n\n"
+        "Output must conform exactly to the provided schema: no text, commentary, or "
+        "markdown outside the schema's fields."
+    ),
+)
+
+
+# Demo-only (T16, `eval gate --seed-regression`): deliberately degraded --
+# see the module docstring. Never iterate this against any dataset; it exists
+# only to produce a demonstrable regression at gate time.
+DEGRADED_DEMO_PROMPT = PromptTemplate(
+    version=-1,
+    template=(
+        "Extract a structured support ticket from the customer support email below.\n\n"
+        "From: {from_}\n"
+        "Subject: {subject}\n"
+        "Body:\n{body}\n\n"
+        "Fields to extract: category, priority, customer_name, order_id, product_name, "
+        "issue_summary, requested_action.\n\n"
         "Output must conform exactly to the provided schema: no text, commentary, or "
         "markdown outside the schema's fields."
     ),

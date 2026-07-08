@@ -5,8 +5,23 @@ constructs real provider SDK clients (``AnthropicClient``/``OpenAIClient``/
 ``GeminiClient``, bundled into a ``runner.ModelKey`` -- see ``runner.py``'s
 module docstring for why the runner itself never imports provider SDKs) and
 the only place that decides whether a run is *reportable* (spec §8) from the
-``--dataset`` flag. ``eval gate``/``eval calibrate`` are wired in T16/T14 --
-this module intentionally stops at ``run``/``compare``/``rescore``.
+``--dataset`` flag. ``eval calibrate`` is wired in T14 -- this module stops
+at ``run``/``compare``/``gate``/``rescore``.
+
+**``eval gate`` (T16):** always reportable (spec §7/§8, no ``--dataset``
+override -- the golden set is the only dataset a baseline is ever compared
+against) and always runs both candidates. Delegates every decision --
+fingerprint check, judge-error budget, the statistical + adversarial-guardrail
+decision rule, rendering -- to ``harness.gate.gate.evaluate_gate`` (pure) and
+``harness.gate.gate.update_baseline`` (the one impure entry point, for
+``--update-baseline``); this module only handles CLI plumbing (dataset/config/
+certificate loading, tracing, client construction via the same
+``_build_model_key``/``_get_or_run`` seams ``run``/``compare`` use, and the
+gate's own exit-code mapping -- see ``_gate_clean_exit``, which differs from
+``_clean_exit_on_expected_errors`` in one binding way: spec §7 explicitly
+buckets an aborted run under the gate's exit-2 "measurement error" outcome,
+whereas ``run``/``compare`` treat the same ``RunAborted`` as an ordinary
+exit-1 expected failure).
 
 **Client-injection seam (binding for T11's tests):** ``_build_model_key`` is
 the SOLE call site that ever constructs ``AnthropicClient``/``OpenAIClient``/
@@ -101,11 +116,13 @@ from dotenv import find_dotenv, load_dotenv
 from google import genai
 
 from harness.config import Config, load_config
+from harness.gate import gate as gate_module
+from harness.gate.baseline import DEFAULT_BASELINES_ROOT, BaselineFile, load_baseline
 from harness.models import ModelClient
 from harness.models.anthropic_client import AnthropicClient
 from harness.models.gemini_client import GeminiClient
 from harness.models.openai_client import OpenAIClient
-from harness.prompts import EXTRACTION_PROMPT, PromptTemplate
+from harness.prompts import DEGRADED_DEMO_PROMPT, EXTRACTION_PROMPT, PromptTemplate
 from harness.reports import MissingCertificateError, render_compare_report, render_run_report
 from harness.runner import (
     DEFAULT_RUNS_ROOT,
@@ -120,7 +137,7 @@ from harness.runner import (
 from harness.schema import Certificate, GoldenItem
 from harness.tracing import MissingTracingError, TraceContext
 
-app = typer.Typer(help="Structured-extraction eval harness: run, compare, rescore.")
+app = typer.Typer(help="Structured-extraction eval harness: run, compare, gate, rescore.")
 
 
 @app.callback(invoke_without_command=False)
@@ -362,6 +379,51 @@ def _clean_exit_on_expected_errors():
         raise typer.Exit(code=1) from exc
 
 
+# Spec §7's four enumerated measurement-error conditions for the GATE
+# specifically -- exit 2. Note RunAborted is here (exit 2) even though
+# `run`/`compare` map the very same exception to exit 1 above: spec §7
+# explicitly lists "aborted run" under the gate's measurement-error bucket
+# (see gate.py's module docstring for the full exit-code rationale).
+_GATE_MEASUREMENT_ERRORS = (
+    gate_module.MissingBaselineError,
+    gate_module.FingerprintMismatchError,
+    gate_module.JudgeErrorBudgetExceededError,
+    RunAborted,
+)
+
+
+@contextmanager
+def _gate_clean_exit():
+    """``eval gate``'s own expected-failure exit mapping (module docstring):
+    the four spec §7 measurement-error conditions get exit 2; every other
+    expected/setup failure (missing tracing/API key, a client construction
+    failure, a run-config mismatch, or a failed ``--update-baseline``
+    guardrail check) gets the same clean exit 1 ``run``/``compare`` already
+    use for their own expected failures."""
+
+    try:
+        yield
+    except _GATE_MEASUREMENT_ERRORS as exc:
+        typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=2) from exc
+    except (
+        RunConfigMismatch,
+        MissingTracingError,
+        MissingCertificateError,
+        MissingApiKeyError,
+        ClientConstructionError,
+        gate_module.GuardrailFloorError,
+    ) as exc:
+        typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
+
+
+def _load_baseline_or_raise(label: str, path: Path) -> BaselineFile:
+    if not path.exists():
+        raise gate_module.MissingBaselineError(label, path)
+    return load_baseline(path)
+
+
 # --------------------------------------------------------------------------
 # Commands.
 # --------------------------------------------------------------------------
@@ -437,6 +499,97 @@ def compare(
     report_path.write_text(report, encoding="utf-8")
     typer.echo(report)
     typer.echo(f"Report written to {report_path}")
+
+
+@app.command()
+def gate(
+    update_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--update-baseline",
+            help="Regenerate and commit fresh baselines for both candidates (K_baseline, "
+            "traced, reportable) instead of running the decision rule.",
+        ),
+    ] = False,
+    seed_regression: Annotated[
+        bool,
+        typer.Option(
+            "--seed-regression",
+            help="Demo mode: apply DEGRADED_DEMO_PROMPT at runtime, skip the fingerprint "
+            "check, and banner the output DEMO MODE.",
+        ),
+    ] = False,
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+) -> None:
+    """CI gate decision vs the committed baseline (spec §7). Exit 0 = pass,
+    1 = regression detected (or another expected/setup failure), 2 =
+    measurement error (missing baseline, fingerprint mismatch, judge-error
+    budget exceeded, or an aborted run)."""
+
+    if update_baseline and seed_regression:
+        typer.secho(
+            "error: --update-baseline and --seed-regression are mutually exclusive",
+            err=True,
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    outcome: gate_module.GateOutcome | None = None
+    with _gate_clean_exit():
+        cfg = load_config(config)
+        items = _load_dataset(Path(cfg.dataset.path))
+        certificate = _load_certificate(DEFAULT_CERTIFICATE_PATH)
+
+        if update_baseline:
+            # Spec §8 traces per-run, not per-invocation (mirrors `compare`'s
+            # own trace_a/trace_b split): each candidate's baseline generation
+            # gets its own trace, both validated (fail-fast, before any API
+            # call) before either client is built.
+            baseline_trace_a = TraceContext.for_run(cfg, True)
+            baseline_trace_b = TraceContext.for_run(cfg, True)
+            for label, label_trace in (("a", baseline_trace_a), ("b", baseline_trace_b)):
+                model_key = _build_model_key(label, cfg)
+                baseline = gate_module.update_baseline(
+                    cfg,
+                    model_key,
+                    dataset=items,
+                    prompt=EXTRACTION_PROMPT,
+                    certificate=certificate,
+                    runs_root=DEFAULT_RUNS_ROOT,
+                    baselines_root=DEFAULT_BASELINES_ROOT,
+                    trace=label_trace,
+                )
+                typer.echo(
+                    f"Baseline written: {DEFAULT_BASELINES_ROOT / f'{label}.json'} "
+                    f"(fingerprint {baseline.fingerprint[:12]}...)"
+                )
+            return
+
+        trace_a = TraceContext.for_run(cfg, True)
+        trace_b = TraceContext.for_run(cfg, True)
+
+        baseline_a = _load_baseline_or_raise("a", DEFAULT_BASELINES_ROOT / "a.json")
+        baseline_b = _load_baseline_or_raise("b", DEFAULT_BASELINES_ROOT / "b.json")
+
+        prompt = DEGRADED_DEMO_PROMPT if seed_regression else EXTRACTION_PROMPT
+        run_dir_a = _get_or_run(cfg, "a", items, prompt, trace_a, DEFAULT_RUNS_ROOT)
+        run_dir_b = _get_or_run(cfg, "b", items, prompt, trace_b, DEFAULT_RUNS_ROOT)
+        run_a = load_run(run_dir_a)
+        run_b = load_run(run_dir_b)
+
+        outcome = gate_module.evaluate_gate(
+            cfg,
+            baseline_a=baseline_a,
+            baseline_b=baseline_b,
+            run_a=run_a,
+            run_b=run_b,
+            certificate=certificate,
+            seed_regression=seed_regression,
+        )
+
+    assert outcome is not None
+    typer.echo(outcome.rendered)
+    raise typer.Exit(code=outcome.exit_code)
 
 
 @app.command()

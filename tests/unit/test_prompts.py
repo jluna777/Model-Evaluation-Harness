@@ -1,4 +1,4 @@
-from harness.prompts import EXTRACTION_PROMPT, PromptTemplate
+from harness.prompts import DEGRADED_DEMO_PROMPT, EXTRACTION_PROMPT, PromptTemplate
 from harness.schema import EmailInput
 
 
@@ -92,3 +92,34 @@ class TestExtractionPromptFrozen:
         # address like "customer@example.com" would be an unrelated false
         # positive for the substring "example".
         assert "example" not in EXTRACTION_PROMPT.template.lower()
+
+
+class TestDegradedDemoPrompt:
+    """T16: DEGRADED_DEMO_PROMPT exists solely for `eval gate
+    --seed-regression`'s demo mode -- a deliberately weakened variant of
+    EXTRACTION_PROMPT, out-of-band prompt_version so it can never collide
+    with (or be mistaken for) a real prompt version's run identity."""
+
+    def test_is_a_prompt_template_and_renders(self):
+        assert isinstance(DEGRADED_DEMO_PROMPT, PromptTemplate)
+        rendered = DEGRADED_DEMO_PROMPT.render(_email())
+        assert isinstance(rendered, str)
+        assert "Where is my order?" in rendered
+
+    def test_version_is_a_negative_out_of_band_sentinel(self):
+        # Never a real, incrementing prompt version (those start at 1).
+        assert DEGRADED_DEMO_PROMPT.version < 0
+        assert DEGRADED_DEMO_PROMPT.version != EXTRACTION_PROMPT.version
+
+    def test_strips_the_three_step_tie_break_rule_and_field_definitions(self):
+        rendered = DEGRADED_DEMO_PROMPT.render(_email())
+        assert TIE_BREAK_SENTENCE not in rendered
+        # Field definitions (e.g. the order_id format hint) are gone too --
+        # only the bare field names remain (module docstring: "stripped of
+        # ... every per-field definition").
+        assert "form ORD-NNNNN" not in rendered
+        assert "order_id" in rendered  # the field name itself is still listed
+
+    def test_still_instructs_schema_only_output(self):
+        rendered = DEGRADED_DEMO_PROMPT.render(_email())
+        assert "conform exactly to the provided schema" in rendered

@@ -75,6 +75,7 @@ from harness.prompts import EXTRACTION_PROMPT, PromptTemplate
 from harness.runner import DEFAULT_RUNS_ROOT, ModelKey, RunArtifact, RunRow, load_run, run_eval
 from harness.schema import GoldenItem
 from harness.scoring.composite import DETERMINISTIC_FIELDS, JUDGED_FIELDS, CompositeMode, composite
+from harness.tracing import TraceContext
 
 BASELINE_SCHEMA_VERSION = 1
 DEFAULT_BASELINES_ROOT = Path("baselines")
@@ -346,6 +347,7 @@ def generate_baseline(
     calibration_verdict: str = "uncalibrated",
     runs_root: str | Path = DEFAULT_RUNS_ROOT,
     baselines_root: str | Path = DEFAULT_BASELINES_ROOT,
+    trace: TraceContext | None = None,
 ) -> BaselineFile:
     """Generate (and write) the baseline for ``model_key``'s candidate over
     ``dataset``, at ``K = config.k_baseline`` replicates per item (spec §7:
@@ -373,6 +375,15 @@ def generate_baseline(
     uncalibrated/``FULL_7`` placeholders ``run_eval``'s own manifest uses,
     appropriate for this ticket's fake-client tests; T16's real baseline
     generation (after a certificate exists) supplies the real values.
+
+    ``trace`` (T16, additive, keyword-only, default ``None``) is threaded
+    straight through to ``run_eval`` -- the same interface-evolution
+    convention this function's own docstring already establishes for
+    ``composite_mode``/``calibration_verdict``. Without it, a committed
+    baseline could never be traced (spec §7/§8: baseline generation is a
+    reportable run and must be traced); this ticket's fake-client tests
+    still default it to ``None`` (untraced), exactly like ``run_eval``'s own
+    default.
     """
 
     run_dir = run_eval(
@@ -382,6 +393,7 @@ def generate_baseline(
         dataset=dataset,
         prompt=prompt,
         runs_root=runs_root,
+        trace=trace,
     )
     run_artifact = load_run(run_dir)
 
