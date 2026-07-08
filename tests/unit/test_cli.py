@@ -19,6 +19,7 @@ import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ import yaml
 from pydantic import BaseModel
 from typer.testing import CliRunner
 
+import harness.calibrate as calibrate
 import harness.cli as cli
 import harness.runner as runner_module
 from harness.cli import app
@@ -36,15 +38,18 @@ from harness.models.retry import TransportExhausted
 from harness.prompts import EXTRACTION_PROMPT
 from harness.reports import render_run_report
 from harness.runner import DEFAULT_RUNS_ROOT, ModelKey, RunDir, load_run, run_eval
-from harness.schema import EmailInput, GoldenExpected, GoldenItem, GoldenMeta, TicketExtraction
+from harness.schema import (
+    CalibrationLabel,
+    EmailInput,
+    GoldenExpected,
+    GoldenItem,
+    GoldenMeta,
+    TicketExtraction,
+)
 
 DEFAULT_CONFIG_PATH = Path(__file__).parents[2] / "configs" / "default.yaml"
-CERT_FIXTURE = (
-    Path(__file__).parents[1] / "fixtures" / "reports" / "certificate_adequate.json"
-)
-RUN_REPORT_FIXTURE_DIR = (
-    Path(__file__).parents[1] / "fixtures" / "reports" / "run_report" / "run"
-)
+CERT_FIXTURE = Path(__file__).parents[1] / "fixtures" / "reports" / "certificate_adequate.json"
+RUN_REPORT_FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "reports" / "run_report" / "run"
 
 runner = CliRunner()
 
@@ -197,9 +202,7 @@ def _recording_factory(
     return factory
 
 
-def _write_config(
-    path: Path, *, dataset_path: Path, dataset_version: int = 1, k: int = 1
-) -> Path:
+def _write_config(path: Path, *, dataset_path: Path, dataset_version: int = 1, k: int = 1) -> Path:
     base = load_config(DEFAULT_CONFIG_PATH)
     updated = base.model_copy(
         update={
@@ -650,9 +653,7 @@ class TestMissingApiKey:
         assert "Traceback" not in result.output
         assert "GEMINI_API_KEY" in result.output
 
-    def test_construction_time_exception_is_wrapped_as_client_construction_error(
-        self, monkeypatch
-    ):
+    def test_construction_time_exception_is_wrapped_as_client_construction_error(self, monkeypatch):
         """Fallback wrap (module docstring): even once the env check passes,
         a provider SDK construction-time exception must never propagate raw
         -- it is re-raised as ``ClientConstructionError`` with the true cause
@@ -708,9 +709,7 @@ class TestMissingApiKey:
 
 
 class TestBuildModelKeyConstructionSeam:
-    def test_build_model_key_constructs_expected_provider_clients_per_label(
-        self, monkeypatch
-    ):
+    def test_build_model_key_constructs_expected_provider_clients_per_label(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-anthropic-key")
         monkeypatch.setenv("OPENAI_API_KEY", "dummy-openai-key")
         monkeypatch.setenv("GEMINI_API_KEY", "dummy-gemini-key")
@@ -739,9 +738,7 @@ class TestBuildModelKeyConstructionSeam:
         assert model_key_b.candidate_client is openai_instances[0]
         assert len(anthropic_instances) == 1  # unaffected by the "b" call
 
-    def test_run_end_to_end_exercises_judge_wrapping_the_gemini_client(
-        self, tmp_path, monkeypatch
-    ):
+    def test_run_end_to_end_exercises_judge_wrapping_the_gemini_client(self, tmp_path, monkeypatch):
         """Drives the real ``_build_model_key`` seam through a full ``eval
         run`` invocation with RECORDING (non-raising) provider stubs, so the
         constructed Gemini stub's ``complete_structured`` is only ever
@@ -970,3 +967,134 @@ class TestEnvFileLoading:
         # These should come from .env since no OS-level var was set
         assert keys_used["openai"] == "key-from-env-file"
         assert keys_used["gemini"] == "key-from-env-file"
+
+
+# --------------------------------------------------------------------------
+# Calibrate command tests.
+# --------------------------------------------------------------------------
+
+
+def _write_calibration_emails(path: Path, items: list[GoldenItem]) -> Path:
+    """Write calibration emails JSONL (GoldenMeta format for calibration)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for item in items:
+            # Calibration emails: GoldenMeta format records.
+            meta_record = {
+                "id": item.id,
+                "email": item.email.model_dump(mode="json"),
+                "expected": item.expected.model_dump(mode="json"),
+                "meta": item.meta.model_dump(mode="json"),
+            }
+            f.write(json.dumps(meta_record) + "\n")
+    return path
+
+
+def _write_calibration_labels(path: Path, labels: list[CalibrationLabel]) -> Path:
+    """Write calibration labels JSONL."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for label in labels:
+            f.write(json.dumps(label.model_dump(mode="json")) + "\n")
+    return path
+
+
+class TestCalibrateRetestBinding:
+    def test_retest_ceiling_mismatched_output_sha256_clean_exit(self, tmp_path, monkeypatch):
+        """``eval calibrate --retest`` with mismatched output_sha256 between
+        initial and retest labels exits cleanly with CalibrationBindingError
+        (no traceback)."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create calibration items
+        items = [
+            make_item("cal-001"),
+            make_item("cal-002"),
+        ]
+        emails_path = tmp_path / "data" / "calibration" / "emails.jsonl"
+        _write_calibration_emails(emails_path, items)
+
+        # Create labels with mismatched output_sha256 between rounds
+        labels = [
+            # cal-001 initial: one output_sha256
+            CalibrationLabel(
+                label_id="lbl-cal-001-a-issue_summary-initial",
+                item_id="cal-001",
+                candidate="a",
+                field="issue_summary",
+                verdict="pass",
+                critique="test label",
+                label_date=date(2026, 6, 1),
+                round="initial",
+                output_sha256=calibrate.hash_output("initial-value-1"),
+            ),
+            # cal-001 retest: different output_sha256 (same key, different output)
+            CalibrationLabel(
+                label_id="lbl-cal-001-a-issue_summary-retest",
+                item_id="cal-001",
+                candidate="a",
+                field="issue_summary",
+                verdict="pass",
+                critique="test label",
+                label_date=date(2026, 6, 1),
+                round="retest",
+                output_sha256=calibrate.hash_output("retest-value-1"),
+            ),
+            # cal-002 initial: one output_sha256
+            CalibrationLabel(
+                label_id="lbl-cal-002-a-issue_summary-initial",
+                item_id="cal-002",
+                candidate="a",
+                field="issue_summary",
+                verdict="pass",
+                critique="test label",
+                label_date=date(2026, 6, 1),
+                round="initial",
+                output_sha256=calibrate.hash_output("initial-value-2"),
+            ),
+            # cal-002 retest: different output_sha256
+            CalibrationLabel(
+                label_id="lbl-cal-002-a-issue_summary-retest",
+                item_id="cal-002",
+                candidate="a",
+                field="issue_summary",
+                verdict="pass",
+                critique="test label",
+                label_date=date(2026, 6, 1),
+                round="retest",
+                output_sha256=calibrate.hash_output("retest-value-2"),
+            ),
+        ]
+        labels_path = tmp_path / "data" / "calibration" / "labels.jsonl"
+        _write_calibration_labels(labels_path, labels)
+
+        config_path = _write_config(tmp_path / "config.yaml", dataset_path=emails_path)
+
+        # Set up required API keys and forbid real client construction
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "dummy-key")
+        _forbid_real_client_construction(monkeypatch)
+
+        # Mock TraceContext to avoid Langfuse credential check
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        # Mock the necessary components to avoid actual API calls
+        registry: dict[str, list[FakeModelClient]] = {}
+        monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
+
+        result = runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--retest",
+                "--emails",
+                str(emails_path),
+                "--labels",
+                str(labels_path),
+                "--config",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output

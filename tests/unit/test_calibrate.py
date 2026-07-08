@@ -752,6 +752,126 @@ class TestComputeRetestCeiling:
 
         assert ceiling is None
 
+    def test_matching_output_sha256_across_rounds_allows_ceiling(self):
+        """When initial and retest labels for the same key have matching
+        output_sha256 (labeled the same candidate output), ceiling is computed
+        normally."""
+        labels = []
+        for i in range(1, 7):  # Need at least 2 shared keys; use 6 for variance
+            item_id = f"cal-{i:03d}"
+            verdict = "fail" if item_id == "cal-002" else "pass"
+            # Both rounds label the same candidate value -> same output_sha256
+            labels.append(
+                make_label(
+                    item_id,
+                    "a",
+                    "issue_summary",
+                    verdict,
+                    round_="initial",
+                    candidate_value="same-value",
+                )
+            )
+            labels.append(
+                make_label(
+                    item_id,
+                    "a",
+                    "issue_summary",
+                    verdict,
+                    round_="retest",
+                    candidate_value="same-value",
+                )
+            )
+
+        ceiling, warnings_out = compute_retest_ceiling(labels, n_resamples=200, seed=0)
+
+        assert ceiling is not None
+        assert ceiling.kappa == pytest.approx(1.0)
+
+    def test_mismatched_output_sha256_raises_binding_error(self):
+        """When initial and retest labels for the same key have different
+        output_sha256 (labeled different candidate outputs), raises
+        CalibrationBindingError all-or-nothing (no partial ceiling)."""
+        labels = []
+        for i in range(1, 3):
+            item_id = f"cal-{i:03d}"
+            # Initial labels one candidate value
+            labels.append(
+                make_label(
+                    item_id,
+                    "a",
+                    "issue_summary",
+                    "pass",
+                    round_="initial",
+                    candidate_value="initial-value",
+                )
+            )
+            # Retest labels a different candidate value
+            labels.append(
+                make_label(
+                    item_id,
+                    "a",
+                    "issue_summary",
+                    "pass",
+                    round_="retest",
+                    candidate_value="retest-value",
+                )
+            )
+
+        with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
+            compute_retest_ceiling(labels)
+
+        assert len(excinfo.value.mismatches) == 2
+        assert ("cal-001", "a", "issue_summary") in excinfo.value.mismatches
+        assert ("cal-002", "a", "issue_summary") in excinfo.value.mismatches
+
+    def test_one_mismatched_key_blocks_all_ceiling_computation(self):
+        """All-or-nothing: a single mismatched output_sha256 prevents the
+        entire ceiling from being computed, even if other keys match."""
+        good_value = "good-candidate-value"
+        bad_value = "bad-candidate-value"
+        labels = [
+            # This key matches
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="initial",
+                candidate_value=good_value,
+            ),
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=good_value,
+            ),
+            # This key mismatches
+            make_label(
+                "cal-002",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="initial",
+                candidate_value=good_value,
+            ),
+            make_label(
+                "cal-002",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=bad_value,
+            ),
+        ]
+
+        with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
+            compute_retest_ceiling(labels)
+
+        # Only the mismatched key should be reported
+        assert excinfo.value.mismatches == (("cal-002", "a", "issue_summary"),)
+
 
 # --------------------------------------------------------------------------
 # Disjointness from golden.
@@ -1166,10 +1286,35 @@ class TestRunCalibrationIntegration:
     def test_retest_flag_adds_ceiling_from_retest_labels(self):
         run_a, run_b, labels, judge = _calibration_fixture()
         # Add retest labels for a subset of the initial keys, perfectly consistent.
+        # Must use same candidate_value as initial labels (output_sha256 binding).
+        def cv(item_id: str, candidate: str, field: str) -> str:
+            return f"{item_id}-{candidate}-{field}-value"
+
         retest_labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", round_="retest"),
-            make_label("cal-002", "a", "issue_summary", "fail", round_="retest"),
-            make_label("cal-003", "a", "issue_summary", "pass", round_="retest"),
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=cv("cal-001", "a", "issue_summary"),
+            ),
+            make_label(
+                "cal-002",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="retest",
+                candidate_value=cv("cal-002", "a", "issue_summary"),
+            ),
+            make_label(
+                "cal-003",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=cv("cal-003", "a", "issue_summary"),
+            ),
         ]
 
         result = run_calibration(
@@ -1190,9 +1335,27 @@ class TestRunCalibrationIntegration:
 
     def test_retest_false_never_computes_ceiling_even_with_retest_labels_present(self):
         run_a, run_b, labels, judge = _calibration_fixture()
+        # Must use same candidate_value as initial labels (output_sha256 binding).
+        def cv(item_id: str, candidate: str, field: str) -> str:
+            return f"{item_id}-{candidate}-{field}-value"
+
         retest_labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", round_="retest"),
-            make_label("cal-002", "a", "issue_summary", "fail", round_="retest"),
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=cv("cal-001", "a", "issue_summary"),
+            ),
+            make_label(
+                "cal-002",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="retest",
+                candidate_value=cv("cal-002", "a", "issue_summary"),
+            ),
         ]
 
         result = run_calibration(
@@ -1573,10 +1736,35 @@ class TestRunCalibrationOffline:
             seed=0,
         )
         judgments_file = self._judgments_file_from_live_result(live_result)
+        # Must use same candidate_value as initial labels (output_sha256 binding).
+        def cv(item_id: str, candidate: str, field: str) -> str:
+            return f"{item_id}-{candidate}-{field}-value"
+
         retest_labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", round_="retest"),
-            make_label("cal-002", "a", "issue_summary", "fail", round_="retest"),
-            make_label("cal-003", "a", "issue_summary", "pass", round_="retest"),
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=cv("cal-001", "a", "issue_summary"),
+            ),
+            make_label(
+                "cal-002",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="retest",
+                candidate_value=cv("cal-002", "a", "issue_summary"),
+            ),
+            make_label(
+                "cal-003",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=cv("cal-003", "a", "issue_summary"),
+            ),
         ]
 
         offline_result = calibrate.run_calibration_offline(
@@ -1936,10 +2124,32 @@ class TestCalibrateCLIHappyPath:
         items = [_cli_item(i) for i in item_ids]
         emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
         labels = _happy_path_labels(item_ids)
+        # Retest labels must use same candidate_value as initial labels (output_sha256 binding).
         retest_labels = [
-            make_label("cal-001", "a", "issue_summary", "fail", round_="retest"),
-            make_label("cal-002", "a", "issue_summary", "pass", round_="retest"),
-            make_label("cal-003", "a", "issue_summary", "pass", round_="retest"),
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="retest",
+                candidate_value=_happy_path_candidate_value("cal-001", "a", "issue_summary"),
+            ),
+            make_label(
+                "cal-002",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=_happy_path_candidate_value("cal-002", "a", "issue_summary"),
+            ),
+            make_label(
+                "cal-003",
+                "a",
+                "issue_summary",
+                "pass",
+                round_="retest",
+                candidate_value=_happy_path_candidate_value("cal-003", "a", "issue_summary"),
+            ),
         ]
         labels_path = _write_labels(tmp_path / "labels.jsonl", labels + retest_labels)
         config_path = _write_calibrate_config(tmp_path / "config.yaml", k=1)

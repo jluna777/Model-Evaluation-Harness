@@ -311,10 +311,11 @@ def _labels_by_key(
     labels: Sequence[CalibrationLabel], round_: Literal["initial", "retest"]
 ) -> dict[tuple[str, str, str], Literal["pass", "fail"]]:
     """``{(item_id, candidate, field): verdict}`` for one label round --
-    thin wrapper over ``_labels_by_full_key`` for callers (``compute_
-    retest_ceiling``) that only need the verdict, not the full label (no
-    output-binding check applies there: it compares two label rounds against
-    each other, never against a candidate output)."""
+    thin wrapper over ``_labels_by_full_key`` for callers that only need the
+    verdict, not the full label. ``compute_retest_ceiling`` uses this to
+    compare verdicts but also performs a separate output-binding check
+    (``_verify_retest_binding``) to ensure both rounds labeled the same
+    candidate output for each shared key."""
 
     return {key: label.verdict for key, label in _labels_by_full_key(labels, round_).items()}
 
@@ -662,6 +663,30 @@ def _self_consistency_from_records(
 # --------------------------------------------------------------------------
 
 
+def _verify_retest_binding(
+    labels: Sequence[CalibrationLabel],
+    shared_keys: Sequence[tuple[str, str, str]],
+) -> None:
+    """Verifies that for every shared key between initial and retest rounds,
+    the output_sha256 values match. Raises CalibrationBindingError if any
+    mismatches are found.
+    """
+    initial_by_key = _labels_by_full_key(labels, "initial")
+    retest_by_key = _labels_by_full_key(labels, "retest")
+
+    mismatches = []
+    for key in shared_keys:
+        if key in initial_by_key and key in retest_by_key:
+            if (
+                initial_by_key[key].output_sha256
+                != retest_by_key[key].output_sha256
+            ):
+                mismatches.append(key)
+
+    if mismatches:
+        raise CalibrationBindingError(mismatches)
+
+
 def compute_retest_ceiling(
     labels: Sequence[CalibrationLabel],
     *,
@@ -674,6 +699,11 @@ def compute_retest_ceiling(
     and ``round="retest"`` labels -- spec §5's "estimate of the consistency
     ceiling". Returns ``(None, ())`` if fewer than 2 keys are shared (no
     meaningful ceiling to compute; e.g. no retest labels at all).
+
+    Verifies that for every shared key, the initial and retest labels were
+    made against the SAME candidate output (output_sha256 match). If any
+    output binding mismatch is found, raises CalibrationBindingError all-or-
+    nothing (no partial ceiling computed).
     """
 
     initial = _labels_by_key(labels, "initial")
@@ -681,6 +711,10 @@ def compute_retest_ceiling(
     shared_keys = sorted(set(initial) & set(retest))
     if len(shared_keys) < 2:
         return None, ()
+
+    # Verify output binding: for every shared key, initial and retest labels
+    # must be of the same candidate output (output_sha256 match).
+    _verify_retest_binding(labels, shared_keys)
 
     a = [initial[key] for key in shared_keys]
     b = [retest[key] for key in shared_keys]
@@ -1204,6 +1238,10 @@ def write_judgments_jsonl(
         lines.append(json.dumps({"kind": "self_consistency", **asdict(s)}, sort_keys=True))
 
     tmp_path = path.with_suffix(path.suffix + ".tmp")
+    # Clean up any stale temp file from a prior killed write (same atomic-write
+    # pattern as runner.py's _repair_truncated_tail).
+    if tmp_path.exists():
+        tmp_path.unlink()
     with tmp_path.open("w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
         fh.flush()
