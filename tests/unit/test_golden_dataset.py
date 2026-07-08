@@ -56,6 +56,12 @@ _CANDIDATE_FAMILY_MARKERS = {
 
 _COUNTS_BLOCK_RE = re.compile(r"```text\n(.*?)\n```", re.DOTALL)
 
+# Domain-category minimums (ticket-schema `expected.category` enum: billing/
+# shipping/account/product/other) live in a separately fenced block, distinct
+# from the taxonomy-tag counts block above -- domains are a floor per value,
+# not summed against the 50-item total the way the taxonomy block is.
+_DOMAIN_MINIMUMS_BLOCK_RE = re.compile(r"```domains\n(.*?)\n```", re.DOTALL)
+
 
 def generator_family(generator: str) -> str:
     """Classify a ``meta.generator`` string as 'anthropic', 'openai', or 'other'.
@@ -88,6 +94,25 @@ def load_taxonomy_counts(taxonomy_path: Path) -> dict[str, int]:
     return counts
 
 
+def load_domain_minimums(taxonomy_path: Path) -> dict[str, int]:
+    """Parse the fenced ` ```domains ` block from taxonomy.md: a per-ticket-
+    domain (`expected.category`) minimum-count floor, independent of the
+    taxonomy-tag counts block above."""
+
+    text = taxonomy_path.read_text(encoding="utf-8")
+    match = _DOMAIN_MINIMUMS_BLOCK_RE.search(text)
+    if not match:
+        raise ValueError(f"no machine-readable domains block found in {taxonomy_path}")
+    minimums: dict[str, int] = {}
+    for line in match.group(1).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name, _, value = line.partition(":")
+        minimums[name.strip()] = int(value.strip())
+    return minimums
+
+
 def load_golden_items(golden_path: Path) -> list[GoldenItem]:
     """Load and strictly validate every line of a golden-format JSONL file."""
 
@@ -100,6 +125,18 @@ def category_counts(items: list[GoldenItem]) -> dict[str, int]:
     for item in items:
         for category in item.meta.categories:
             counts[category] = counts.get(category, 0) + 1
+    return counts
+
+
+def domain_category_counts(items: list[GoldenItem]) -> dict[str, int]:
+    """Count items per ticket-schema domain (`expected.category`) -- the axis
+    the domain-minimums floor is checked against, orthogonal to the
+    `meta.categories` taxonomy tags counted by ``category_counts``."""
+
+    counts: dict[str, int] = {}
+    for item in items:
+        domain = str(item.expected.category)
+        counts[domain] = counts.get(domain, 0) + 1
     return counts
 
 
@@ -124,11 +161,19 @@ def reconcile(
     expected_nominal: int = EXPECTED_NOMINAL,
     expected_adversarial: int = EXPECTED_ADVERSARIAL,
     min_distinct_fraction: float = MIN_DISTINCT_FAMILY_FRACTION,
+    domain_minimums: dict[str, int] | None = None,
 ) -> None:
     """Every T13 reconciliation assertion; raises ``AssertionError`` on the
     first violation found. Parameterized on the expected totals so the same
     logic exercises both the real 50-item contract and small synthetic
-    fixtures."""
+    fixtures.
+
+    ``domain_minimums``, when given, is a floor per ticket-schema domain
+    (`expected.category`: billing/shipping/account/product/other) -- a
+    separate axis from ``taxonomy_counts``' exact-reconciled `meta.categories`
+    tags, so it is checked independently rather than folded into the same
+    dict/sum check.
+    """
 
     assert len(items) == expected_total, f"expected {expected_total} items, got {len(items)}"
 
@@ -164,6 +209,14 @@ def reconcile(
         f"candidates; need >= {min_distinct_fraction:.0%}"
     )
 
+    if domain_minimums is not None:
+        actual_domain_counts = domain_category_counts(items)
+        for domain, floor in domain_minimums.items():
+            actual = actual_domain_counts.get(domain, 0)
+            assert actual >= floor, (
+                f"domain category {domain!r} has fewer than {floor} item(s) ({actual})"
+            )
+
 
 def assert_multi_request_variants_covered(actual_counts: dict[str, int]) -> None:
     """Ticket AC: each of the four multi-request variants has >=1 item."""
@@ -191,7 +244,8 @@ class TestGoldenDatasetReconciliation:
         _skip_if_golden_dataset_absent()
         items = load_golden_items(GOLDEN_PATH)
         counts = load_taxonomy_counts(TAXONOMY_PATH)
-        reconcile(items, counts)
+        domain_minimums = load_domain_minimums(TAXONOMY_PATH)
+        reconcile(items, counts, domain_minimums=domain_minimums)
         assert_multi_request_variants_covered(category_counts(items))
 
     def test_every_item_is_a_strict_golden_item(self):
@@ -217,12 +271,13 @@ def _item_dict(
     order_id: str | None = None,
     generator: str = "gemini-3.5-flash",
     difficulty: int = 1,
+    category: str = "other",
 ) -> dict:
     return {
         "id": item_id,
         "email": {"from": "a@example.com", "subject": "s", "body": "b"},
         "expected": {
-            "category": "other",
+            "category": category,
             "priority": "low",
             "customer_name": None,
             "order_id": order_id,
@@ -276,6 +331,26 @@ class TestLoadTaxonomyCounts:
         taxonomy_path.write_text("# Taxonomy\n\nno fenced block here\n", encoding="utf-8")
         with pytest.raises(ValueError, match="no machine-readable"):
             load_taxonomy_counts(taxonomy_path)
+
+
+class TestLoadDomainMinimums:
+    def test_parses_fenced_domains_block(self, tmp_path):
+        taxonomy_path = tmp_path / "taxonomy.md"
+        taxonomy_path.write_text(
+            "# Taxonomy\n\n```text\ncat_a: 3\ncat_b: 2\n```\n\n"
+            "```domains\nbilling: 2\nshipping: 2\n```\n",
+            encoding="utf-8",
+        )
+        assert load_domain_minimums(taxonomy_path) == {"billing": 2, "shipping": 2}
+        # The two fenced blocks are independent -- the domains block never
+        # leaks into (or gets confused with) the taxonomy-tag counts block.
+        assert load_taxonomy_counts(taxonomy_path) == {"cat_a": 3, "cat_b": 2}
+
+    def test_raises_when_block_missing(self, tmp_path):
+        taxonomy_path = tmp_path / "taxonomy.md"
+        taxonomy_path.write_text("# Taxonomy\n\n```text\ncat_a: 3\n```\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="no machine-readable domains"):
+            load_domain_minimums(taxonomy_path)
 
 
 class TestReconciliationLogicSynthetic:
@@ -407,6 +482,49 @@ class TestReconciliationLogicSynthetic:
                 expected_nominal=2,
                 expected_adversarial=2,
                 # default 0.8 bound: only 1/4 = 25% distinct here -> must fail
+            )
+
+    def test_domain_minimums_pass_when_satisfied(self, tmp_path):
+        items_raw = [
+            _item_dict("g-001", "nominal", ["cat_a"], category="billing"),
+            _item_dict("g-002", "nominal", ["cat_a"], category="billing"),
+            _item_dict("g-003", "adversarial", ["cat_b"], category="shipping"),
+            _item_dict("g-004", "adversarial", ["cat_b"], category="shipping"),
+        ]
+        golden_path = _write_jsonl(tmp_path / "golden.jsonl", items_raw)
+        items = load_golden_items(golden_path)
+        reconcile(
+            items,
+            {"cat_a": 2, "cat_b": 2},
+            expected_total=4,
+            expected_nominal=2,
+            expected_adversarial=2,
+            min_distinct_fraction=0.5,
+            domain_minimums={"billing": 2, "shipping": 2},
+        )
+
+    def test_fails_when_domain_minimum_violated(self, tmp_path):
+        # Mutation of the passing fixture above: g-002 moves from "billing" to
+        # "shipping", dropping billing to 1 item -- below its floor of 2 -- so
+        # the same reconcile() call that passed before must now fail, proving
+        # the domain-minimums check actually enforces the floor.
+        items_raw = [
+            _item_dict("g-001", "nominal", ["cat_a"], category="billing"),
+            _item_dict("g-002", "nominal", ["cat_a"], category="shipping"),
+            _item_dict("g-003", "adversarial", ["cat_b"], category="shipping"),
+            _item_dict("g-004", "adversarial", ["cat_b"], category="shipping"),
+        ]
+        golden_path = _write_jsonl(tmp_path / "golden.jsonl", items_raw)
+        items = load_golden_items(golden_path)
+        with pytest.raises(AssertionError, match="domain category 'billing'"):
+            reconcile(
+                items,
+                {"cat_a": 2, "cat_b": 2},
+                expected_total=4,
+                expected_nominal=2,
+                expected_adversarial=2,
+                min_distinct_fraction=0.5,
+                domain_minimums={"billing": 2, "shipping": 2},
             )
 
     def test_assert_multi_request_variants_covered_passes_when_all_present(self):

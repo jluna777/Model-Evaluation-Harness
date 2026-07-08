@@ -44,6 +44,20 @@ block at the bottom is what the test parses.
 **Sum check:** row 1–8 (nominal) = 18+2+2+2+2+2+2+2 = **32**. Row 9–17 (adversarial) =
 2×9 = **18**. Total = **50**.
 
+## Priority labeling convention (owner ruling, severity-aware, 2026-07-08)
+
+Extends, and does not reverse, the dev-004 forward-time-pressure convention
+(`docs/decisions.md` D4, 2026-07-07): `priority: urgent` whenever the email's
+*content* is safety-critical (a real risk of injury, fire, gas, electrical, or
+structural-failure hazard), **regardless of stated timing or tone** — a calmly
+worded "no rush" report of a gas leak is still `urgent`. Absent a
+safety-critical signal, `high`/`urgent` apply only under **genuine forward
+time pressure**: a stated date or event, roughly within a **two-week window**,
+that the resolution must precede. `normal` applies otherwise — non-safety
+defects with no forward deadline stay `normal` (dev-004 precedent). Tone is
+never the signal, content is. Full brief-level rationale and worked examples:
+`data/golden/briefs.md`'s "Urgency convention" and golden-046/golden-048.
+
 Ticket categories (`expected.category`: billing/shipping/account/product/other) are
 not a separate row here — they are the schema's own enum and are additionally spread
 across every taxonomy category above (see `baseline`'s internal split and the
@@ -170,6 +184,26 @@ mid_thread_burial: 2
 embedded_instructions: 2
 tone_vs_content: 2
 multi_request_threaded_supersession: 2
+```
+
+## Machine-readable domain-category minimums
+
+Ticket-schema domains (`expected.category`) are the schema's own five enum
+values — orthogonal to the `meta.categories` taxonomy tags reconciled above
+(a single item's taxonomy tags do not name its domain; see `baseline`'s
+internal per-domain split and the per-brief domain assignment in
+`briefs.md`). This block is a **floor per domain, not an exact reconciled
+count**: unlike the taxonomy block above, these five values are not summed
+against the 50-item total (domains and taxonomy tags are different axes over
+the same items). The reconciliation test parses this block independently and
+asserts every domain reaches at least its stated minimum.
+
+```domains
+billing: 2
+shipping: 2
+account: 2
+product: 2
+other: 2
 ```
 
 ---

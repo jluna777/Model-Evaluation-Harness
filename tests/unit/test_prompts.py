@@ -57,10 +57,13 @@ TIE_BREAK_SENTENCE = (
 
 
 class TestExtractionPromptFrozen:
-    """T12: EXTRACTION_PROMPT is frozen as prompt_version 1 against data/dev/ only."""
+    """T12: EXTRACTION_PROMPT is frozen against data/dev/ only. Re-frozen as
+    prompt_version 2 on 2026-07-08 (owner ruling) to state the severity-aware
+    priority rule in full -- any prompt wording change must bump the version,
+    no exceptions (the judge_version analog), so this pin moves 1 -> 2 here."""
 
-    def test_version_is_frozen_at_one(self):
-        assert EXTRACTION_PROMPT.version == 1
+    def test_version_is_frozen_at_two(self):
+        assert EXTRACTION_PROMPT.version == 2
 
     def test_rendered_prompt_contains_tie_break_sentence_verbatim(self):
         rendered = EXTRACTION_PROMPT.render(_email())
@@ -80,6 +83,14 @@ class TestExtractionPromptFrozen:
         rendered = EXTRACTION_PROMPT.render(_email())
         assert "null" in rendered
         assert "genuinely does not mention" in rendered
+
+    def test_rendered_prompt_states_severity_aware_priority_rule(self):
+        # v2 re-freeze (owner ruling, 2026-07-08): safety-critical content is
+        # urgent regardless of stated timing or tone -- a stable substring of
+        # that clause must survive in the rendered prompt.
+        rendered = EXTRACTION_PROMPT.render(_email())
+        assert "safety-critical issue" in rendered
+        assert "regardless of stated timing or tone" in rendered
 
     def test_rendered_prompt_instructs_schema_only_output(self):
         rendered = EXTRACTION_PROMPT.render(_email())

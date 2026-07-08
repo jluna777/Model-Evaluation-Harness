@@ -2,11 +2,16 @@
 
 ``PromptTemplate`` pairs a version number with rendering logic so the version
 that produced any given output is always recoverable and feeds the run
-fingerprint (``config.py``). ``EXTRACTION_PROMPT`` is frozen as
+fingerprint (``config.py``). ``EXTRACTION_PROMPT`` was originally frozen as
 ``prompt_version: 1`` (T12), iterated against ``data/dev/`` only, never
-against golden or calibration items (spec §3, constitution Principle 6). Any
+against golden or calibration items (spec §3, constitution Principle 6). It
+was re-frozen as ``prompt_version: 2`` on 2026-07-08 (owner ruling) to state
+the severity-aware priority rule in full -- the only wording change is the
+``- priority:`` definition line; the only consumers of v1 were dev-scratch
+runs, never a golden or baseline run, so no re-baseline was required. Any
 future wording change must bump ``version`` and go through the
-``eval gate --update-baseline`` procedure (spec §7).
+``eval gate --update-baseline`` procedure (spec §7) -- that discipline is
+absolute, the judge_version analog for prompts.
 
 ``DEGRADED_DEMO_PROMPT`` (T16) exists solely for ``eval gate
 --seed-regression``'s documented demo mode: it is a deliberately weakened
@@ -45,8 +50,10 @@ class PromptTemplate:
 # Frozen against data/dev/ only (spec §3, constitution Principle 6). Any
 # wording change bumps `version` and requires the eval gate --update-baseline
 # procedure (spec §7) -- do not edit this text in place.
+# Re-frozen as v2 on 2026-07-08 (owner ruling): the `- priority:` line below
+# now states the severity-aware rule in full. No other wording changed.
 EXTRACTION_PROMPT = PromptTemplate(
-    version=1,
+    version=2,
     template=(
         "Extract a structured support ticket from the customer support email below.\n\n"
         "From: {from_}\n"
@@ -67,8 +74,13 @@ EXTRACTION_PROMPT = PromptTemplate(
         "anywhere in the email, including quoted or forwarded sections.\n\n"
         "Fields to extract:\n"
         "- category: one of billing | shipping | account | product | other.\n"
-        "- priority: one of low | normal | high | urgent, as conveyed by the email; use "
-        "normal if the email gives no signal either way.\n"
+        "- priority: one of low | normal | high | urgent. Use urgent whenever the content "
+        "describes a safety-critical issue (real risk of injury, fire, gas, electrical, or "
+        "structural-failure hazard) regardless of stated timing or tone -- a calm \"no rush\" "
+        "report of a gas leak is still urgent. Otherwise use high or urgent only under genuine "
+        "forward time pressure: a stated date or event, roughly within the next two weeks, that "
+        "the resolution must precede. Use normal when neither signal is present. Tone alone is "
+        "never the signal -- content is.\n"
         "- customer_name: the customer's name exactly as it appears in the email, or null "
         "if no name is given.\n"
         "- order_id: the order number exactly as it appears (form ORD-NNNNN), or null if "
