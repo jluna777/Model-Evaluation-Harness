@@ -2187,6 +2187,56 @@ class TestCalibrateCLIHappyPath:
         assert certificate.ceiling_kappa is not None
 
 
+class TestCalibrateCLILiveOutputBinding:
+    def test_live_output_hash_mismatch_gives_clean_exit_one(self, tmp_path, monkeypatch):
+        """``CalibrationBindingError`` on the LIVE path (finding F1,
+        ``pair_with_labels``) -- mirrors ``TestCalibrateCLIOffline``'s own
+        ``test_output_hash_mismatch_gives_clean_exit_one`` for the offline
+        path (``pair_judgments_with_labels``): a label whose
+        ``output_sha256`` no longer matches the candidate output it is keyed
+        to must exit cleanly, never with a traceback, even when both
+        candidate runs are reused rather than freshly executed."""
+
+        monkeypatch.chdir(tmp_path)
+        item_ids = ["cal-001", "cal-002", "cal-003"]
+        items = [_cli_item(i) for i in item_ids]
+        emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
+
+        labels = _happy_path_labels(item_ids)
+        corrupted_first = labels[0].model_copy(update={"output_sha256": "0" * 64})
+        labels_path = _write_labels(tmp_path / "labels.jsonl", [corrupted_first, *labels[1:]])
+        config_path = _write_calibrate_config(tmp_path / "config.yaml", k=1)
+
+        cfg = load_config(config_path)
+        effective_cfg, calib_items = cli._resolve_calibration_dataset(cfg, emails_path)
+        _seed_calibration_runs(effective_cfg, calib_items)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        def _forbid_build_model_key(label, config):
+            raise AssertionError("_build_model_key must not be called -- both runs are reused")
+
+        monkeypatch.setattr(cli, "_build_model_key", _forbid_build_model_key)
+        monkeypatch.setattr(cli, "_build_judge_client", lambda config: _happy_path_judge_client())
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(emails_path),
+                "--labels",
+                str(labels_path),
+                "--config",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert corrupted_first.item_id in result.output
+
+
 # --------------------------------------------------------------------------
 # `eval calibrate` forces K=1 regardless of config.k (finding F3)
 # --------------------------------------------------------------------------
@@ -2344,9 +2394,31 @@ class TestCalibrateCLIOffline:
         offline_certificate = Certificate.model_validate(
             json.loads(cert_path.read_text(encoding="utf-8"))
         )
+        # Every certificate field, not just the headline kappa/CI/verdict:
+        # --offline recomputes the FULL certificate (finding F2, spec AC5)
+        # from persisted judgments, so nothing else may drift either.
         assert offline_certificate.overall_kappa == pytest.approx(live_certificate.overall_kappa)
         assert offline_certificate.kappa_ci == pytest.approx(live_certificate.kappa_ci)
         assert offline_certificate.verdict == live_certificate.verdict
+        assert offline_certificate.judge_version == live_certificate.judge_version
+        assert offline_certificate.label_file_hash == live_certificate.label_file_hash
+        assert offline_certificate.ceiling_kappa == live_certificate.ceiling_kappa
+
+        assert (
+            offline_certificate.per_candidate_kappa.keys()
+            == live_certificate.per_candidate_kappa.keys()
+        )
+        for label, kappa in live_certificate.per_candidate_kappa.items():
+            assert offline_certificate.per_candidate_kappa[label] == pytest.approx(kappa)
+
+        assert live_certificate.per_candidate_kappa_ci is not None
+        assert offline_certificate.per_candidate_kappa_ci is not None
+        assert (
+            offline_certificate.per_candidate_kappa_ci.keys()
+            == live_certificate.per_candidate_kappa_ci.keys()
+        )
+        for label, ci in live_certificate.per_candidate_kappa_ci.items():
+            assert offline_certificate.per_candidate_kappa_ci[label] == pytest.approx(ci)
 
     def test_offline_requires_no_langfuse_credentials_and_never_touches_trace_context(
         self, tmp_path, monkeypatch

@@ -101,6 +101,22 @@ class TestRefusal:
         assert result.failure == "refusal"
         assert result.raw
 
+    def test_contentless_refusal_yields_empty_but_populated_raw(self):
+        # A refusal with zero text content blocks at all (Anthropic can
+        # refuse without any accompanying text) -- `raw` is built by joining
+        # every text block (module docstring), so this is the empty string,
+        # not None. "raw is always populated" (models/__init__.py) means
+        # "always a str", never "always non-empty".
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _json_response(200, _load("refusal_contentless.json"))
+
+        client = AnthropicClient(model=REQUESTED_MODEL, client=_client_with_transport(handler))
+        result = client.complete_structured("extract this", TicketExtraction)
+
+        assert result.output is None
+        assert result.failure == "refusal"
+        assert result.raw == ""
+
 
 class TestSchemaInvalid:
     def test_invalid_json_is_schema_invalid_and_calls_transport_once(self):

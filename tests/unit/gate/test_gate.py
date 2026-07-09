@@ -1114,6 +1114,83 @@ class TestGateCliPassAndFail:
         assert "Overall verdict: FAIL" in result.output
 
 
+class TestGateCliRunRootCleanup:
+    """``eval gate`` used to leave its fresh, per-invocation
+    ``results/runs/gate/<uuid>`` root (``_fresh_gate_runs_root``) on disk
+    forever. It is now removed once the invocation finishes -- unless
+    ``--keep-runs`` is passed, or the gate exited 2 (a measurement error,
+    always kept for debugging regardless of ``--keep-runs``)."""
+
+    def test_successful_gate_removes_its_fresh_run_root(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        fixed_root = Path("results") / "runs" / "gate-fixed-root-for-cleanup-test"
+        monkeypatch.setattr(cli, "_fresh_gate_runs_root", lambda *a, **k: fixed_root)
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        registry: dict[str, list[FakeModelClient]] = {}
+        monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path)])
+
+        assert result.exit_code == 0, result.output
+        assert not fixed_root.exists()
+
+    def test_keep_runs_flag_leaves_the_run_root_present(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        fixed_root = Path("results") / "runs" / "gate-fixed-root-for-cleanup-test"
+        monkeypatch.setattr(cli, "_fresh_gate_runs_root", lambda *a, **k: fixed_root)
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        registry: dict[str, list[FakeModelClient]] = {}
+        monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path), "--keep-runs"])
+
+        assert result.exit_code == 0, result.output
+        assert fixed_root.exists()
+        assert any(fixed_root.rglob("a-*"))  # the run root actually has content, not just a dir
+
+    def test_measurement_error_exit_2_keeps_run_root_even_without_keep_runs(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item(f"nom-{i}") for i in range(8)]
+        items.append(make_item("adv-0", slice_="adversarial"))
+        items.append(make_item("adv-1", slice_="adversarial"))
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        fixed_root = Path("results") / "runs" / "gate-fixed-root-for-cleanup-test"
+        monkeypatch.setattr(cli, "_fresh_gate_runs_root", lambda *a, **k: fixed_root)
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        # 10 items x k=3 x 2 judged fields = 60 calls; error every 15th -> 4/60 = 6.67% > 5%
+        # (mirrors TestGateCliJudgeErrorBudget) -- a measurement error that
+        # fires only AFTER both candidates' runs have completed and written
+        # real content under `fixed_root`.
+        monkeypatch.setattr(cli, "_build_model_key", _factory_with_judge_errors("a", 15))
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path)])
+
+        assert result.exit_code == 2, result.output
+        assert fixed_root.exists()
+        assert any(fixed_root.rglob("a-*"))
+
+
 class TestGateCliMissingBaseline:
     def test_missing_baseline_exits_2_with_instructions(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -1227,7 +1304,13 @@ class TestGateCliSeedRegression:
         registry: dict[str, list[FakeModelClient]] = {}
         monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
 
-        result = runner.invoke(app, ["gate", "--config", str(config_path), "--seed-regression"])
+        # --keep-runs: this test needs to inspect the demo run's persisted
+        # artifact below, and a non-measurement-error gate invocation
+        # otherwise removes its own fresh results/runs/gate/<uuid> root once
+        # it finishes (item 4's cleanup-on-completion).
+        result = runner.invoke(
+            app, ["gate", "--config", str(config_path), "--seed-regression", "--keep-runs"]
+        )
 
         assert result.exit_code != 2, result.output  # fingerprint mismatch must not surface
         assert "DEMO MODE" in result.output
@@ -1330,10 +1413,18 @@ class TestGateCliUpdateBaseline:
         registry: dict[str, list[FakeModelClient]] = {}
         monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
 
-        with pytest.warns(UserWarning, match="uncalibrated"):
+        with pytest.warns(UserWarning, match="uncalibrated") as record:
             result = runner.invoke(app, ["gate", "--config", str(config_path), "--update-baseline"])
 
         assert result.exit_code == 0, result.output
+        # T16 stacklevel fix: the warning must be attributed to its actual
+        # external caller (this module's own `gate_module.update_baselines`
+        # call, inside `cli.py`'s `gate` command) -- not to a frame internal
+        # to `gate.py` itself (`_stage_baseline`/`update_baseline(s)`, what
+        # the previous `stacklevel=3` pointed at). CliRunner invokes the
+        # command in-process, so the real call stack is intact here and this
+        # assertion is meaningful, not tautological.
+        assert record[0].filename == str(Path(cli.__file__))
         baseline_a = load_baseline(Path("baselines") / "a.json")
         assert baseline_a.fingerprint_components.calibration_verdict == "uncalibrated"
         assert baseline_a.fingerprint_components.composite_mode == "FULL_7"

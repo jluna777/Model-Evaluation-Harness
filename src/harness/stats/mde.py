@@ -15,7 +15,7 @@ at alpha=0.05), not the two-sided ``(1 - alpha/2)`` quantile (1.9600...) --
 using the two-sided quantile here would overstate the effect size the gate
 can actually detect, since the gate's own test is one-sided.
 
-``z_alpha``/``z_beta`` reuse :func:`harness.stats.bootstrap._norm_ppf`
+``z_alpha``/``z_beta`` reuse :func:`harness.stats._normal._norm_ppf`
 (Acklam's rational approximation + Halley refinement) rather than importing
 scipy, keeping scipy a dev-only dependency for ``src/``.
 """
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 
-from harness.stats.bootstrap import _norm_ppf
+from harness.stats._normal import _norm_ppf
 
 
 def mde(delta_sd: float, n: int, *, alpha: float = 0.05, power: float = 0.80) -> float:

@@ -64,7 +64,7 @@ class TicketExtraction(BaseModel):
 class GoldenExpected(TicketExtraction):
     """Reference-side extraction: strict validation on top of the candidate schema."""
 
-    order_id: str | None = Field(default=None, pattern=r"^ORD-\d{5}$")
+    order_id: str | None = Field(pattern=r"^ORD-\d{5}$")
 
 
 class GoldenMeta(BaseModel):

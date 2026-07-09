@@ -256,6 +256,68 @@ class TestHelp:
 
 
 # --------------------------------------------------------------------------
+# CLI polish: a typo'd --dataset/--config/rescore run-dir path is a clean,
+# non-zero exit with a message -- never a raw traceback.
+# --------------------------------------------------------------------------
+
+
+class TestPathArgumentValidation:
+    def test_typo_dataset_path_clean_exit_no_traceback(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        config_path = _write_config(
+            tmp_path / "config.yaml", dataset_path=Path("data/golden/golden.jsonl")
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--model",
+                "a",
+                "--dataset",
+                "no/such/dataset.jsonl",
+                "--config",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "no" in result.output
+        assert "such" in result.output
+        assert "dataset.jsonl" in result.output
+
+    def test_typo_config_path_clean_exit_no_traceback(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("item-0")]
+        dataset_path = _write_dataset(tmp_path / "dev.jsonl", items)
+
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--model",
+                "a",
+                "--dataset",
+                str(dataset_path),
+                "--config",
+                "no/such/config.yaml",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+
+    def test_typo_rescore_run_dir_clean_exit_no_traceback(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        result = runner.invoke(app, ["rescore", "no/such/run-dir"])
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+
+
+# --------------------------------------------------------------------------
 # `eval rescore`
 # --------------------------------------------------------------------------
 
@@ -398,9 +460,14 @@ class TestCompareReuse:
 
         monkeypatch.setattr(cli, "_build_model_key", _forbid_factory)
 
-        result = runner.invoke(
-            app, ["compare", "--dataset", str(dataset_path), "--config", str(config_path)]
-        )
+        # `compare` builds one TraceContext per candidate (module docstring);
+        # this dev-stage (--dataset) invocation is non-reportable, so with no
+        # Langfuse keys in the test environment both trips warn-and-proceed
+        # rather than raise.
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app, ["compare", "--dataset", str(dataset_path), "--config", str(config_path)]
+            )
 
         assert result.exit_code == 0, result.output
         assert (candidate_a.call_count, candidate_b.call_count) == calls_before
@@ -417,9 +484,10 @@ class TestCompareReuse:
         registry: dict[str, list[FakeModelClient]] = {}
         monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
 
-        result = runner.invoke(
-            app, ["compare", "--dataset", str(dataset_path), "--config", str(config_path)]
-        )
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app, ["compare", "--dataset", str(dataset_path), "--config", str(config_path)]
+            )
 
         assert result.exit_code == 0, result.output
         assert len(registry["candidate"]) == 2  # one fresh ModelKey per candidate
@@ -443,6 +511,36 @@ class TestExpectedFailureExits:
         config_path = _write_config(tmp_path / "config.yaml", dataset_path=dataset_path)
 
         result = runner.invoke(app, ["run", "--model", "a", "--config", str(config_path)])
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "credentials" in result.output.lower() or "langfuse" in result.output.lower()
+
+    def test_compare_missing_tracing_error_on_golden_dataset_before_any_client_construction(
+        self, tmp_path, monkeypatch
+    ):
+        """Mirrors ``run``'s own anchor above, for ``compare``'s fresh-runs
+        path (T11 gap): a golden (no ``--dataset`` override, reportable)
+        ``compare`` invocation without Langfuse keys must raise
+        ``MissingTracingError`` before EITHER candidate's client is ever
+        constructed -- proven the stronger way (module docstring): the
+        raise-on-init provider stubs must never fire, not just that
+        ``_build_model_key`` itself was never called."""
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+        monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+        _forbid_real_client_construction(monkeypatch)
+
+        def _forbid_factory(*args: object, **kwargs: object) -> ModelKey:
+            raise AssertionError("_build_model_key must not be called before tracing succeeds")
+
+        monkeypatch.setattr(cli, "_build_model_key", _forbid_factory)
+
+        dataset_path = _write_dataset(tmp_path / "golden.jsonl", [make_item("item-0")])
+        config_path = _write_config(tmp_path / "config.yaml", dataset_path=dataset_path)
+
+        result = runner.invoke(app, ["compare", "--config", str(config_path)])
 
         assert result.exit_code == 1
         assert "Traceback" not in result.output
@@ -510,10 +608,22 @@ class TestExpectedFailureExits:
         registry: dict[str, list[FakeModelClient]] = {}
         monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
 
-        result = runner.invoke(
-            app,
-            ["run", "--model", "a", "--dataset", str(dataset_path), "--config", str(config_path)],
-        )
+        # A dev-stage (--dataset) run is non-reportable; with no Langfuse
+        # keys in the test environment, `run`'s single TraceContext warns and
+        # proceeds rather than raising.
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--model",
+                    "a",
+                    "--dataset",
+                    str(dataset_path),
+                    "--config",
+                    str(config_path),
+                ],
+            )
 
         assert result.exit_code == 1
         assert "Traceback" not in result.output
@@ -537,10 +647,19 @@ class TestExpectedFailureExits:
 
         monkeypatch.setattr(cli, "_build_model_key", factory)
 
-        result = runner.invoke(
-            app,
-            ["run", "--model", "a", "--dataset", str(dataset_path), "--config", str(config_path)],
-        )
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--model",
+                    "a",
+                    "--dataset",
+                    str(dataset_path),
+                    "--config",
+                    str(config_path),
+                ],
+            )
 
         assert result.exit_code == 1
         assert "Traceback" not in result.output
@@ -840,9 +959,10 @@ class TestCompareUniqueFailureOrdering:
 
         monkeypatch.setattr(cli, "_build_model_key", factory)
 
-        result = runner.invoke(
-            app, ["compare", "--dataset", str(dataset_path), "--config", str(config_path)]
-        )
+        with pytest.warns(UserWarning, match="No Langfuse credentials"):
+            result = runner.invoke(
+                app, ["compare", "--dataset", str(dataset_path), "--config", str(config_path)]
+            )
 
         assert result.exit_code == 1
         assert "Traceback" not in result.output

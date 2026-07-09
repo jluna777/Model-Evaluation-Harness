@@ -54,7 +54,13 @@ class TestDescriptiveContext:
         a = ["pass"] * 9 + ["fail"]  # 9/10 pass -> prevalence 0.9
         b = ["pass"] * 7 + ["fail"] * 3  # agrees on 7 pass + 1 fail = 8/10
 
-        result = cohens_kappa(a, b)
+        # This tiny, heavily pass-skewed fixture incidentally triggers the
+        # same degenerate-cluster-resample RuntimeWarning
+        # TestDegenerateResampleNanDisclosure documents -- expected here (the
+        # fixture exists for raw_agreement/prevalence, not the CI), so it is
+        # asserted rather than left to leak into the suite's warning summary.
+        with pytest.warns(RuntimeWarning):
+            result = cohens_kappa(a, b)
 
         assert result.raw_agreement == pytest.approx(0.8)
         assert result.prevalence == pytest.approx(0.9)
@@ -166,7 +172,12 @@ class TestResultShape:
         a = ["pass", "fail", "pass", "fail"]
         b = ["pass", "pass", "pass", "fail"]
 
-        result = cohens_kappa(a, b)
+        # Small, pass-skewed fixture; incidentally triggers the same
+        # degenerate-cluster-resample RuntimeWarning as
+        # TestDegenerateResampleNanDisclosure -- expected here, asserted
+        # rather than left to leak.
+        with pytest.warns(RuntimeWarning):
+            result = cohens_kappa(a, b)
 
         assert isinstance(result, KappaResult)
         assert isinstance(result.kappa, float)

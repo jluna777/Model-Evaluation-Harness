@@ -165,8 +165,9 @@ fallback wrap that backs this up.
 import hashlib
 import json
 import os
+import shutil
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date
 from enum import StrEnum
@@ -498,7 +499,7 @@ def _fresh_gate_runs_root(base: Path = DEFAULT_RUNS_ROOT) -> Path:
 
 
 @contextmanager
-def _clean_exit_on_expected_errors():
+def _clean_exit_on_expected_errors() -> Iterator[None]:
     try:
         yield
     except (
@@ -547,13 +548,25 @@ _GATE_MEASUREMENT_ERRORS = (
 
 
 @contextmanager
-def _gate_clean_exit():
+def _gate_clean_exit(gate_runs_root: Path, *, keep_runs: bool) -> Iterator[None]:
     """``eval gate``'s own expected-failure exit mapping (module docstring,
     finding F1): every measurement-error/setup-precondition condition above
     gets exit 2; ``GuardrailFloorError`` (``--update-baseline`` only) is the
     one exception left at exit 1, since it fires only AFTER a real baseline
     candidate has been fully measured and refused for cause -- "a completed
-    measurement whose verdict is fail", not a measurement error."""
+    measurement whose verdict is fail", not a measurement error.
+
+    Also owns ``gate_runs_root``'s cleanup (``--keep-runs``): this fresh,
+    invocation-unique directory (``_fresh_gate_runs_root``) only ever exists
+    to drive THIS invocation's measurement, so it is removed once the
+    invocation is done -- UNLESS ``keep_runs`` was requested, or the
+    invocation ended in one of ``_GATE_MEASUREMENT_ERRORS`` (kept for
+    debugging: a measurement error means no trustworthy measurement
+    necessarily completed, so the partial run directory may be the only
+    evidence available for diagnosing it). ``GuardrailFloorError`` is NOT a
+    measurement error (module docstring: "a completed measurement whose
+    verdict is fail") and a normal pass/fail return is by definition a
+    completed measurement -- both still get cleaned up."""
 
     try:
         yield
@@ -562,13 +575,32 @@ def _gate_clean_exit():
         raise typer.Exit(code=2) from exc
     except gate_module.GuardrailFloorError as exc:
         typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
+        if not keep_runs:
+            shutil.rmtree(gate_runs_root, ignore_errors=True)
         raise typer.Exit(code=1) from exc
+    else:
+        if not keep_runs:
+            shutil.rmtree(gate_runs_root, ignore_errors=True)
 
 
 def _load_baseline_or_raise(label: str, path: Path) -> BaselineFile:
     if not path.exists():
         raise gate_module.MissingBaselineError(label, path)
     return load_baseline(path)
+
+
+def _require_config_exists(path: Path) -> None:
+    """Friendly, traceback-free check for ``calibrate``'s live-path
+    ``--config`` (``CalibrateConfigOption`` docstring): unlike ``run``/
+    ``compare``/``gate``'s ``ConfigOption``, this one is not declared
+    ``exists=True`` at the click layer (a typo'd default would otherwise be
+    rejected even under ``--offline``, which never reads it at all) -- this
+    is the explicit substitute, called only on the branch that actually
+    calls ``load_config``."""
+
+    if not path.exists():
+        typer.secho(f"error: config file not found: {path}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=2)
 
 
 # --------------------------------------------------------------------------
@@ -580,12 +612,23 @@ DatasetOption = Annotated[
     Path | None,
     typer.Option(
         "--dataset",
+        exists=True,
         help="Dev-stage dataset path. Omit to use the config's golden set (reportable).",
     ),
 ]
 ConfigOption = Annotated[
     Path,
-    typer.Option("--config", help="Path to the run configuration YAML."),
+    typer.Option("--config", exists=True, help="Path to the run configuration YAML."),
+]
+# `calibrate` is the one command whose `--config` may go entirely unused
+# (`--offline` never reads it, module docstring) -- click's `exists=True`
+# validates even an unused default eagerly, before the command body ever
+# runs, which would wrongly demand a config file `--offline` has no need
+# for. `calibrate` checks existence itself (`_require_config_exists`),
+# ONLY on the live path that actually calls `load_config`.
+CalibrateConfigOption = Annotated[
+    Path,
+    typer.Option("--config", help="Path to the run configuration YAML (unused with --offline)."),
 ]
 
 
@@ -666,6 +709,15 @@ def gate(
             "check, and banner the output DEMO MODE.",
         ),
     ] = False,
+    keep_runs: Annotated[
+        bool,
+        typer.Option(
+            "--keep-runs",
+            help="Keep this invocation's fresh results/runs/gate/<uuid> directory after the "
+            "gate finishes instead of removing it. Always kept regardless of this flag when "
+            "the gate exits 2 (a measurement error) -- see the exit-code note below.",
+        ),
+    ] = False,
     config: ConfigOption = DEFAULT_CONFIG_PATH,
 ) -> None:
     """CI gate decision vs the committed baseline (spec §7). Exit 0 = pass,
@@ -675,7 +727,14 @@ def gate(
     mismatch, judge-error budget exceeded, a nominal item-set mismatch, an
     aborted run, or any setup precondition that fires before a measurement
     is even attempted (missing tracing/certificate/API-key credentials, an
-    SDK construction failure, a run-config mismatch) -- finding F1."""
+    SDK construction failure, a run-config mismatch) -- finding F1.
+
+    This invocation's own fresh ``results/runs/gate/<uuid>`` directory
+    (``_fresh_gate_runs_root``) is removed once the gate finishes, since it
+    exists solely to drive this one measurement -- unless ``--keep-runs`` is
+    passed, or the gate exited 2 (measurement error: the directory may be
+    the only evidence available for debugging what happened, so it is always
+    kept then regardless of ``--keep-runs``)."""
 
     if update_baseline and seed_regression:
         typer.secho(
@@ -685,8 +744,17 @@ def gate(
         )
         raise typer.Exit(code=1)
 
+    # Finding F2: every eval gate invocation gets its own fresh,
+    # guaranteed-unused runs_root, so it always drives a full, fresh
+    # run_eval execution for both candidates -- see
+    # `_fresh_gate_runs_root`'s docstring and the module docstring's
+    # "Run-identity reuse" section. Computed before `_gate_clean_exit` (which
+    # owns this directory's cleanup) so it exists even if nothing below ever
+    # gets far enough to create it.
+    gate_runs_root = _fresh_gate_runs_root(DEFAULT_RUNS_ROOT)
+
     outcome: gate_module.GateOutcome | None = None
-    with _gate_clean_exit():
+    with _gate_clean_exit(gate_runs_root, keep_runs=keep_runs):
         cfg = load_config(config)
         items = _load_dataset(Path(cfg.dataset.path))
         certificate = _load_certificate(DEFAULT_CERTIFICATE_PATH)
@@ -700,12 +768,6 @@ def gate(
         # path that is allowed to proceed without a committed certificate.
         if not update_baseline:
             require_certificate(certificate, reportable=True)
-        # Finding F2: every eval gate invocation gets its own fresh,
-        # guaranteed-unused runs_root, so it always drives a full, fresh
-        # run_eval execution for both candidates -- see
-        # `_fresh_gate_runs_root`'s docstring and the module docstring's
-        # "Run-identity reuse" section.
-        gate_runs_root = _fresh_gate_runs_root(DEFAULT_RUNS_ROOT)
 
         if update_baseline:
             # Spec §8 traces per-run, not per-invocation (mirrors `compare`'s
@@ -808,7 +870,7 @@ def calibrate(
             "reads it.",
         ),
     ] = DEFAULT_CALIBRATION_JUDGMENTS_PATH,
-    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    config: CalibrateConfigOption = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Judge calibration: agreement report + committed certificate (spec §5).
 
@@ -852,6 +914,7 @@ def calibrate(
         typer.echo(f"Certificate written to {DEFAULT_CERTIFICATE_PATH}")
         return
 
+    _require_config_exists(config)
     with _clean_exit_on_expected_errors():
         cfg = load_config(config)
         effective_cfg, calib_items = _resolve_calibration_dataset(cfg, emails)
@@ -921,7 +984,12 @@ def calibrate(
 def rescore(
     run_dir: Annotated[
         Path,
-        typer.Argument(help="Path to an existing run directory (manifest.json + rows.jsonl)."),
+        typer.Argument(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            help="Path to an existing run directory (manifest.json + rows.jsonl).",
+        ),
     ],
 ) -> None:
     """Recompute a run's report from persisted raw outputs -- zero API calls, zero client build."""
@@ -934,9 +1002,5 @@ def rescore(
     typer.echo(report)
 
 
-def main() -> None:
-    app()
-
-
 if __name__ == "__main__":
-    main()
+    app()

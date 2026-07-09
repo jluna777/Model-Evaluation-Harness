@@ -1,3 +1,5 @@
+from typing import Literal, cast
+
 import numpy as np
 import pytest
 from scipy import stats as scipy_stats
@@ -199,3 +201,14 @@ class TestInputValidation:
     def test_empty_deltas_raises(self):
         with pytest.raises(ValueError):
             sign_flip_test([], sided="one", seed=0)
+
+    def test_invalid_sided_raises_before_any_enumeration(self):
+        # `sided` is validated at the very top, before enumeration/resampling
+        # -- a large-but-valid `deltas` here would be expensive to enumerate
+        # if the (bogus) value slipped past validation and only failed deep
+        # inside `_extreme_mask`. cast() bypasses the Literal type check so
+        # the runtime validation itself is exercised.
+        bogus_sided = cast(Literal["one", "two"], "bogus")
+
+        with pytest.raises(ValueError, match="sided"):
+            sign_flip_test([-1.0, -2.0, -3.0], sided=bogus_sided, seed=0)

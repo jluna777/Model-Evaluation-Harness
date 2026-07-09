@@ -117,3 +117,24 @@ class TestFingerprint:
         other_kwargs["config"] = other_config
 
         assert fingerprint(**kwargs) != fingerprint(**other_kwargs)
+
+    def test_pinned_fingerprint_value_is_unchanged_by_the_sort_keys_refactor(self):
+        # Pins the exact hex digest `fingerprint()` produced for these fixed
+        # inputs BEFORE removing the redundant `dict(sorted(...))` around
+        # `served_versions` (json.dumps(..., sort_keys=True) already sorts
+        # every dict's keys, including nested ones, so the extra sort was a
+        # no-op) -- computed by running the current (pre-refactor) code once
+        # and hard-coding the result, so this test fails loudly if the
+        # refactor ever changes a fingerprint's value, not just its
+        # stability/reproducibility (already covered above).
+        config = load_config(DEFAULT_CONFIG_PATH)
+
+        fp = fingerprint(
+            config=config,
+            served_versions={"candidate_b": "v2", "candidate_a": "v1"},
+            judge_version="judge-v1",
+            composite_mode="FULL_7",
+            calibration_verdict="adequate",
+        )
+
+        assert fp == "d74a075bc9090d4bdc7f5f3f00ab57814291b6f005a304967e8a80861430591b"

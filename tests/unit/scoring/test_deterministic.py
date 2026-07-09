@@ -77,6 +77,22 @@ class TestScoreDeterministic:
 
         assert scores["customer_name"] == 0
 
+    def test_mismatched_customer_name_scores_zero(self):
+        expected = _extraction(customer_name="Jane Doe")
+        actual = _extraction(customer_name="John Smith")
+
+        scores = score_deterministic(expected, actual)
+
+        assert scores["customer_name"] == 0
+
+    def test_mismatched_order_id_scores_zero(self):
+        expected = _extraction(order_id="ORD-12345")
+        actual = _extraction(order_id="ORD-99999")
+
+        scores = score_deterministic(expected, actual)
+
+        assert scores["order_id"] == 0
+
     def test_mismatched_category_scores_zero(self):
         expected = _extraction(category="billing")
         actual = _extraction(category="shipping")

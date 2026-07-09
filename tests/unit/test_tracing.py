@@ -22,7 +22,7 @@ from harness.config import Config, load_config
 from harness.judge.judge import JudgeVerdict
 from harness.models import StructuredResult, Usage
 from harness.prompts import EXTRACTION_PROMPT
-from harness.runner import ModelKey, load_run, run_eval
+from harness.runner import ModelKey, RunAborted, load_run, run_eval
 from harness.schema import EmailInput, GoldenExpected, GoldenItem, GoldenMeta
 from harness.tracing import (
     LANGFUSE_BASE_URL_ENV,
@@ -444,6 +444,71 @@ class TestRunnerIntegration:
         assert len(judge_spans) == 2  # issue_summary + requested_action
         assert len(score_spans) == 1
         assert fake_client.flush_calls == 1
+
+    def test_candidate_failure_mid_run_raises_run_aborted_but_span_still_ended_and_traced(
+        self, monkeypatch, tmp_path
+    ):
+        """A measurement failure (the candidate client itself raising) is
+        not a tracing failure (spec §8): ``RunAborted`` must still propagate
+        out of ``run_eval`` exactly like it does with no tracing at all, but
+        the span already opened for the failing candidate call is still
+        closed (``_span``'s ``finally`` calls ``.end()`` regardless of
+        whether the wrapped body raised), and ``trace.untraced`` must stay
+        ``False`` -- the Langfuse transport itself never failed here, so
+        there is nothing to degrade."""
+
+        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+        fake_langfuse = FakeLangfuseClient()
+        config = _config()
+        trace = TraceContext.for_run(config, reportable=True, client_factory=lambda: fake_langfuse)
+
+        class RaisingAfterNCandidateClient:
+            """Succeeds on every call up to (not including) ``fail_at_call``,
+            then raises on that call, then would succeed again -- but
+            ``max_workers=1`` plus ``run_eval``'s abort_event means no call
+            after the failing one is ever actually made."""
+
+            def __init__(self, fail_at_call: int) -> None:
+                self.fail_at_call = fail_at_call
+                self.calls = 0
+                self._lock = threading.Lock()
+
+            def complete_structured(self, prompt: str, schema: type) -> StructuredResult:
+                with self._lock:
+                    self.calls += 1
+                    call_idx = self.calls
+                if call_idx == self.fail_at_call:
+                    raise RuntimeError("simulated candidate failure")
+                return success_result()
+
+        candidate = RaisingAfterNCandidateClient(fail_at_call=2)
+        model_key = ModelKey(
+            label="a", candidate_client=candidate, judge_client=FakeModelClient()
+        )
+        items = [make_item(f"item-{i}") for i in range(3)]
+
+        with pytest.raises(RunAborted):
+            run_eval(
+                config,
+                model_key,
+                k=1,
+                dataset=items,
+                prompt=EXTRACTION_PROMPT,
+                runs_root=tmp_path,
+                trace=trace,
+                max_workers=1,
+            )
+
+        candidate_spans = [s for s in fake_langfuse.spans if s.name == "candidate"]
+        # item-0's call succeeds (call #1); item-1's call is the failing
+        # call #2 -- its span was still opened and, since it raised inside
+        # the `with candidate_span:` body, still closed in `_span`'s
+        # `finally`. item-2's task is never even started (abort_event, plus
+        # max_workers=1 serializing execution).
+        assert len(candidate_spans) == 2
+        assert all(span.ended for span in candidate_spans)
+        assert trace.untraced is False
 
     def test_keyless_dev_run_through_run_eval_is_untraced_with_one_warning(
         self, monkeypatch, tmp_path

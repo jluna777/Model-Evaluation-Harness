@@ -355,18 +355,23 @@ def judge_error_rate(run: RunArtifact) -> float:
     field precisely when no call was made at all, i.e. the candidate itself
     failed schema validation/refused). ``0.0`` if no judge calls were ever
     attempted (never a division by zero).
+
+    The numerator is ``run.judge_error_count()`` -- ``RunArtifact``'s own
+    count of ``field_scores`` values that are ``None`` -- rather than a
+    second, separately-maintained error counter here: a judged field's score
+    is ``None`` iff its judge call errored (runner.py's binding convention
+    again; deterministic fields, the only other ``field_scores`` entries,
+    are never ``None``), so the two counts are the same quantity. Only the
+    denominator (attempted calls) is genuinely specific to this budget check
+    and has no ``RunArtifact`` counterpart.
     """
 
     total = 0
-    errors = 0
     for row in run.rows:
         for field_name in JUDGED_FIELDS:
-            if row.raw_judge.get(field_name) is None:
-                continue
-            total += 1
-            if row.field_scores[field_name] is None:
-                errors += 1
-    return errors / total if total else 0.0
+            if row.raw_judge.get(field_name) is not None:
+                total += 1
+    return run.judge_error_count() / total if total else 0.0
 
 
 # --------------------------------------------------------------------------
@@ -582,7 +587,17 @@ def _resolve_baseline_mode_and_verdict(
         "calibration_verdict='uncalibrated'). This is acceptable for "
         "--update-baseline only; a normal `eval gate` run still requires a "
         "committed calibration certificate.",
-        stacklevel=3,
+        # Frame depth from this warn() call to the actual external caller
+        # (was 3, pointing at update_baseline/update_baselines -- still
+        # internal to this module):
+        #   1 = this frame (_resolve_baseline_mode_and_verdict, the warn()
+        #       call site itself)
+        #   2 = _stage_baseline (calls _resolve_baseline_mode_and_verdict)
+        #   3 = update_baseline / update_baselines (calls _stage_baseline)
+        #   4 = whoever calls update_baseline/update_baselines -- e.g.
+        #       cli.py's `gate --update-baseline` command, the actual
+        #       external caller this warning should be attributed to.
+        stacklevel=4,
     )
     return CompositeMode.FULL_7, "uncalibrated"
 

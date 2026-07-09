@@ -138,7 +138,10 @@ def fingerprint(
     payload = {
         "prompt_version": config.prompt_version,
         "dataset_version": config.dataset.version,
-        "served_versions": dict(sorted(served_versions.items())),
+        # `json.dumps(..., sort_keys=True)` below already sorts every dict's
+        # keys, including this one's -- pre-sorting `served_versions` here
+        # was redundant (a no-op given sort_keys=True downstream).
+        "served_versions": dict(served_versions),
         "judge_version": judge_version,
         "composite_mode": str(composite_mode),
         "calibration_verdict": str(calibration_verdict),

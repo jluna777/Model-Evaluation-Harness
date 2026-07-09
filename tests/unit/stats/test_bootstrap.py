@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 from scipy import stats as scipy_stats
 
-from harness.stats.bootstrap import _bca_adjust, _bca_percentiles, _norm_cdf, _norm_ppf, bca_ci
+from harness.stats._normal import _norm_cdf, _norm_ppf
+from harness.stats.bootstrap import _bca_adjust, _bca_percentiles, bca_ci
 
 
 class TestNormalHelpers:
@@ -323,6 +324,23 @@ def _nan_above_threshold(threshold: float):
     return statistic
 
 
+def _nan_for_singleton_input(x: np.ndarray) -> float:
+    """Statistic that is NaN for a single-element input, else the (ddof=1)
+    variance. With exactly 2 total observations, every leave-one-out
+    jackknife subset has size 1 (-> NaN) while every size-2 bootstrap
+    resample (drawn WITH replacement from the 2 original values) always has
+    size 2 (-> finite, 0.0 or 8.0 for the fixed values used below) --
+    isolating a "jackknife-only NaN, zero bootstrap NaN" case, the mirror
+    image of ``_nan_on_duplicate``'s "bootstrap-only NaN" case above. Written
+    to avoid ``np.var``'s own "Degrees of freedom <= 0" RuntimeWarning on a
+    singleton so the test's warning assertions only ever see ``bca_ci``'s.
+    """
+
+    if x.size < 2:
+        return float("nan")
+    return float(np.var(x, ddof=1))
+
+
 def _nan_on_duplicate(x: np.ndarray) -> float:
     """Statistic that returns NaN whenever ``x`` contains a repeated value,
     else the mean. Bootstrap resamples draw ``n`` values with replacement
@@ -402,6 +420,45 @@ class TestNanPolicy:
         # outside a generous +/-3 band.
         assert -3.0 < lo < 3.0
         assert -3.0 < hi < 3.0
+
+    def test_jackknife_only_nan_message_names_only_jackknife_count(self):
+        # n=2: both jackknife leave-one-out subsets are singletons (NaN);
+        # every size-2 bootstrap resample stays finite -- zero bootstrap
+        # NaNs. The default (raise) message must name only the nonzero
+        # (jackknife) count -- previously it always prepended "0 of 2
+        # bootstrap replicate statistics are NaN" even when the bootstrap
+        # replicates were not the problem at all.
+        with pytest.raises(ValueError) as exc_info:
+            bca_ci(
+                [1.0, 5.0],
+                _nan_for_singleton_input,
+                level=0.95,
+                seed=1,
+                n_resamples=200,
+            )
+
+        message = str(exc_info.value)
+        assert "2 of 2 jackknife" in message
+        assert "bootstrap" not in message
+
+    def test_omit_policy_with_no_nans_matches_default_and_emits_no_warning(self):
+        # nan_policy="omit" only ever differs from the default when NaNs
+        # actually occur (module docstring): on ordinary, non-degenerate
+        # data it must be a complete no-op -- identical interval, and no
+        # warning (the omission-disclosure RuntimeWarning fires only when
+        # something was actually omitted).
+        rng = np.random.default_rng(55)
+        values = rng.normal(size=30)
+
+        default_result = bca_ci(values, np.mean, level=0.95, seed=7, n_resamples=2000)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            omit_result = bca_ci(
+                values, np.mean, level=0.95, seed=7, n_resamples=2000, nan_policy="omit"
+            )
+
+        assert omit_result == default_result
 
     def test_omit_policy_warning_names_the_omission_count(self):
         statistic = _nan_above_threshold(self._threshold)

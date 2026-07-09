@@ -47,3 +47,11 @@ markers = [
     "live: hits real provider APIs; excluded by default, opt in with -m live",
 ]
 addopts = "-m \"not live\""
+filterwarnings = [
+    # Third-party noise, not ours to fix: google-genai's types.py builds a
+    # module-level Union alias using the private `typing._UnionGenericAlias`,
+    # which is deprecated for removal in Python 3.17. Narrowly scoped to that
+    # exact message/module so any *other* DeprecationWarning (including one
+    # from our own code) still surfaces normally.
+    "ignore:'_UnionGenericAlias' is deprecated:DeprecationWarning:google\\.genai\\.types",
+]

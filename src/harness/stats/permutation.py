@@ -71,7 +71,15 @@ def sign_flip_test(
     estimate the same p-value. ``seed`` makes the Monte Carlo path
     reproducible; it is unused (but still required, for a stable call
     signature) in exact mode.
+
+    ``sided`` is validated FIRST, before any enumeration/resampling work
+    begins -- an invalid value used to only surface from ``_extreme_mask``,
+    after the (potentially expensive, up to ``2**20`` entries) exact
+    enumeration had already run to completion.
     """
+
+    if sided not in ("one", "two"):
+        raise ValueError(f"sided must be 'one' or 'two', got {sided!r}")
 
     deltas_arr = np.asarray(deltas, dtype=np.float64)
     if deltas_arr.size == 0:
