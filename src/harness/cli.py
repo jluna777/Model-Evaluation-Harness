@@ -19,8 +19,9 @@ judge-only client seam (``_build_judge_client``) to re-judge those artifacts'
 triples with the CURRENT judge -- calibrate has no use for a candidate client
 of its own once each candidate's run is in hand, whether that run was just
 freshly executed or reused from disk. All of the actual statistics/decision
-logic (agreement, verdict, self-consistency, the retest ceiling, the
-certificate) lives in ``harness.calibrate``; this module is CLI plumbing only
+logic (agreement, verdict, self-consistency, gold resolution, the
+human-human agreement ceiling, the certificate) lives in ``harness.
+calibrate``; this module is CLI plumbing only
 (dataset/label loading, tracing, client construction, writing the
 certificate/judgments file, printing the report).
 
@@ -516,6 +517,12 @@ def _clean_exit_on_expected_errors() -> Iterator[None]:
         # discovered before any statistic can be trusted, never a traceback.
         calibrate_module.CalibrationBindingError,
         calibrate_module.StaleJudgmentsError,
+        # Dual-annotation upgrade (owner, 2026-07-09): the two annotators'
+        # labels don't satisfy the dual-annotation precondition (wrong
+        # annotator count/identity, incomplete second-annotator coverage, or
+        # an unadjudicated disagreement) -- a setup/data-integrity problem,
+        # never a traceback.
+        calibrate_module.DualAnnotationError,
     ) as exc:
         typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
@@ -830,13 +837,6 @@ def gate(
 
 @app.command()
 def calibrate(
-    retest: Annotated[
-        bool,
-        typer.Option(
-            "--retest",
-            help="Also compute the test-retest consistency ceiling from round=retest labels.",
-        ),
-    ] = False,
     offline: Annotated[
         bool,
         typer.Option(
@@ -874,6 +874,17 @@ def calibrate(
 ) -> None:
     """Judge calibration: agreement report + committed certificate (spec §5).
 
+    Dual-annotation (owner-approved upgrade, 2026-07-09): both automatic, no
+    flag required. Whenever ``labels_path`` carries ``round="initial"`` rows
+    from exactly two annotators (``"owner"`` plus one other, covering the
+    exact same keys), this command resolves the final gold labels
+    (``harness.calibrate.resolve_gold_labels`` -- owner adjudication wins
+    every disagreement) and computes the human-human agreement (IAA) ceiling
+    (``compute_iaa_ceiling``) alongside judge agreement. Missing/incomplete
+    second-annotator coverage, or a disagreement with no adjudication row,
+    raises ``DualAnnotationError`` -- mapped to a clean exit 1 by
+    ``_clean_exit_on_expected_errors``, never a traceback.
+
     Live (default): always reportable -- fails fast with ``MissingTracingError``
     if Langfuse credentials are absent, before any candidate or judge client is
     constructed -- and persists its judge output to ``judgments.jsonl``
@@ -904,7 +915,6 @@ def calibrate(
                 labels=calib_labels,
                 label_file_hash=label_file_hash,
                 date_override=resolved_date,
-                retest=retest,
             )
             certificate = calibrate_module.build_certificate(result)
             calibrate_module.write_certificate(certificate, DEFAULT_CERTIFICATE_PATH)
@@ -956,7 +966,6 @@ def calibrate(
             judge=judge,
             label_file_hash=label_file_hash,
             date_override=resolved_date,
-            retest=retest,
         )
         certificate = calibrate_module.build_certificate(result)
         calibrate_module.write_certificate(certificate, DEFAULT_CERTIFICATE_PATH)

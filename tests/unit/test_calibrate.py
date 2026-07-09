@@ -25,6 +25,7 @@ import harness.cli as cli
 import harness.stats.agreement as agreement_module
 from harness.calibrate import (
     CalibrationResult,
+    GoldLabel,
     JudgedTriple,
     PairedJudgment,
     SelfConsistencyResult,
@@ -33,7 +34,7 @@ from harness.calibrate import (
     build_triples,
     check_disjoint_from_golden,
     compute_agreement,
-    compute_retest_ceiling,
+    compute_iaa_ceiling,
     decide_verdict,
     hash_label_file,
     judge_triples,
@@ -43,6 +44,7 @@ from harness.calibrate import (
     per_candidate_divergence_flag,
     render_calibration_report,
     resolve_certificate_date,
+    resolve_gold_labels,
     run_calibration,
     select_fixed_self_consistency_triples,
     write_certificate,
@@ -166,29 +168,61 @@ def make_label(
     verdict: str,
     *,
     round_: str = "initial",
+    annotator: str = "owner",
     label_date_: str = "2026-06-01",
     label_id: str | None = None,
     candidate_value: str = "unused-value",
 ) -> CalibrationLabel:
     """``candidate_value`` (finding F1) defaults to an arbitrary placeholder
     for tests that never pair this label against a real judged triple (date/
-    hash-file/round-trip tests, and retest-round labels, which are only ever
-    compared to each other, never to a candidate output). Any test that DOES
-    flow through ``pair_with_labels``/``run_calibration`` for its ``"initial"``
-    round labels must pass the SAME ``candidate_value`` string the
-    corresponding ``Triple``/candidate output actually carries, or the F1
-    binding check will (correctly) raise ``CalibrationBindingError``."""
+    hash-file/round-trip tests, and adjudication-round labels, which are only
+    ever compared to the two annotators' rows, never directly to a candidate
+    output). Any test that DOES flow through ``pair_with_labels``/
+    ``run_calibration`` for its ``"initial"`` round labels must pass the SAME
+    ``candidate_value`` string the corresponding ``Triple``/candidate output
+    actually carries, or the F1 binding check will (correctly) raise
+    ``CalibrationBindingError``.
+
+    ``annotator`` defaults to ``"owner"`` (the primary annotator, dual-
+    annotation upgrade 2026-07-09) -- pass e.g. ``annotator="annotator2"``
+    for the second annotator's rows."""
 
     return CalibrationLabel(
-        label_id=label_id or f"lbl-{item_id}-{candidate}-{field}-{round_}",
+        label_id=label_id or f"lbl-{item_id}-{candidate}-{field}-{round_}-{annotator}",
         item_id=item_id,
         candidate=candidate,
         field=field,
+        annotator=annotator,
         verdict=verdict,
         critique="scripted",
         label_date=label_date_,
         round=round_,
         output_sha256=calibrate.hash_output(candidate_value),
+    )
+
+
+def make_gold(
+    item_id: str,
+    candidate: str,
+    field: str,
+    verdict: str,
+    *,
+    critique: str = "scripted",
+    candidate_value: str = "unused-value",
+    source: str = "agreement",
+) -> GoldLabel:
+    """A ``GoldLabel`` built directly (bypassing ``resolve_gold_labels``) for
+    tests exercising ``pair_with_labels``/``pair_judgments_with_labels`` in
+    isolation from gold resolution itself."""
+
+    return GoldLabel(
+        item_id=item_id,
+        candidate=candidate,
+        field=field,
+        verdict=verdict,
+        critique=critique,
+        output_sha256=calibrate.hash_output(candidate_value),
+        source=source,
     )
 
 
@@ -337,10 +371,10 @@ class TestJudgeTriples:
 
 
 class TestPairWithLabels:
-    def test_pairs_matching_labels_and_excludes_judge_errors_and_unlabeled(self):
+    def test_pairs_matching_gold_and_excludes_judge_errors_and_unlabeled(self):
         email = make_item("cal-001").email
         triples = [
-            Triple("cal-001", "a", "issue_summary", email, "ref", "v1"),  # labeled, pass/pass
+            Triple("cal-001", "a", "issue_summary", email, "ref", "v1"),  # gold, pass/pass
             Triple("cal-001", "a", "requested_action", email, "ref", "v2"),  # judge error
             Triple("cal-002", "a", "issue_summary", email, "ref", "v3"),  # unlabeled
         ]
@@ -349,12 +383,12 @@ class TestPairWithLabels:
             JudgedTriple(triples[1], verdict=None, error="refusal", rationale=None),
             JudgedTriple(triples[2], verdict="pass", error=None, rationale="ok"),
         ]
-        labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
-            make_label("cal-001", "a", "requested_action", "pass", candidate_value="v2"),
+        gold = [
+            make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
+            make_gold("cal-001", "a", "requested_action", "pass", candidate_value="v2"),
         ]
 
-        paired, judge_errors, unlabeled = pair_with_labels(judged, labels, round_="initial")
+        paired, judge_errors, unlabeled = pair_with_labels(judged, gold)
 
         assert len(paired) == 1
         assert paired[0].item_id == "cal-001"
@@ -363,25 +397,14 @@ class TestPairWithLabels:
         assert judge_errors == 1
         assert unlabeled == 1
 
-    def test_duplicate_label_for_same_key_raises(self):
-        labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", label_id="lbl-1"),
-            make_label("cal-001", "a", "issue_summary", "fail", label_id="lbl-2"),
+    def test_duplicate_gold_for_same_key_raises(self):
+        gold = [
+            make_gold("cal-001", "a", "issue_summary", "pass"),
+            make_gold("cal-001", "a", "issue_summary", "fail"),
         ]
 
         with pytest.raises(ValueError, match="duplicate"):
-            pair_with_labels([], labels, round_="initial")
-
-    def test_round_selection_ignores_other_round(self):
-        email = make_item("cal-001").email
-        triple = Triple("cal-001", "a", "issue_summary", email, "ref", "v1")
-        judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
-        labels = [make_label("cal-001", "a", "issue_summary", "fail", round_="retest")]
-
-        paired, _, unlabeled = pair_with_labels(judged, labels, round_="initial")
-
-        assert paired == []
-        assert unlabeled == 1
+            pair_with_labels([], gold)
 
 
 # --------------------------------------------------------------------------
@@ -394,19 +417,20 @@ class TestPairWithLabelsOutputBinding:
         email = make_item("cal-001").email
         triple = Triple("cal-001", "a", "issue_summary", email, "ref", "v1")
         judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
-        # Label was written against a DIFFERENT candidate_value than the one
-        # actually judged now -- e.g. the run directory was regenerated.
-        labels = [make_label("cal-001", "a", "issue_summary", "pass", candidate_value="stale-v1")]
+        # Gold label was resolved against a DIFFERENT candidate_value than the
+        # one actually judged now -- e.g. the run directory was regenerated.
+        gold = [make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="stale-v1")]
 
         with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
-            pair_with_labels(judged, labels, round_="initial")
+            pair_with_labels(judged, gold)
 
         assert excinfo.value.mismatches == (("cal-001", "a", "issue_summary"),)
         assert "cal-001" in str(excinfo.value)
 
     def test_one_mismatch_blocks_all_pairing_not_just_the_bad_key(self):
-        """All-or-nothing (F1): a single mismatched label must prevent EVERY
-        pair from being returned, including otherwise-correctly-bound ones."""
+        """All-or-nothing (F1): a single mismatched gold label must prevent
+        EVERY pair from being returned, including otherwise-correctly-bound
+        ones."""
 
         email = make_item("cal-001").email
         good_triple = Triple("cal-001", "a", "issue_summary", email, "ref", "good-value")
@@ -415,15 +439,15 @@ class TestPairWithLabelsOutputBinding:
             JudgedTriple(good_triple, verdict="pass", error=None, rationale="ok"),
             JudgedTriple(bad_triple, verdict="pass", error=None, rationale="ok"),
         ]
-        labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", candidate_value="good-value"),
-            make_label(
+        gold = [
+            make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="good-value"),
+            make_gold(
                 "cal-002", "a", "issue_summary", "pass", candidate_value="wrong-recorded-value"
             ),
         ]
 
         with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
-            pair_with_labels(judged, labels, round_="initial")
+            pair_with_labels(judged, gold)
 
         assert excinfo.value.mismatches == (("cal-002", "a", "issue_summary"),)
 
@@ -431,25 +455,24 @@ class TestPairWithLabelsOutputBinding:
         email = make_item("cal-001").email
         triple = Triple("cal-001", "a", "issue_summary", email, "ref", "exact-value")
         judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
-        labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", candidate_value="exact-value")
-        ]
+        gold = [make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="exact-value")]
 
-        paired, judge_errors, unlabeled = pair_with_labels(judged, labels, round_="initial")
+        paired, judge_errors, unlabeled = pair_with_labels(judged, gold)
 
         assert len(paired) == 1
         assert judge_errors == 0
         assert unlabeled == 0
 
     def test_unlabeled_triple_is_never_hash_checked(self):
-        """A triple with no matching label at all can't mismatch -- there is
-        no label to compare against, so it is simply counted unlabeled."""
+        """A triple with no matching gold label at all can't mismatch --
+        there is no label to compare against, so it is simply counted
+        unlabeled."""
 
         email = make_item("cal-001").email
         triple = Triple("cal-001", "a", "issue_summary", email, "ref", "anything")
         judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
 
-        paired, judge_errors, unlabeled = pair_with_labels(judged, [], round_="initial")
+        paired, judge_errors, unlabeled = pair_with_labels(judged, [])
 
         assert paired == []
         assert judge_errors == 0
@@ -490,13 +513,14 @@ class TestLabelingTemplateRows:
             Triple("cal-001", "a", "requested_action", email, "ref-2", "candidate-value-2"),
         ]
 
-        rows = calibrate.labeling_template_rows(triples)
+        rows = calibrate.labeling_template_rows(triples, "owner")
 
         assert len(rows) == 2
         assert rows[0] == {
             "item_id": "cal-001",
             "candidate": "a",
             "field": "issue_summary",
+            "annotator": "owner",
             "candidate_value": "candidate-value-1",
             "output_sha256": calibrate.hash_output("candidate-value-1"),
             "verdict": "",
@@ -505,7 +529,7 @@ class TestLabelingTemplateRows:
         assert rows[1]["output_sha256"] == calibrate.hash_output("candidate-value-2")
 
     def test_empty_triples_gives_empty_rows(self):
-        assert calibrate.labeling_template_rows([]) == []
+        assert calibrate.labeling_template_rows([], "owner") == []
 
     def test_rows_are_born_correctly_bound_for_calibration_label(self):
         """Every row's output_sha256 must equal hash_output(candidate_value)
@@ -516,9 +540,27 @@ class TestLabelingTemplateRows:
         email = make_item("cal-001").email
         triples = [Triple("cal-001", "b", "issue_summary", email, "ref", "some output text")]
 
-        rows = calibrate.labeling_template_rows(triples)
+        rows = calibrate.labeling_template_rows(triples, "annotator2")
 
         assert rows[0]["output_sha256"] == calibrate.hash_output(rows[0]["candidate_value"])
+
+    def test_one_sheet_per_annotator_same_triples_differ_only_by_annotator(self):
+        """Dual-annotation upgrade (2026-07-09): calling this once per
+        annotator with the SAME triples produces sheets that are identical
+        except for the ``annotator`` field -- neither sheet leaks the other's
+        (blank, at generation time) verdict column."""
+
+        email = make_item("cal-001").email
+        triples = [Triple("cal-001", "a", "issue_summary", email, "ref", "shared-value")]
+
+        owner_rows = calibrate.labeling_template_rows(triples, "owner")
+        other_rows = calibrate.labeling_template_rows(triples, "annotator2")
+
+        assert owner_rows[0]["annotator"] == "owner"
+        assert other_rows[0]["annotator"] == "annotator2"
+        owner_row_sans_annotator = {k: v for k, v in owner_rows[0].items() if k != "annotator"}
+        other_row_sans_annotator = {k: v for k, v in other_rows[0].items() if k != "annotator"}
+        assert owner_row_sans_annotator == other_row_sans_annotator
 
 
 # --------------------------------------------------------------------------
@@ -715,162 +757,258 @@ class TestMeasureSelfConsistency:
 
 
 # --------------------------------------------------------------------------
-# Test-retest ceiling.
+# Human-human agreement (IAA) ceiling -- dual-annotation upgrade, 2026-07-09.
 # --------------------------------------------------------------------------
 
 
-class TestComputeRetestCeiling:
-    def test_perfect_agreement_on_intersection_gives_kappa_one(self):
-        labels = []
-        for i in range(1, 7):
-            item_id = f"cal-{i:03d}"
-            verdict = "fail" if item_id == "cal-002" else "pass"
-            labels.append(make_label(item_id, "a", "issue_summary", verdict, round_="initial"))
-            labels.append(make_label(item_id, "a", "issue_summary", verdict, round_="retest"))
+def _dual_labels(
+    verdict_pairs: dict[str, tuple[str, str]], *, field: str = "issue_summary"
+) -> list[CalibrationLabel]:
+    """One owner + one ``annotator2`` label per ``item_id`` in
+    ``verdict_pairs`` (``{item_id: (owner_verdict, other_verdict)}``), all
+    sharing the same (per-item) ``candidate_value`` so the two annotators'
+    ``output_sha256`` match (a genuine disagreement is a verdict difference,
+    never a binding mismatch, unless a test deliberately wants the latter)."""
 
-        ceiling, warnings_out = compute_retest_ceiling(labels, n_resamples=200, seed=0)
+    labels: list[CalibrationLabel] = []
+    for item_id, (owner_verdict, other_verdict) in verdict_pairs.items():
+        value = f"{item_id}-value"
+        labels.append(
+            make_label(item_id, "a", field, owner_verdict, annotator="owner", candidate_value=value)
+        )
+        labels.append(
+            make_label(
+                item_id, "a", field, other_verdict, annotator="annotator2", candidate_value=value
+            )
+        )
+    return labels
 
-        assert ceiling is not None
+
+class TestComputeIaaCeiling:
+    def test_perfect_agreement_gives_kappa_one(self):
+        labels = _dual_labels(
+            {
+                f"cal-{i:03d}": ("fail" if i == 2 else "pass", "fail" if i == 2 else "pass")
+                for i in range(1, 7)
+            }
+        )
+
+        ceiling, warnings_out = compute_iaa_ceiling(labels, n_resamples=200, seed=0)
+
         assert ceiling.kappa == pytest.approx(1.0)
         assert isinstance(warnings_out, tuple)
 
-    def test_fewer_than_two_shared_keys_returns_none(self):
+    def test_hand_computed_kappa_on_engineered_disagreement_pattern(self):
+        """Owner: pass, pass, fail, fail, pass. Other: pass, fail, fail,
+        pass, pass. Hand-computed: n=5, po=3/5=0.6 (3 agreements); row sums
+        (owner) fail=2/pass=3, col sums (other) fail=2/pass=3 ->
+        pe=(2/5)^2+(3/5)^2=0.52; kappa=(0.6-0.52)/(1-0.52)=0.08/0.48=1/6."""
+
+        labels = _dual_labels(
+            {
+                "cal-001": ("pass", "pass"),
+                "cal-002": ("pass", "fail"),
+                "cal-003": ("fail", "fail"),
+                "cal-004": ("fail", "pass"),
+                "cal-005": ("pass", "pass"),
+            }
+        )
+
+        ceiling, _ = compute_iaa_ceiling(labels, n_resamples=50, seed=0)
+
+        assert ceiling.kappa == pytest.approx(1 / 6)
+
+    def test_incomplete_second_annotator_coverage_raises_loud_error(self):
+        labels = _dual_labels({"cal-001": ("pass", "pass"), "cal-002": ("pass", "pass")})
+        # Drop annotator2's row for cal-002 -- incomplete coverage.
         labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", round_="initial"),
-            make_label("cal-001", "a", "issue_summary", "pass", round_="retest"),
+            label
+            for label in labels
+            if not (label.annotator == "annotator2" and label.item_id == "cal-002")
         ]
 
-        ceiling, warnings_out = compute_retest_ceiling(labels)
+        with pytest.raises(
+            calibrate.DualAnnotationError, match="second annotator labels incomplete"
+        ):
+            compute_iaa_ceiling(labels)
 
-        assert ceiling is None
-        assert warnings_out == ()
-
-    def test_no_retest_labels_returns_none(self):
-        labels = [make_label("cal-001", "a", "issue_summary", "pass", round_="initial")]
-
-        ceiling, _ = compute_retest_ceiling(labels)
-
-        assert ceiling is None
-
-    def test_matching_output_sha256_across_rounds_allows_ceiling(self):
-        """When initial and retest labels for the same key have matching
-        output_sha256 (labeled the same candidate output), ceiling is computed
-        normally."""
-        labels = []
-        for i in range(1, 7):  # Need at least 2 shared keys; use 6 for variance
-            item_id = f"cal-{i:03d}"
-            verdict = "fail" if item_id == "cal-002" else "pass"
-            # Both rounds label the same candidate value -> same output_sha256
-            labels.append(
-                make_label(
-                    item_id,
-                    "a",
-                    "issue_summary",
-                    verdict,
-                    round_="initial",
-                    candidate_value="same-value",
-                )
-            )
-            labels.append(
-                make_label(
-                    item_id,
-                    "a",
-                    "issue_summary",
-                    verdict,
-                    round_="retest",
-                    candidate_value="same-value",
-                )
-            )
-
-        ceiling, warnings_out = compute_retest_ceiling(labels, n_resamples=200, seed=0)
-
-        assert ceiling is not None
-        assert ceiling.kappa == pytest.approx(1.0)
-
-    def test_mismatched_output_sha256_raises_binding_error(self):
-        """When initial and retest labels for the same key have different
-        output_sha256 (labeled different candidate outputs), raises
-        CalibrationBindingError all-or-nothing (no partial ceiling)."""
-        labels = []
-        for i in range(1, 3):
-            item_id = f"cal-{i:03d}"
-            # Initial labels one candidate value
-            labels.append(
-                make_label(
-                    item_id,
-                    "a",
-                    "issue_summary",
-                    "pass",
-                    round_="initial",
-                    candidate_value="initial-value",
-                )
-            )
-            # Retest labels a different candidate value
-            labels.append(
-                make_label(
-                    item_id,
-                    "a",
-                    "issue_summary",
-                    "pass",
-                    round_="retest",
-                    candidate_value="retest-value",
-                )
-            )
-
-        with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
-            compute_retest_ceiling(labels)
-
-        assert len(excinfo.value.mismatches) == 2
-        assert ("cal-001", "a", "issue_summary") in excinfo.value.mismatches
-        assert ("cal-002", "a", "issue_summary") in excinfo.value.mismatches
-
-    def test_one_mismatched_key_blocks_all_ceiling_computation(self):
-        """All-or-nothing: a single mismatched output_sha256 prevents the
-        entire ceiling from being computed, even if other keys match."""
-        good_value = "good-candidate-value"
-        bad_value = "bad-candidate-value"
+    def test_cross_annotator_hash_mismatch_raises_binding_error(self):
         labels = [
-            # This key matches
             make_label(
-                "cal-001",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="initial",
-                candidate_value=good_value,
+                "cal-001", "a", "issue_summary", "pass", annotator="owner", candidate_value="v1"
             ),
             make_label(
                 "cal-001",
                 "a",
                 "issue_summary",
                 "pass",
-                round_="retest",
-                candidate_value=good_value,
-            ),
-            # This key mismatches
-            make_label(
-                "cal-002",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="initial",
-                candidate_value=good_value,
-            ),
-            make_label(
-                "cal-002",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="retest",
-                candidate_value=bad_value,
+                annotator="annotator2",
+                candidate_value="v1-other",
             ),
         ]
 
         with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
-            compute_retest_ceiling(labels)
+            compute_iaa_ceiling(labels)
 
-        # Only the mismatched key should be reported
-        assert excinfo.value.mismatches == (("cal-002", "a", "issue_summary"),)
+        assert excinfo.value.mismatches == (("cal-001", "a", "issue_summary"),)
+
+    def test_only_owner_annotator_present_raises(self):
+        labels = [make_label("cal-001", "a", "issue_summary", "pass", annotator="owner")]
+
+        with pytest.raises(calibrate.DualAnnotationError, match="exactly 2 annotators"):
+            compute_iaa_ceiling(labels)
+
+    def test_three_annotators_present_raises(self):
+        labels = [
+            make_label(
+                "cal-001", "a", "issue_summary", "pass", annotator="owner", candidate_value="v"
+            ),
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "pass",
+                annotator="annotator2",
+                candidate_value="v",
+            ),
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "pass",
+                annotator="annotator3",
+                candidate_value="v",
+            ),
+        ]
+
+        with pytest.raises(calibrate.DualAnnotationError, match="exactly 2 annotators"):
+            compute_iaa_ceiling(labels)
+
+    def test_owner_annotator_missing_raises(self):
+        labels = [
+            make_label(
+                "cal-001", "a", "issue_summary", "pass", annotator="annotator2", candidate_value="v"
+            ),
+            make_label(
+                "cal-001", "a", "issue_summary", "pass", annotator="annotator3", candidate_value="v"
+            ),
+        ]
+
+        with pytest.raises(calibrate.DualAnnotationError, match="owner"):
+            compute_iaa_ceiling(labels)
+
+
+# --------------------------------------------------------------------------
+# Gold resolution -- dual-annotation upgrade, 2026-07-09.
+# --------------------------------------------------------------------------
+
+
+class TestResolveGoldLabels:
+    def test_agreement_uses_owners_verdict_with_agreement_source(self):
+        labels = _dual_labels({"cal-001": ("pass", "pass"), "cal-002": ("fail", "fail")})
+
+        gold = resolve_gold_labels(labels)
+
+        assert {(g.item_id, g.verdict, g.source) for g in gold} == {
+            ("cal-001", "pass", "agreement"),
+            ("cal-002", "fail", "agreement"),
+        }
+
+    def test_disagreement_with_adjudication_uses_adjudicated_verdict(self):
+        labels = _dual_labels({"cal-001": ("pass", "pass"), "cal-002": ("pass", "fail")})
+        labels.append(
+            make_label(
+                "cal-002",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="adjudication",
+                annotator="owner",
+                candidate_value="cal-002-value",
+            )
+        )
+
+        gold = resolve_gold_labels(labels)
+
+        by_item = {g.item_id: g for g in gold}
+        assert by_item["cal-001"].source == "agreement"
+        assert by_item["cal-002"].verdict == "fail"
+        assert by_item["cal-002"].source == "adjudication"
+
+    def test_disagreement_without_adjudication_raises_error_naming_keys(self):
+        labels = _dual_labels({"cal-001": ("pass", "fail"), "cal-002": ("pass", "pass")})
+
+        with pytest.raises(calibrate.DualAnnotationError) as excinfo:
+            resolve_gold_labels(labels)
+
+        assert "('cal-001', 'a', 'issue_summary')" in str(excinfo.value)
+
+    def test_incomplete_coverage_raises_before_checking_disagreements(self):
+        labels = _dual_labels({"cal-001": ("pass", "pass"), "cal-002": ("pass", "pass")})
+        # Drop annotator2's row for cal-002 only -- annotator2 is still
+        # present (via cal-001), so this is incomplete coverage, not a wrong
+        # annotator count.
+        labels = [
+            label
+            for label in labels
+            if not (label.annotator == "annotator2" and label.item_id == "cal-002")
+        ]
+
+        with pytest.raises(
+            calibrate.DualAnnotationError, match="second annotator labels incomplete"
+        ):
+            resolve_gold_labels(labels)
+
+    def test_adjudication_hash_mismatch_raises_binding_error(self):
+        labels = _dual_labels({"cal-001": ("pass", "fail")})
+        labels.append(
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="adjudication",
+                annotator="owner",
+                candidate_value="a-different-output-entirely",
+            )
+        )
+
+        with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
+            resolve_gold_labels(labels)
+
+        assert excinfo.value.mismatches == (("cal-001", "a", "issue_summary"),)
+
+    def test_duplicate_owner_label_for_same_key_raises(self):
+        labels = [
+            make_label("cal-001", "a", "issue_summary", "pass", annotator="owner", label_id="l1"),
+            make_label("cal-001", "a", "issue_summary", "fail", annotator="owner", label_id="l2"),
+            make_label("cal-001", "a", "issue_summary", "pass", annotator="annotator2"),
+        ]
+
+        with pytest.raises(ValueError, match="duplicate"):
+            resolve_gold_labels(labels)
+
+    def test_n_adjudicated_count_via_gold_source(self):
+        labels = _dual_labels(
+            {"cal-001": ("pass", "fail"), "cal-002": ("pass", "pass"), "cal-003": ("fail", "pass")}
+        )
+        for item_id, verdict in (("cal-001", "pass"), ("cal-003", "fail")):
+            labels.append(
+                make_label(
+                    item_id,
+                    "a",
+                    "issue_summary",
+                    verdict,
+                    round_="adjudication",
+                    annotator="owner",
+                    candidate_value=f"{item_id}-value",
+                )
+            )
+
+        gold = resolve_gold_labels(labels)
+
+        n_adjudicated = sum(1 for g in gold if g.source == "adjudication")
+        assert n_adjudicated == 2
 
 
 # --------------------------------------------------------------------------
@@ -949,7 +1087,7 @@ class TestResolveCertificateDate:
                 "a",
                 "issue_summary",
                 "pass",
-                round_="retest",
+                round_="adjudication",
                 label_date_="2026-06-15",
             ),
             make_label("cal-002", "a", "issue_summary", "pass", label_date_="2026-03-01"),
@@ -1035,6 +1173,7 @@ def _sample_result(**overrides) -> CalibrationResult:
         ),
         ceiling=None,
         warnings=(),
+        n_adjudicated=0,
     )
     defaults.update(overrides)
     return CalibrationResult(**defaults)
@@ -1060,17 +1199,22 @@ class TestBuildCertificate:
         }
         assert certificate.verdict == "adequate"
         assert certificate.ceiling_kappa is None
+        assert certificate.ceiling_kappa_ci is None
+        assert certificate.n_adjudicated == 0
         assert certificate.label_file_hash == "hash-1"
         assert certificate.date == date(2026, 6, 1)
 
-    def test_ceiling_kappa_populated_when_result_has_ceiling(self):
+    def test_ceiling_kappa_and_ci_populated_when_result_has_ceiling(self):
         result = _sample_result(
-            ceiling=KappaResult(kappa=0.9, ci=(0.8, 0.95), raw_agreement=0.95, prevalence=0.6)
+            ceiling=KappaResult(kappa=0.9, ci=(0.8, 0.95), raw_agreement=0.95, prevalence=0.6),
+            n_adjudicated=2,
         )
 
         certificate = build_certificate(result)
 
         assert certificate.ceiling_kappa == pytest.approx(0.9)
+        assert certificate.ceiling_kappa_ci == pytest.approx((0.8, 0.95))
+        assert certificate.n_adjudicated == 2
 
 
 class TestWriteCertificateRoundTrip:
@@ -1144,17 +1288,20 @@ class TestRenderCalibrationReport:
     def test_omits_ceiling_section_when_absent(self):
         actual = render_calibration_report(_sample_result(ceiling=None))
 
-        assert "Test-Retest Consistency Ceiling" not in actual
+        assert "Human-Human Agreement Ceiling" not in actual
 
-    def test_renders_ceiling_section_labeled_as_estimate(self):
+    def test_renders_ceiling_section_labeled_as_human_human_agreement(self):
         result = _sample_result(
-            ceiling=KappaResult(kappa=0.9, ci=(0.8, 0.95), raw_agreement=0.95, prevalence=0.6)
+            ceiling=KappaResult(kappa=0.9, ci=(0.8, 0.95), raw_agreement=0.95, prevalence=0.6),
+            n_adjudicated=2,
         )
 
         actual = render_calibration_report(result)
 
-        assert "Test-Retest Consistency Ceiling" in actual
-        assert "an estimate of the consistency ceiling" in actual
+        assert "Human-Human Agreement Ceiling" in actual
+        assert "the human-human agreement ceiling" in actual
+        assert "indicates estimation noise, not a super-human judge" in actual
+        assert "Adjudicated disagreements: 2" in actual
 
     def test_renders_bootstrap_disclosures_when_present(self):
         result = _sample_result(warnings=("Omitted 5 of 10000 bootstrap replicates (fixture)",))
@@ -1186,9 +1333,16 @@ class TestRenderCalibrationReport:
 def _calibration_fixture():
     """6 calibration items, 2 candidates, 2 fields = 24 triples total.
     Designed for exact, hand-verifiable agreement: one unlabeled triple, one
-    judge-error triple, and perfect (owner-label == judge-verdict) agreement
+    judge-error triple, and perfect (gold-verdict == judge-verdict) agreement
     everywhere else, with one "fail" pair per candidate so neither candidate's
     subset collapses to a single category.
+
+    Dual-annotation upgrade (2026-07-09): every labeled key gets BOTH an
+    ``"owner"`` and an ``"annotator2"`` row, mirroring each other exactly
+    (same verdict, same candidate_value) -- perfect inter-annotator agreement
+    by construction, so gold always resolves via spontaneous agreement
+    (``n_adjudicated == 0``) and the human-human ceiling is exactly 1.0,
+    keeping every pre-upgrade assertion about judge-vs-gold agreement intact.
     """
 
     item_ids = [f"cal-{i:03d}" for i in range(1, 7)]
@@ -1225,16 +1379,24 @@ def _calibration_fixture():
                 value = cv(item_id, candidate, f)
                 label_verdict = "fail" if key in fail_pairs else "pass"
                 if key != unlabeled:
-                    labels.append(
-                        make_label(item_id, candidate, f, label_verdict, candidate_value=value)
-                    )
+                    for annotator in ("owner", "annotator2"):
+                        labels.append(
+                            make_label(
+                                item_id,
+                                candidate,
+                                f,
+                                label_verdict,
+                                candidate_value=value,
+                                annotator=annotator,
+                            )
+                        )
                 # Every triple is judged regardless of whether it ends up
                 # labeled -- judge_triples judges the full triple set, and
                 # pairing (not judging) is what excludes the unlabeled one.
                 if key == judge_error:
                     verdict_table[value] = "__error__"
                 else:
-                    verdict_table[value] = label_verdict  # judge agrees with the owner
+                    verdict_table[value] = label_verdict  # judge agrees with gold
 
     judge = _judge(lambda candidate_value, idx: verdict_table[candidate_value])
     return run_a, run_b, labels, judge
@@ -1264,7 +1426,12 @@ class TestRunCalibrationIntegration:
         assert result.per_candidate["a"].kappa == pytest.approx(1.0)
         assert result.per_candidate["b"].kappa == pytest.approx(1.0)
         assert result.self_consistency.n_triples == 20  # default self-consistency n
-        assert result.ceiling is None
+        # Ceiling is now unconditional (dual-annotation upgrade): both
+        # annotators mirror each other exactly in this fixture -> kappa 1.0,
+        # zero adjudicated disagreements.
+        assert result.ceiling is not None
+        assert result.ceiling.kappa == pytest.approx(1.0)
+        assert result.n_adjudicated == 0
         assert result.date == max(label.label_date for label in labels)
 
     def test_date_override_wins_over_label_dates(self):
@@ -1283,102 +1450,77 @@ class TestRunCalibrationIntegration:
 
         assert result.date == date(2030, 1, 1)
 
-    def test_retest_flag_adds_ceiling_from_retest_labels(self):
-        run_a, run_b, labels, judge = _calibration_fixture()
-        # Add retest labels for a subset of the initial keys, perfectly consistent.
-        # Must use same candidate_value as initial labels (output_sha256 binding).
-        def cv(item_id: str, candidate: str, field: str) -> str:
-            return f"{item_id}-{candidate}-{field}-value"
+    def test_disagreement_with_adjudication_reflected_in_n_adjudicated(self):
+        """One key's second annotator disagrees with the owner; an
+        adjudication row resolves it back to the owner's original verdict
+        (which the judge already agrees with) -- ``n_adjudicated`` counts it,
+        and the judge-agreement kappa is unaffected."""
 
-        retest_labels = [
-            make_label(
-                "cal-001",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="retest",
-                candidate_value=cv("cal-001", "a", "issue_summary"),
-            ),
-            make_label(
-                "cal-002",
-                "a",
-                "issue_summary",
-                "fail",
-                round_="retest",
-                candidate_value=cv("cal-002", "a", "issue_summary"),
-            ),
-            make_label(
-                "cal-003",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="retest",
-                candidate_value=cv("cal-003", "a", "issue_summary"),
-            ),
+        run_a, run_b, labels, judge = _calibration_fixture()
+        target_key = ("cal-001", "a", "issue_summary")
+        target_value = f"{target_key[0]}-{target_key[1]}-{target_key[2]}-value"
+
+        modified_labels = [
+            label.model_copy(update={"verdict": "fail"})
+            if (label.item_id, label.candidate, label.field) == target_key
+            and label.annotator == "annotator2"
+            else label
+            for label in labels
         ]
+        adjudication = make_label(
+            *target_key,
+            "pass",
+            round_="adjudication",
+            annotator="owner",
+            candidate_value=target_value,
+            label_id="lbl-cal-001-a-issue_summary-adjudication",
+        )
 
         result = run_calibration(
             run_a=run_a,
             run_b=run_b,
-            labels=labels + retest_labels,
+            labels=[*modified_labels, adjudication],
             judge=judge,
             label_file_hash="fixture-hash",
             n_resamples=50,
             seed=0,
-            retest=True,
         )
 
-        assert result.ceiling is not None
-        assert result.ceiling.kappa == pytest.approx(1.0)
-        report = render_calibration_report(result)
-        assert "an estimate of the consistency ceiling" in report
+        assert result.n_adjudicated == 1
+        assert result.overall.kappa == pytest.approx(1.0)  # judge still agrees with gold
 
-    def test_retest_false_never_computes_ceiling_even_with_retest_labels_present(self):
-        run_a, run_b, labels, judge = _calibration_fixture()
-        # Must use same candidate_value as initial labels (output_sha256 binding).
-        def cv(item_id: str, candidate: str, field: str) -> str:
-            return f"{item_id}-{candidate}-{field}-value"
-
-        retest_labels = [
-            make_label(
-                "cal-001",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="retest",
-                candidate_value=cv("cal-001", "a", "issue_summary"),
-            ),
-            make_label(
-                "cal-002",
-                "a",
-                "issue_summary",
-                "fail",
-                round_="retest",
-                candidate_value=cv("cal-002", "a", "issue_summary"),
-            ),
-        ]
-
-        result = run_calibration(
-            run_a=run_a,
-            run_b=run_b,
-            labels=labels + retest_labels,
-            judge=judge,
-            label_file_hash="fixture-hash",
-            n_resamples=50,
-            seed=0,
-            retest=False,
-        )
-
-        assert result.ceiling is None
-
-    def test_no_matching_labels_raises(self):
+    def test_empty_labels_raises_dual_annotation_error(self):
         run_a, run_b, _labels, judge = _calibration_fixture()
 
-        with pytest.raises(ValueError, match="no labeled triple"):
+        with pytest.raises(calibrate.DualAnnotationError, match="exactly 2 annotators"):
             run_calibration(
                 run_a=run_a,
                 run_b=run_b,
                 labels=[],
+                judge=judge,
+                label_file_hash="fixture-hash",
+                n_resamples=50,
+            )
+
+    def test_gold_resolves_but_no_overlap_with_judged_triples_raises(self):
+        """Dual-annotation coverage is satisfied but for keys that don't
+        exist among the judged triples at all -- pairing (not gold
+        resolution) is what must raise here."""
+
+        run_a, run_b, _labels, judge = _calibration_fixture()
+        orphan_key = ("nonexistent-item", "a", "issue_summary")
+        orphan_labels = [
+            make_label(*orphan_key, "pass", annotator="owner", candidate_value="orphan-value"),
+            make_label(
+                *orphan_key, "pass", annotator="annotator2", candidate_value="orphan-value"
+            ),
+        ]
+
+        with pytest.raises(ValueError, match="no gold label matched"):
+            run_calibration(
+                run_a=run_a,
+                run_b=run_b,
+                labels=orphan_labels,
                 judge=judge,
                 label_file_hash="fixture-hash",
                 n_resamples=50,
@@ -1436,14 +1578,12 @@ class TestPairJudgmentsWithLabels:
                 calibrate.hash_output("v3"), "jv",
             ),
         ]
-        labels = [
-            make_label("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
-            make_label("cal-001", "a", "requested_action", "pass", candidate_value="v2"),
+        gold = [
+            make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
+            make_gold("cal-001", "a", "requested_action", "pass", candidate_value="v2"),
         ]
 
-        paired, judge_errors, unlabeled = calibrate.pair_judgments_with_labels(
-            judgments, labels, round_="initial"
-        )
+        paired, judge_errors, unlabeled = calibrate.pair_judgments_with_labels(judgments, gold)
 
         assert len(paired) == 1
         assert judge_errors == 1
@@ -1455,10 +1595,10 @@ class TestPairJudgmentsWithLabels:
                 "cal-001", "a", "issue_summary", "pass", None, "ok", "deadbeef" * 8, "jv",
             ),
         ]
-        labels = [make_label("cal-001", "a", "issue_summary", "pass", candidate_value="v1")]
+        gold = [make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="v1")]
 
         with pytest.raises(calibrate.CalibrationBindingError) as excinfo:
-            calibrate.pair_judgments_with_labels(judgments, labels, round_="initial")
+            calibrate.pair_judgments_with_labels(judgments, gold)
 
         assert excinfo.value.mismatches == (("cal-001", "a", "issue_summary"),)
 
@@ -1612,6 +1752,10 @@ class TestRunCalibrationOffline:
             live_result.self_consistency.flip_rate
         )
         assert offline_result.date == live_result.date
+        assert offline_result.ceiling is not None
+        assert live_result.ceiling is not None
+        assert offline_result.ceiling.kappa == pytest.approx(live_result.ceiling.kappa)
+        assert offline_result.n_adjudicated == live_result.n_adjudicated
         # Offline never re-derives judged_triples/self_consistency_records --
         # it already consumed a persisted copy of them.
         assert offline_result.judged_triples == ()
@@ -1620,7 +1764,8 @@ class TestRunCalibrationOffline:
     def test_offline_never_touches_judge_or_client(self):
         """No ``judge``/``Judge`` argument even exists on this call --
         proves by signature, not just by absence of a fake, that zero calls
-        can be made."""
+        can be made. The retired ``--retest`` flag's ``retest`` kwarg is gone
+        too -- dual annotation is unconditional (module docstring)."""
 
         run_a, run_b, labels, judge = _calibration_fixture()
         live_result = run_calibration(
@@ -1638,6 +1783,7 @@ class TestRunCalibrationOffline:
 
         sig = inspect.signature(calibrate.run_calibration_offline)
         assert "judge" not in sig.parameters
+        assert "retest" not in sig.parameters
 
         calibrate.run_calibration_offline(
             judgments=judgments_file, labels=labels, label_file_hash="fixture-hash", n_resamples=50
@@ -1718,13 +1864,13 @@ class TestRunCalibrationOffline:
         )
         judgments_file = self._judgments_file_from_live_result(live_result)
 
-        with pytest.raises(ValueError, match="no labeled judgment"):
+        with pytest.raises(calibrate.DualAnnotationError, match="exactly 2 annotators"):
             calibrate.run_calibration_offline(
                 judgments=judgments_file, labels=[], label_file_hash="fixture-hash",
                 n_resamples=50,
             )
 
-    def test_retest_ceiling_computed_purely_from_labels(self):
+    def test_gold_resolves_but_no_overlap_with_judgments_raises(self):
         run_a, run_b, labels, judge = _calibration_fixture()
         live_result = run_calibration(
             run_a=run_a,
@@ -1736,54 +1882,78 @@ class TestRunCalibrationOffline:
             seed=0,
         )
         judgments_file = self._judgments_file_from_live_result(live_result)
-        # Must use same candidate_value as initial labels (output_sha256 binding).
-        def cv(item_id: str, candidate: str, field: str) -> str:
-            return f"{item_id}-{candidate}-{field}-value"
-
-        retest_labels = [
+        orphan_labels = [
             make_label(
-                "cal-001",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="retest",
-                candidate_value=cv("cal-001", "a", "issue_summary"),
+                "nonexistent-item", "a", "issue_summary", "pass",
+                annotator="owner", candidate_value="orphan-value",
             ),
             make_label(
-                "cal-002",
-                "a",
-                "issue_summary",
-                "fail",
-                round_="retest",
-                candidate_value=cv("cal-002", "a", "issue_summary"),
-            ),
-            make_label(
-                "cal-003",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="retest",
-                candidate_value=cv("cal-003", "a", "issue_summary"),
+                "nonexistent-item", "a", "issue_summary", "pass",
+                annotator="annotator2", candidate_value="orphan-value",
             ),
         ]
 
-        offline_result = calibrate.run_calibration_offline(
-            judgments=judgments_file,
-            labels=labels + retest_labels,
+        with pytest.raises(ValueError, match="no gold label matched"):
+            calibrate.run_calibration_offline(
+                judgments=judgments_file, labels=orphan_labels, label_file_hash="fixture-hash",
+                n_resamples=50,
+            )
+
+    def test_ceiling_reflects_full_label_set_independent_of_judgments(self):
+        """``compute_iaa_ceiling`` only ever reads ``labels`` -- adding a
+        disagreement for items never judged at all must still move the
+        offline-recomputed ceiling, proving it is computed purely from
+        labels rather than from the persisted judgments file."""
+
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
             label_file_hash="fixture-hash",
             n_resamples=50,
-            retest=True,
+            seed=0,
+        )
+        assert live_result.ceiling is not None
+        assert live_result.ceiling.kappa == pytest.approx(1.0)
+        judgments_file = self._judgments_file_from_live_result(live_result)
+
+        # Owner and annotator2 disagree on "cal-999" (never judged at all --
+        # it isn't among run_a/run_b's items) -- an owner adjudication row
+        # resolves the disagreement so resolve_gold_labels still succeeds,
+        # while the raw disagreement still counts toward compute_iaa_ceiling.
+        extra_owner = make_label(
+            "cal-999", "a", "issue_summary", "pass",
+            annotator="owner", candidate_value="extra-value", label_id="lbl-extra-owner",
+        )
+        extra_other = make_label(
+            "cal-999", "a", "issue_summary", "fail",
+            annotator="annotator2", candidate_value="extra-value", label_id="lbl-extra-annotator2",
+        )
+        extra_adjudication = make_label(
+            "cal-999", "a", "issue_summary", "pass",
+            round_="adjudication", annotator="owner",
+            candidate_value="extra-value", label_id="lbl-extra-adjudication",
+        )
+
+        offline_result = calibrate.run_calibration_offline(
+            judgments=judgments_file,
+            labels=[*labels, extra_owner, extra_other, extra_adjudication],
+            label_file_hash="fixture-hash",
+            n_resamples=200,
+            seed=0,
         )
 
         assert offline_result.ceiling is not None
-        assert offline_result.ceiling.kappa == pytest.approx(1.0)
+        assert offline_result.ceiling.kappa < 1.0
 
 
 # --------------------------------------------------------------------------
 # `eval calibrate` CLI wiring (typer.testing.CliRunner). No live API calls:
 # candidate runs are pre-seeded via run_eval with fakes, the judge is a
 # scripted fake, and TraceContext is replaced with an always-traced fake
-# where a test needs `--retest`/happy-path behavior to proceed.
+# where a test needs happy-path behavior to proceed.
 # --------------------------------------------------------------------------
 
 CLI_DEFAULT_CONFIG_PATH = Path(__file__).parents[2] / "configs" / "default.yaml"
@@ -1942,9 +2112,16 @@ def _happy_path_candidate_value(item_id: str, candidate: str, field: str) -> str
 
 
 def _happy_path_labels(item_ids: list[str]) -> list[CalibrationLabel]:
-    """Owner labels matching ``_CalibrationCandidateClient``'s output exactly
-    -- perfect agreement -- with one "fail" per candidate (so neither
-    candidate's per-candidate subset collapses to a single category)."""
+    """Both annotators' labels matching ``_CalibrationCandidateClient``'s
+    output exactly -- perfect agreement, both between the annotators AND
+    against the judge -- with one "fail" per candidate (so neither
+    candidate's per-candidate subset collapses to a single category).
+
+    Dual-annotation upgrade (2026-07-09): ``"owner"`` and ``"annotator2"``
+    mirror each other exactly here, so gold always resolves via spontaneous
+    agreement (``n_adjudicated == 0``) and the certificate's human-human
+    ceiling comes out to 1.0 -- keeping every pre-upgrade CLI assertion about
+    judge-vs-gold agreement intact."""
 
     fail_pairs = {(item_ids[0], "a", "issue_summary"), (item_ids[1], "b", "requested_action")}
     labels: list[CalibrationLabel] = []
@@ -1952,15 +2129,18 @@ def _happy_path_labels(item_ids: list[str]) -> list[CalibrationLabel]:
         for candidate in ("a", "b"):
             for f in ("issue_summary", "requested_action"):
                 verdict = "fail" if (item_id, candidate, f) in fail_pairs else "pass"
-                labels.append(
-                    make_label(
-                        item_id,
-                        candidate,
-                        f,
-                        verdict,
-                        candidate_value=_happy_path_candidate_value(item_id, candidate, f),
+                value = _happy_path_candidate_value(item_id, candidate, f)
+                for annotator in ("owner", "annotator2"):
+                    labels.append(
+                        make_label(
+                            item_id,
+                            candidate,
+                            f,
+                            verdict,
+                            candidate_value=value,
+                            annotator=annotator,
+                        )
                     )
-                )
     return labels
 
 
@@ -2059,6 +2239,10 @@ class TestCalibrateCLIHappyPath:
 
         assert result.exit_code == 0, result.output
         assert "Judge Calibration Report" in result.output
+        # Dual annotation is automatic (no --retest flag needed): the ceiling
+        # section and its adjudication count appear in every report now.
+        assert "Human-Human Agreement Ceiling" in result.output
+        assert "Adjudicated disagreements: 0" in result.output
 
         cert_path = tmp_path / "data" / "calibration" / "certificate.json"
         assert cert_path.exists()
@@ -2066,6 +2250,9 @@ class TestCalibrateCLIHappyPath:
         assert certificate.verdict == "adequate"
         assert certificate.overall_kappa == pytest.approx(1.0)
         assert certificate.per_candidate_kappa_ci is not None
+        assert certificate.ceiling_kappa == pytest.approx(1.0)
+        assert certificate.ceiling_kappa_ci is not None
+        assert certificate.n_adjudicated == 0
         assert certificate.label_file_hash == hash_label_file(labels_path)
 
         # Finding F2: the live run must persist its judge output so a later
@@ -2118,40 +2305,42 @@ class TestCalibrateCLIHappyPath:
         certificate = Certificate.model_validate(json.loads(cert_path.read_text(encoding="utf-8")))
         assert certificate.date == date(2030, 1, 1)
 
-    def test_retest_flag_adds_ceiling_to_certificate(self, tmp_path, monkeypatch):
+    def test_disagreement_with_adjudication_reflected_in_certificate(self, tmp_path, monkeypatch):
+        """No flag required (dual annotation is automatic, 2026-07-09): one
+        annotator2 verdict is flipped to disagree with the owner, and an
+        owner adjudication row resolves it back -- the certificate discloses
+        exactly one adjudicated disagreement."""
+
         monkeypatch.chdir(tmp_path)
         item_ids = ["cal-001", "cal-002", "cal-003"]
         items = [_cli_item(i) for i in item_ids]
         emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
+
         labels = _happy_path_labels(item_ids)
-        # Retest labels must use same candidate_value as initial labels (output_sha256 binding).
-        retest_labels = [
-            make_label(
-                "cal-001",
-                "a",
-                "issue_summary",
-                "fail",
-                round_="retest",
-                candidate_value=_happy_path_candidate_value("cal-001", "a", "issue_summary"),
-            ),
-            make_label(
-                "cal-002",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="retest",
-                candidate_value=_happy_path_candidate_value("cal-002", "a", "issue_summary"),
-            ),
-            make_label(
-                "cal-003",
-                "a",
-                "issue_summary",
-                "pass",
-                round_="retest",
-                candidate_value=_happy_path_candidate_value("cal-003", "a", "issue_summary"),
-            ),
+        target_item, target_candidate, target_field = "cal-003", "a", "issue_summary"
+        target_value = _happy_path_candidate_value(target_item, target_candidate, target_field)
+        modified_labels = [
+            label.model_copy(update={"verdict": "fail"})
+            if (
+                label.item_id == target_item
+                and label.candidate == target_candidate
+                and label.field == target_field
+                and label.annotator == "annotator2"
+            )
+            else label
+            for label in labels
         ]
-        labels_path = _write_labels(tmp_path / "labels.jsonl", labels + retest_labels)
+        adjudication = make_label(
+            target_item,
+            target_candidate,
+            target_field,
+            "pass",
+            round_="adjudication",
+            annotator="owner",
+            candidate_value=target_value,
+            label_id="lbl-cal-003-a-issue_summary-adjudication",
+        )
+        labels_path = _write_labels(tmp_path / "labels.jsonl", [*modified_labels, adjudication])
         config_path = _write_calibrate_config(tmp_path / "config.yaml", k=1)
 
         cfg = load_config(config_path)
@@ -2170,7 +2359,6 @@ class TestCalibrateCLIHappyPath:
             app,
             [
                 "calibrate",
-                "--retest",
                 "--emails",
                 str(emails_path),
                 "--labels",
@@ -2181,10 +2369,62 @@ class TestCalibrateCLIHappyPath:
         )
 
         assert result.exit_code == 0, result.output
-        assert "an estimate of the consistency ceiling" in result.output
+        assert "the human-human agreement ceiling" in result.output
+        assert "Adjudicated disagreements: 1" in result.output
         cert_path = tmp_path / "data" / "calibration" / "certificate.json"
         certificate = Certificate.model_validate(json.loads(cert_path.read_text(encoding="utf-8")))
         assert certificate.ceiling_kappa is not None
+        assert certificate.n_adjudicated == 1
+
+
+class TestCalibrateCLIIncompleteSecondAnnotator:
+    def test_missing_second_annotator_labels_gives_clean_exit_one(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        item_ids = ["cal-001", "cal-002", "cal-003"]
+        items = [_cli_item(i) for i in item_ids]
+        emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
+
+        full_labels = _happy_path_labels(item_ids)
+        dropped_key = (item_ids[0], "a", "issue_summary")
+        incomplete_labels = [
+            label
+            for label in full_labels
+            if not (
+                label.annotator == "annotator2"
+                and (label.item_id, label.candidate, label.field) == dropped_key
+            )
+        ]
+        labels_path = _write_labels(tmp_path / "labels.jsonl", incomplete_labels)
+        config_path = _write_calibrate_config(tmp_path / "config.yaml", k=1)
+
+        cfg = load_config(config_path)
+        effective_cfg, calib_items = cli._resolve_calibration_dataset(cfg, emails_path)
+        _seed_calibration_runs(effective_cfg, calib_items)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        monkeypatch.setattr(
+            cli,
+            "_build_model_key",
+            lambda label, config: (_ for _ in ()).throw(AssertionError("must reuse")),
+        )
+        monkeypatch.setattr(cli, "_build_judge_client", lambda config: _happy_path_judge_client())
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(emails_path),
+                "--labels",
+                str(labels_path),
+                "--config",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "second annotator labels incomplete" in result.output.lower()
 
 
 class TestCalibrateCLILiveOutputBinding:
@@ -2403,6 +2643,8 @@ class TestCalibrateCLIOffline:
         assert offline_certificate.judge_version == live_certificate.judge_version
         assert offline_certificate.label_file_hash == live_certificate.label_file_hash
         assert offline_certificate.ceiling_kappa == live_certificate.ceiling_kappa
+        assert offline_certificate.ceiling_kappa_ci == live_certificate.ceiling_kappa_ci
+        assert offline_certificate.n_adjudicated == live_certificate.n_adjudicated
 
         assert (
             offline_certificate.per_candidate_kappa.keys()

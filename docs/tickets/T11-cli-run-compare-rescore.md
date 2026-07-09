@@ -36,7 +36,7 @@ Wire the Typer CLI's three Phase-A commands — `run`, `compare`, `rescore` — 
 
 ## Notes
 - All Global constraints from plan.md apply (referenced, not restated).
-- `eval gate [--update-baseline|--seed-regression]` is wired in T16; `eval calibrate [--retest]` is wired in T14 — the "calibrate fails fast without Langfuse keys" anchor is added there (plan T11 note), not here. Do not stub these commands with fake behavior.
+- `eval gate [--update-baseline|--seed-regression]` is wired in T16; `eval calibrate` is wired in T14 (dual annotation is automatic, no flag — D2 amendment 2026-07-09) — the "calibrate fails fast without Langfuse keys" anchor is added there (plan T11 note), not here. Do not stub these commands with fake behavior.
 - Dev-path (`--dataset`) runs are non-reportable: they may run keyless/untraced (spec §8) but can never feed baselines or the README. Golden-set runs invoked without keys follow the T09 `TraceContext` contract for their `reportable` flag.
 - `rescore` recomputes all scores/statistics/reports from persisted raw outputs with zero API calls (spec §9) — this is the spec AC5 recomputation path; keep report rendering entirely inside T10's renderers so `rescore` output is byte-stable.
 - `compare` behavior per spec §6: reuses existing run artifacts when fingerprints match; re-runs otherwise; report shows absolute scores alongside deltas (rendering is T10's contract).

@@ -53,12 +53,33 @@ data always selects the same 20 -- are each judged 3x; the flip rate (the
 fraction of the 20 for which the 3 judgments disagree) is reported and
 carried into the certificate context.
 
-**Test-retest ceiling (spec §5, ``--retest``):** intra-annotator kappa on the
-label-id intersection of ``round="initial"`` and ``round="retest"`` labels,
-with its own cluster-bootstrap CI, surfaced as ``ceiling_kappa`` on the
-certificate and explicitly labeled *an estimate of the consistency ceiling*
-in the rendered report -- a judge kappa exceeding it is estimation noise, not
-a super-human judge (never treated as a red flag).
+**Dual-annotation IAA ceiling and gold resolution (owner-approved upgrade,
+2026-07-09 -- replaces single-annotator test-retest, constitution §6 D2):**
+BOTH annotators (``"owner"``, the primary annotator, plus a second,
+independent annotator identified by whatever other ``annotator`` string
+appears) independently label ALL ``round="initial"`` field judgments from
+their own hash-bound labeling sheet (``labeling_template_rows``, per
+annotator) -- neither sees the other's verdicts.
+``_verify_dual_annotator_coverage`` is the shared precondition both
+downstream functions build on: exactly two annotators, one of them
+``OWNER_ANNOTATOR``, labeling the EXACT same set of ``(item_id, candidate,
+field)`` keys (no partial-intersection tolerance -- an incomplete second
+annotator undermines the whole premise) with matching ``output_sha256`` per
+shared key (``CalibrationBindingError`` otherwise, the retest-binding
+precedent extended to two annotators). ``compute_iaa_ceiling`` computes
+Cohen's kappa between the two annotators' verdicts over that doubly-labeled
+set, with its own cluster-bootstrap CI -- *the human-human agreement
+ceiling*, surfaced as ``ceiling_kappa``/``ceiling_kappa_ci`` on the
+certificate; the decision semantics are unchanged from the retired ceiling: a
+judge kappa exceeding it is estimation noise, not a super-human judge.
+``resolve_gold_labels`` derives the FINAL gold verdict per key -- the
+owner's verdict where the two annotators agree, or the OWNER's adjudication
+verdict (``round="adjudication"``, ``annotator="owner"``) where they
+disagree, raising loudly (``DualAnnotationError``) and naming every key if a
+disagreement has no adjudication row. Judge agreement/kappa is computed
+against this resolved gold, never against either annotator's raw label
+directly. ``Certificate.n_adjudicated`` discloses how many gold labels came
+from adjudication rather than spontaneous agreement.
 
 **Bootstrap omission disclosure (D2/agreement.py):** ``cohens_kappa``'s CI
 path may emit exactly one ``RuntimeWarning`` disclosing how many degenerate
@@ -79,19 +100,22 @@ labels (any round) unless an explicit override is supplied -- never
 wall-clock-dependent, so tests and re-runs against the same label file always
 produce the same certificate date.
 
-**Label-to-output binding (finding F1):** a label only names a triple by
-``(item_id, candidate, field)`` -- it says nothing about WHICH candidate
-output was labeled. Since candidate runs are not guaranteed deterministic
-(temp>0) and ``results/`` is gitignored (a run directory can be regenerated
-at any time), that key alone can silently rebind a label to a DIFFERENT
-candidate output than the one an owner actually looked at. Every
-``CalibrationLabel`` therefore carries ``output_sha256`` -- the sha256 of the
-exact ``candidate_value`` string labeled (``hash_output``) -- and
-``pair_with_labels``/``pair_judgments_with_labels`` verify it against the
-live/persisted candidate output before any pairing happens, all-or-nothing
-(``CalibrationBindingError`` on any mismatch, naming every offending key --
-never a silent partial exclusion, which would hide exactly the kind of
-corruption this check exists to catch).
+**Label-to-output binding (finding F1, extended to every annotator/round by
+the dual-annotation upgrade):** a label only names a triple by ``(item_id,
+candidate, field)`` -- it says nothing about WHICH candidate output was
+labeled. Since candidate runs are not guaranteed deterministic (temp>0) and
+``results/`` is gitignored (a run directory can be regenerated at any time),
+that key alone can silently rebind a label to a DIFFERENT candidate output
+than the one an annotator actually looked at. Every ``CalibrationLabel``
+therefore carries ``output_sha256`` -- the sha256 of the exact
+``candidate_value`` string labeled (``hash_output``) -- checked at three
+points, all all-or-nothing and all naming every offending key: between the
+two annotators' ``"initial"`` rows and against any ``"adjudication"`` row
+(``_verify_dual_annotator_coverage``/``resolve_gold_labels``), and again
+between the resolved GOLD label and the live/persisted candidate output
+actually being judged now (``pair_with_labels``/``pair_judgments_with_
+labels``) -- never a silent partial exclusion, which would hide exactly the
+kind of corruption this check exists to catch.
 
 **Zero-API recomputability (finding F2):** a live run persists every judge
 call it makes -- one row per judged triple plus every self-consistency
@@ -130,6 +154,11 @@ from harness.runner import RunArtifact
 from harness.schema import CalibrationLabel, Certificate, EmailInput, GoldenItem
 from harness.scoring.composite import JUDGED_FIELDS
 from harness.stats.agreement import KappaResult, cohens_kappa
+
+# Dual-annotation upgrade (owner, 2026-07-09): the primary annotator, who
+# also adjudicates every disagreement. The second annotator is whatever other
+# ``annotator`` string appears in round="initial" labels (free string, spec §5).
+OWNER_ANNOTATOR = "owner"
 
 # Spec §5 pinned parameters -- changing these needs a dated decision-log amendment.
 ADEQUACY_KAPPA_THRESHOLD = 0.6
@@ -288,42 +317,263 @@ class CalibrationBindingError(Exception):
         self.mismatches = tuple(mismatches)
 
 
-def _labels_by_full_key(
-    labels: Sequence[CalibrationLabel], round_: Literal["initial", "retest"]
+class DualAnnotationError(Exception):
+    """Raised when ``labels`` does not satisfy the dual-annotation design's
+    core precondition (owner-approved upgrade, 2026-07-09, constitution §6
+    D2): exactly two annotators with ``round="initial"`` labels, one of them
+    ``OWNER_ANNOTATOR``, both covering the EXACT same set of ``(item_id,
+    candidate, field)`` keys, and -- for ``resolve_gold_labels`` -- every
+    disagreement between them backed by an owner adjudication row. Never
+    partially resolved: every message names every offending key so the
+    labels file can be fixed directly, mirroring ``CalibrationBindingError``'s
+    all-or-nothing precedent. The CLI maps this to a clean exit 1
+    (``_clean_exit_on_expected_errors``), never a traceback."""
+
+
+def _initial_labels_by_annotator(
+    labels: Sequence[CalibrationLabel],
+) -> dict[str, dict[tuple[str, str, str], CalibrationLabel]]:
+    """``{annotator: {(item_id, candidate, field): CalibrationLabel}}`` over
+    every ``round="initial"`` label. Raises ``ValueError`` on a duplicate key
+    within one annotator's own rows -- a data integrity problem (two labels
+    from the same annotator for the same judged field), never silently
+    resolved by picking one."""
+
+    by_annotator: dict[str, dict[tuple[str, str, str], CalibrationLabel]] = {}
+    for label in labels:
+        if label.round != "initial":
+            continue
+        by_key = by_annotator.setdefault(label.annotator, {})
+        key = (label.item_id, label.candidate, label.field)
+        if key in by_key:
+            raise ValueError(
+                f"duplicate 'initial' label from annotator {label.annotator!r} for {key} "
+                "in labels.jsonl"
+            )
+        by_key[key] = label
+    return by_annotator
+
+
+def _labels_by_annotator_round(
+    labels: Sequence[CalibrationLabel], annotator: str, round_: Literal["initial", "adjudication"]
 ) -> dict[tuple[str, str, str], CalibrationLabel]:
-    """``{(item_id, candidate, field): CalibrationLabel}`` for one label
-    round. Raises ``ValueError`` on a duplicate key within the same round --
-    a data integrity problem (two labels for the same judged field), never
-    silently resolved by picking one."""
+    """``{(item_id, candidate, field): CalibrationLabel}`` for one
+    ``(annotator, round_)`` pair. Raises ``ValueError`` on a duplicate key --
+    same data-integrity convention as ``_initial_labels_by_annotator``."""
 
     by_key: dict[tuple[str, str, str], CalibrationLabel] = {}
     for label in labels:
-        if label.round != round_:
+        if label.round != round_ or label.annotator != annotator:
             continue
         key = (label.item_id, label.candidate, label.field)
         if key in by_key:
-            raise ValueError(f"duplicate {round_!r} label for {key} in labels.jsonl")
+            raise ValueError(
+                f"duplicate {round_!r} label from annotator {annotator!r} for {key} in "
+                "labels.jsonl"
+            )
         by_key[key] = label
     return by_key
 
 
-def _labels_by_key(
-    labels: Sequence[CalibrationLabel], round_: Literal["initial", "retest"]
-) -> dict[tuple[str, str, str], Literal["pass", "fail"]]:
-    """``{(item_id, candidate, field): verdict}`` for one label round --
-    thin wrapper over ``_labels_by_full_key`` for callers that only need the
-    verdict, not the full label. ``compute_retest_ceiling`` uses this to
-    compare verdicts but also performs a separate output-binding check
-    (``_verify_retest_binding``) to ensure both rounds labeled the same
-    candidate output for each shared key."""
+@dataclass(frozen=True)
+class DualAnnotatorCoverage:
+    """The verified precondition both ``compute_iaa_ceiling`` and
+    ``resolve_gold_labels`` build on -- see ``_verify_dual_annotator_coverage``."""
 
-    return {key: label.verdict for key, label in _labels_by_full_key(labels, round_).items()}
+    owner: str
+    other: str
+    owner_by_key: dict[tuple[str, str, str], CalibrationLabel]
+    other_by_key: dict[tuple[str, str, str], CalibrationLabel]
+    shared_keys: tuple[tuple[str, str, str], ...]
+
+
+def _verify_dual_annotator_coverage(
+    labels: Sequence[CalibrationLabel], *, owner_annotator: str = OWNER_ANNOTATOR
+) -> DualAnnotatorCoverage:
+    """Verifies the dual-annotation design's core precondition (owner-
+    approved 2026-07-09): exactly two annotators labeled ``round="initial"``,
+    one of them ``owner_annotator``, and BOTH annotators labeled the exact
+    same set of keys (complete coverage -- no partial-intersection tolerance,
+    unlike the retired test-retest ceiling's ``>=2``-shared-keys allowance)
+    with matching ``output_sha256`` per shared key. Feeds both
+    ``compute_iaa_ceiling`` and ``resolve_gold_labels`` so the two can never
+    disagree about what "complete, correctly-bound dual coverage" means.
+
+    Raises ``DualAnnotationError`` (wrong annotator count/identity, or
+    incomplete coverage -- message format: "second annotator labels
+    incomplete: N keys missing") or ``CalibrationBindingError``
+    (``output_sha256`` mismatch between the two annotators for a shared key).
+    """
+
+    by_annotator = _initial_labels_by_annotator(labels)
+    annotators = sorted(by_annotator)
+    if len(annotators) != 2:
+        raise DualAnnotationError(
+            "dual-annotation calibration requires exactly 2 annotators with round='initial' "
+            f"labels; found {len(annotators)}: {annotators}"
+        )
+    if owner_annotator not in annotators:
+        raise DualAnnotationError(
+            f"dual-annotation calibration requires the owner annotator {owner_annotator!r} "
+            f"among round='initial' labels; found only {annotators}"
+        )
+    other = next(a for a in annotators if a != owner_annotator)
+    owner_by_key = by_annotator[owner_annotator]
+    other_by_key = by_annotator[other]
+
+    missing_from_other = sorted(set(owner_by_key) - set(other_by_key))
+    missing_from_owner = sorted(set(other_by_key) - set(owner_by_key))
+    if missing_from_other or missing_from_owner:
+        n_missing = len(missing_from_other) + len(missing_from_owner)
+        raise DualAnnotationError(
+            f"second annotator labels incomplete: {n_missing} key(s) missing -- "
+            f"{len(missing_from_other)} key(s) labeled by {owner_annotator!r} but not by "
+            f"{other!r} ({missing_from_other}); {len(missing_from_owner)} key(s) labeled by "
+            f"{other!r} but not by {owner_annotator!r} ({missing_from_owner})"
+        )
+
+    shared_keys = tuple(sorted(owner_by_key))
+    mismatches = [
+        key
+        for key in shared_keys
+        if owner_by_key[key].output_sha256 != other_by_key[key].output_sha256
+    ]
+    if mismatches:
+        raise CalibrationBindingError(mismatches)
+
+    return DualAnnotatorCoverage(
+        owner=owner_annotator,
+        other=other,
+        owner_by_key=owner_by_key,
+        other_by_key=other_by_key,
+        shared_keys=shared_keys,
+    )
+
+
+def compute_iaa_ceiling(
+    labels: Sequence[CalibrationLabel],
+    *,
+    ci_level: float = DEFAULT_CI_LEVEL,
+    n_resamples: int = DEFAULT_N_RESAMPLES,
+    seed: int = 0,
+) -> tuple[KappaResult, tuple[str, ...]]:
+    """Cohen's kappa between the two annotators' verdicts over the doubly-
+    labeled calibration set -- *the human-human agreement ceiling* that
+    replaces the retired test-retest ceiling (owner-approved dual-annotation
+    upgrade, 2026-07-09, constitution §6 D2): a judge kappa exceeding this
+    value indicates estimation noise, not a super-human judge (unchanged
+    semantics, new ceiling source). Coverage must be COMPLETE
+    (``_verify_dual_annotator_coverage``) -- there is no partial-intersection
+    tolerance the way the old ceiling had, because an incomplete second
+    annotator undermines the ceiling's whole premise.
+    """
+
+    coverage = _verify_dual_annotator_coverage(labels)
+    a = [coverage.owner_by_key[k].verdict for k in coverage.shared_keys]
+    b = [coverage.other_by_key[k].verdict for k in coverage.shared_keys]
+    clusters = [k[0] for k in coverage.shared_keys]  # item_id (email)
+    result, messages = _kappa_with_capture(
+        a, b, clusters, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+    )
+    return result, tuple(messages)
+
+
+@dataclass(frozen=True)
+class GoldLabel:
+    """One resolved gold verdict (owner-approved dual-annotation upgrade,
+    2026-07-09, ``resolve_gold_labels``): the owner's verdict when both
+    annotators agree, or the OWNER's adjudication verdict when they disagree.
+    ``source`` records which case produced it -- summed into ``Certificate.
+    n_adjudicated`` (honest disclosure of how much of the gold set required a
+    tie-break)."""
+
+    item_id: str
+    candidate: Literal["a", "b"]
+    field: str
+    verdict: Literal["pass", "fail"]
+    critique: str
+    output_sha256: str
+    source: Literal["agreement", "adjudication"]
+
+
+def resolve_gold_labels(labels: Sequence[CalibrationLabel]) -> list[GoldLabel]:
+    """Final gold labels for judge-agreement measurement (owner-approved
+    dual-annotation upgrade, 2026-07-09): the owner's verdict where the two
+    annotators' ``round="initial"`` labels agree, the OWNER's adjudication
+    verdict (``round="adjudication"``, ``annotator="owner"``) where they
+    disagree. Requires the same complete, correctly-bound dual coverage as
+    ``compute_iaa_ceiling`` (``_verify_dual_annotator_coverage``) -- gold can
+    never be resolved from an incomplete or unbound label set.
+
+    Every disagreement without a matching adjudication row is a loud
+    ``DualAnnotationError`` naming every unadjudicated key -- gold is never
+    partially resolved. An adjudication row whose ``output_sha256`` disagrees
+    with the annotators' (the same binding check, extended to the
+    adjudication round) raises ``CalibrationBindingError`` before any gold is
+    resolved, all-or-nothing.
+    """
+
+    coverage = _verify_dual_annotator_coverage(labels)
+    adjudication_by_key = _labels_by_annotator_round(labels, coverage.owner, "adjudication")
+
+    adjudication_mismatches = [
+        key
+        for key in coverage.shared_keys
+        if (adjudication := adjudication_by_key.get(key)) is not None
+        and adjudication.output_sha256 != coverage.owner_by_key[key].output_sha256
+    ]
+    if adjudication_mismatches:
+        raise CalibrationBindingError(adjudication_mismatches)
+
+    gold: list[GoldLabel] = []
+    unadjudicated: list[tuple[str, str, str]] = []
+    for key in coverage.shared_keys:
+        owner_label = coverage.owner_by_key[key]
+        other_label = coverage.other_by_key[key]
+        if owner_label.verdict == other_label.verdict:
+            gold.append(
+                GoldLabel(
+                    item_id=key[0],
+                    candidate=key[1],
+                    field=key[2],
+                    verdict=owner_label.verdict,
+                    critique=owner_label.critique,
+                    output_sha256=owner_label.output_sha256,
+                    source="agreement",
+                )
+            )
+            continue
+        adjudication = adjudication_by_key.get(key)
+        if adjudication is None:
+            unadjudicated.append(key)
+            continue
+        gold.append(
+            GoldLabel(
+                item_id=key[0],
+                candidate=key[1],
+                field=key[2],
+                verdict=adjudication.verdict,
+                critique=adjudication.critique,
+                output_sha256=adjudication.output_sha256,
+                source="adjudication",
+            )
+        )
+    if unadjudicated:
+        raise DualAnnotationError(
+            f"{len(unadjudicated)} disagreement(s) between {coverage.owner!r} and "
+            f"{coverage.other!r} have no adjudication row (round='adjudication', annotator="
+            f"{coverage.owner!r}): {sorted(unadjudicated)}"
+        )
+    return gold
 
 
 @dataclass(frozen=True)
 class PairedJudgment:
-    """One (owner label, judge verdict) pair -- both determinate -- ready to
-    feed ``cohens_kappa``."""
+    """One (gold label, judge verdict) pair -- both determinate -- ready to
+    feed ``cohens_kappa``. ``owner_verdict`` is the resolved GOLD verdict
+    (``resolve_gold_labels``): always owner-sourced, whether directly (the
+    two annotators agreed) or via the owner's adjudication -- the field name
+    predates the dual-annotation upgrade and remains accurate under it."""
 
     item_id: str
     candidate: Literal["a", "b"]
@@ -331,10 +581,24 @@ class PairedJudgment:
     judge_verdict: Literal["pass", "fail"]
 
 
+def _gold_by_key(gold: Sequence[GoldLabel]) -> dict[tuple[str, str, str], GoldLabel]:
+    """``{(item_id, candidate, field): GoldLabel}``. Raises ``ValueError`` on
+    a duplicate key -- ``resolve_gold_labels`` never produces one itself (one
+    entry per shared key), so a duplicate here means a caller assembled
+    ``gold`` by hand incorrectly."""
+
+    by_key: dict[tuple[str, str, str], GoldLabel] = {}
+    for g in gold:
+        key = (g.item_id, g.candidate, g.field)
+        if key in by_key:
+            raise ValueError(f"duplicate gold label for {key}")
+        by_key[key] = g
+    return by_key
+
+
 def _pair_entries(
     entries: Sequence[tuple[tuple[str, str, str], Literal["pass", "fail"] | None, str]],
-    labels: Sequence[CalibrationLabel],
-    round_: Literal["initial", "retest"],
+    gold: Sequence[GoldLabel],
 ) -> tuple[list[PairedJudgment], int, int]:
     """Shared pairing/binding-check core for ``pair_with_labels`` (live,
     entries carry a freshly-recomputed ``hash_output``) and
@@ -343,16 +607,16 @@ def _pair_entries(
     per judged item, in judged order.
 
     The binding check runs to completion over every entry with a matching
-    label BEFORE any pairing happens (all-or-nothing, module docstring): on
-    any ``CalibrationBindingError``, nothing is paired at all.
+    gold label BEFORE any pairing happens (all-or-nothing, module docstring):
+    on any ``CalibrationBindingError``, nothing is paired at all.
     """
 
-    by_label = _labels_by_full_key(labels, round_)
+    by_gold = _gold_by_key(gold)
 
     mismatches = [
         key
         for key, _verdict, output_hash in entries
-        if (label := by_label.get(key)) is not None and label.output_sha256 != output_hash
+        if (g := by_gold.get(key)) is not None and g.output_sha256 != output_hash
     ]
     if mismatches:
         raise CalibrationBindingError(mismatches)
@@ -361,8 +625,8 @@ def _pair_entries(
     judge_errors = 0
     unlabeled = 0
     for key, verdict, _output_hash in entries:
-        label = by_label.get(key)
-        if label is None:
+        g = by_gold.get(key)
+        if g is None:
             unlabeled += 1
             continue
         if verdict is None:
@@ -370,29 +634,26 @@ def _pair_entries(
             continue
         paired.append(
             PairedJudgment(
-                item_id=key[0], candidate=key[1], owner_verdict=label.verdict, judge_verdict=verdict
+                item_id=key[0], candidate=key[1], owner_verdict=g.verdict, judge_verdict=verdict
             )
         )
     return paired, judge_errors, unlabeled
 
 
 def pair_with_labels(
-    judged: Sequence[JudgedTriple],
-    labels: Sequence[CalibrationLabel],
-    *,
-    round_: Literal["initial", "retest"] = "initial",
+    judged: Sequence[JudgedTriple], gold: Sequence[GoldLabel]
 ) -> tuple[list[PairedJudgment], int, int]:
-    """Joins judged triples to owner labels for ``round_``.
+    """Joins judged triples to resolved GOLD labels (``resolve_gold_labels``).
 
     Returns ``(paired, judge_errors_excluded, unlabeled_excluded)``: a judge
     error (``verdict is None``) is excluded, never coerced to ``"fail"``
-    (spec §7); a judged triple with no matching label is excluded and counted
-    separately (e.g. a stratification-loop addition not yet labeled). Both
-    exclusion counts are disclosed in the report rather than silently
-    dropped.
+    (spec §7); a judged triple with no matching gold label is excluded and
+    counted separately (e.g. a stratification-loop addition not yet
+    labeled). Both exclusion counts are disclosed in the report rather than
+    silently dropped.
 
     **Output-binding check (finding F1):** before any of the above, every
-    label whose key matches a judged triple has its ``output_sha256``
+    gold label whose key matches a judged triple has its ``output_sha256``
     checked against ``hash_output`` of that triple's LIVE ``candidate_value``
     -- see ``CalibrationBindingError``/module docstring for why, and why a
     mismatch raises rather than silently excludes.
@@ -406,28 +667,33 @@ def pair_with_labels(
         )
         for jt in judged
     ]
-    return _pair_entries(entries, labels, round_)
+    return _pair_entries(entries, gold)
 
 
-def labeling_template_rows(triples: Sequence[Triple]) -> list[dict]:
-    """Prefilled labeling-material rows for a future labeling-material
-    generator (finding F1): one dict per triple with ``item_id``/
-    ``candidate``/``field``/``candidate_value`` already filled in from
-    ``triples``, plus a correctly computed ``output_sha256`` (``hash_output``)
-    and empty ``verdict``/``critique`` placeholders for the owner to fill in
-    by hand.
+def labeling_template_rows(triples: Sequence[Triple], annotator: str) -> list[dict]:
+    """Prefilled labeling-material rows for one annotator's hash-bound
+    labeling sheet (dual-annotation upgrade, 2026-07-09): one dict per triple
+    with ``item_id``/``candidate``/``field``/``annotator``/``candidate_value``
+    already filled in from ``triples``, plus a correctly computed
+    ``output_sha256`` (``hash_output``) and empty ``verdict``/``critique``
+    placeholders for that annotator to fill in by hand.
+
+    Called once per annotator (same ``triples``, different ``annotator``) to
+    produce each annotator's OWN sheet -- neither annotator's sheet carries
+    the other's verdict column, since both are born blank; the sheets differ
+    only in the ``annotator`` value stamped into every row.
 
     Exists so labeling artifacts are born correctly bound to the exact
-    candidate output the owner is looking at, rather than requiring a human
-    (or some future generator) to hand-compute or copy-paste a hash that can
-    silently drift from the value actually shown -- the row IS the hash's
-    only input, computed here, once, from the same ``Triple`` the row
+    candidate output the annotator is looking at, rather than requiring a
+    human (or some future generator) to hand-compute or copy-paste a hash
+    that can silently drift from the value actually shown -- the row IS the
+    hash's only input, computed here, once, from the same ``Triple`` the row
     displays.
 
     Each returned dict is shaped to become one ``CalibrationLabel`` once the
-    owner fills in ``verdict``/``critique`` (and ``label_id``/``label_date``/
-    ``round``, which this function -- having no labeling session of its own
-    -- does not know yet).
+    annotator fills in ``verdict``/``critique`` (and ``label_id``/
+    ``label_date``/``round``, which this function -- having no labeling
+    session of its own -- does not know yet).
     """
 
     return [
@@ -435,6 +701,7 @@ def labeling_template_rows(triples: Sequence[Triple]) -> list[dict]:
             "item_id": t.item_id,
             "candidate": t.candidate,
             "field": t.field,
+            "annotator": annotator,
             "candidate_value": t.candidate_value,
             "output_sha256": hash_output(t.candidate_value),
             "verdict": "",
@@ -659,73 +926,6 @@ def _self_consistency_from_records(
 
 
 # --------------------------------------------------------------------------
-# Test-retest ceiling (spec §5, --retest).
-# --------------------------------------------------------------------------
-
-
-def _verify_retest_binding(
-    labels: Sequence[CalibrationLabel],
-    shared_keys: Sequence[tuple[str, str, str]],
-) -> None:
-    """Verifies that for every shared key between initial and retest rounds,
-    the output_sha256 values match. Raises CalibrationBindingError if any
-    mismatches are found.
-    """
-    initial_by_key = _labels_by_full_key(labels, "initial")
-    retest_by_key = _labels_by_full_key(labels, "retest")
-
-    mismatches = []
-    for key in shared_keys:
-        if key in initial_by_key and key in retest_by_key:
-            if (
-                initial_by_key[key].output_sha256
-                != retest_by_key[key].output_sha256
-            ):
-                mismatches.append(key)
-
-    if mismatches:
-        raise CalibrationBindingError(mismatches)
-
-
-def compute_retest_ceiling(
-    labels: Sequence[CalibrationLabel],
-    *,
-    ci_level: float = DEFAULT_CI_LEVEL,
-    n_resamples: int = DEFAULT_N_RESAMPLES,
-    seed: int = 0,
-) -> tuple[KappaResult | None, tuple[str, ...]]:
-    """Intra-annotator Cohen's kappa (with its own cluster-bootstrap CI) on
-    the ``(item_id, candidate, field)`` intersection of ``round="initial"``
-    and ``round="retest"`` labels -- spec §5's "estimate of the consistency
-    ceiling". Returns ``(None, ())`` if fewer than 2 keys are shared (no
-    meaningful ceiling to compute; e.g. no retest labels at all).
-
-    Verifies that for every shared key, the initial and retest labels were
-    made against the SAME candidate output (output_sha256 match). If any
-    output binding mismatch is found, raises CalibrationBindingError all-or-
-    nothing (no partial ceiling computed).
-    """
-
-    initial = _labels_by_key(labels, "initial")
-    retest = _labels_by_key(labels, "retest")
-    shared_keys = sorted(set(initial) & set(retest))
-    if len(shared_keys) < 2:
-        return None, ()
-
-    # Verify output binding: for every shared key, initial and retest labels
-    # must be of the same candidate output (output_sha256 match).
-    _verify_retest_binding(labels, shared_keys)
-
-    a = [initial[key] for key in shared_keys]
-    b = [retest[key] for key in shared_keys]
-    clusters = [key[0] for key in shared_keys]  # item_id (email)
-    result, messages = _kappa_with_capture(
-        a, b, clusters, ci_level=ci_level, n_resamples=n_resamples, seed=seed
-    )
-    return result, tuple(messages)
-
-
-# --------------------------------------------------------------------------
 # Disjointness from the golden set (spec §5 AC).
 # --------------------------------------------------------------------------
 
@@ -771,6 +971,11 @@ class CalibrationResult:
     recompute without spending any API calls. ``run_calibration_offline``
     leaves them at their default ``()``: it already consumed a PERSISTED
     copy of this same data and does not reproduce it a second time.
+
+    ``n_adjudicated`` (dual-annotation upgrade, 2026-07-09): count of gold
+    labels resolved via owner adjudication rather than spontaneous agreement
+    between the two annotators -- honest disclosure, surfaced verbatim on
+    ``Certificate.n_adjudicated``.
     """
 
     judge_version: str
@@ -789,6 +994,7 @@ class CalibrationResult:
     warnings: tuple[str, ...]
     judged_triples: tuple[JudgedTriple, ...] = ()
     self_consistency_records: tuple[SelfConsistencyRecord, ...] = ()
+    n_adjudicated: int = 0
 
 
 def run_calibration(
@@ -804,19 +1010,25 @@ def run_calibration(
     ci_level: float = DEFAULT_CI_LEVEL,
     n_resamples: int = DEFAULT_N_RESAMPLES,
     seed: int = 0,
-    retest: bool = False,
 ) -> CalibrationResult:
-    """The full judge-calibration measurement (spec §5, §4): reconstructs
-    triples from both candidates' persisted calibration runs, re-judges them
-    with the current judge, computes overall/per-candidate agreement against
-    owner labels, the adequacy verdict, the per-candidate divergence flag,
-    the stratification fail-rate note, judge self-consistency, and (when
-    ``retest``) the test-retest consistency ceiling.
+    """The full judge-calibration measurement (spec §5, §4, dual-annotation
+    upgrade 2026-07-09): reconstructs triples from both candidates'
+    persisted calibration runs, re-judges them with the current judge,
+    resolves the FINAL gold labels from the two annotators' labels
+    (``resolve_gold_labels`` -- owner adjudication wins every disagreement),
+    computes overall/per-candidate judge agreement against that gold, the
+    adequacy verdict, the per-candidate divergence flag, the stratification
+    fail-rate note, judge self-consistency, and the human-human agreement
+    (IAA) ceiling (``compute_iaa_ceiling``) -- both gold resolution and the
+    ceiling are computed unconditionally now (no opt-in flag): the retired
+    single-annotator design's degraded, ceiling-less mode no longer exists.
 
-    Raises ``ValueError`` if no judged triple has a matching ``round="initial"``
-    label at all -- there is nothing to compute agreement on, which signals a
-    wiring problem (mismatched dataset/label files) rather than a real
-    calibration outcome to report on.
+    Raises ``DualAnnotationError``/``CalibrationBindingError`` (via
+    ``resolve_gold_labels``/``compute_iaa_ceiling``) if the two annotators'
+    labels do not satisfy the dual-annotation precondition, or ``ValueError``
+    if no judged triple has a matching gold label at all -- there is nothing
+    to compute agreement on, which signals a wiring problem (mismatched
+    dataset/label files) rather than a real calibration outcome to report on.
     """
 
     triples_a = build_triples("a", run_a)
@@ -824,12 +1036,14 @@ def run_calibration(
     all_triples = triples_a + triples_b
 
     judged = judge_triples(judge, all_triples)
-    paired, judge_errors_excluded, unlabeled_excluded = pair_with_labels(
-        judged, labels, round_="initial"
-    )
+
+    gold = resolve_gold_labels(labels)
+    n_adjudicated = sum(1 for g in gold if g.source == "adjudication")
+
+    paired, judge_errors_excluded, unlabeled_excluded = pair_with_labels(judged, gold)
     if not paired:
         raise ValueError(
-            "no labeled triple matched a judged calibration output -- check that "
+            "no gold label matched a judged calibration output -- check that "
             "labels.jsonl and the calibration runs describe the same items"
         )
 
@@ -841,9 +1055,15 @@ def run_calibration(
         {label: result.kappa for label, result in per_candidate.items()}
     )
 
-    initial_labels = [label for label in labels if label.round == "initial"]
-    fail_count = sum(1 for label in initial_labels if label.verdict == "fail")
-    initial_fail_rate = fail_count / len(initial_labels) if initial_labels else 0.0
+    # Stratification fail-rate is measured on the OWNER's own initial labels
+    # specifically (not both annotators' combined rows, which would double
+    # count) -- the owner is the primary annotator who drives the
+    # stratification loop (spec §5), unchanged by the dual-annotation upgrade.
+    owner_initial_labels = [
+        label for label in labels if label.round == "initial" and label.annotator == OWNER_ANNOTATOR
+    ]
+    fail_count = sum(1 for label in owner_initial_labels if label.verdict == "fail")
+    initial_fail_rate = fail_count / len(owner_initial_labels) if owner_initial_labels else 0.0
     fail_enrichment_note = initial_fail_rate < STRATIFICATION_FAIL_RATE_THRESHOLD
 
     fixed_triples = select_fixed_self_consistency_triples(all_triples, self_consistency_n)
@@ -851,12 +1071,9 @@ def run_calibration(
         judge, fixed_triples, repeats=self_consistency_repeats
     )
 
-    ceiling: KappaResult | None = None
-    ceiling_warnings: tuple[str, ...] = ()
-    if retest:
-        ceiling, ceiling_warnings = compute_retest_ceiling(
-            labels, ci_level=ci_level, n_resamples=n_resamples, seed=seed
-        )
+    ceiling, ceiling_warnings = compute_iaa_ceiling(
+        labels, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+    )
 
     resolved_date = resolve_certificate_date(labels, date_override)
 
@@ -877,13 +1094,15 @@ def run_calibration(
         warnings=agreement_warnings + ceiling_warnings,
         judged_triples=tuple(judged),
         self_consistency_records=tuple(self_consistency_records),
+        n_adjudicated=n_adjudicated,
     )
 
 
 def build_certificate(result: CalibrationResult) -> Certificate:
     """Builds the committed ``Certificate`` (spec §5) from an already-computed
     ``CalibrationResult`` -- every field named in spec §5, including the
-    additive ``per_candidate_kappa_ci`` (T14)."""
+    additive ``per_candidate_kappa_ci`` (T14) and, from the dual-annotation
+    upgrade (2026-07-09), ``ceiling_kappa_ci`` and ``n_adjudicated``."""
 
     return Certificate(
         judge_version=result.judge_version,
@@ -893,6 +1112,8 @@ def build_certificate(result: CalibrationResult) -> Certificate:
         per_candidate_kappa_ci={label: r.ci for label, r in result.per_candidate.items()},
         verdict=result.verdict,
         ceiling_kappa=result.ceiling.kappa if result.ceiling is not None else None,
+        ceiling_kappa_ci=result.ceiling.ci if result.ceiling is not None else None,
+        n_adjudicated=result.n_adjudicated,
         label_file_hash=result.label_file_hash,
         date=result.date,
     )
@@ -903,8 +1124,9 @@ def render_calibration_report(result: CalibrationResult) -> str:
     per-candidate, with CIs, raw agreement, prevalence as descriptive
     context), the adequacy verdict, the D1-review divergence flag when it
     fires, the stratification fail-rate note, judge self-consistency, the
-    test-retest ceiling row (when computed), and any bootstrap-omission
-    disclosures."""
+    human-human agreement (IAA) ceiling row (dual-annotation upgrade,
+    2026-07-09, when computed) with the adjudicated-disagreement count, and
+    any bootstrap-omission disclosures."""
 
     lines: list[str] = ["# Judge Calibration Report", ""]
     lines.append(f"- Judge version: `{result.judge_version}`")
@@ -979,15 +1201,16 @@ def render_calibration_report(result: CalibrationResult) -> str:
     lines.append("")
 
     if result.ceiling is not None:
-        lines.append("## Test-Retest Consistency Ceiling")
+        lines.append("## Human-Human Agreement Ceiling")
         lines.append("")
         lines.append(
-            f"Intra-annotator κ on the initial/retest intersection = "
+            f"Inter-annotator κ between the two independent annotators' verdicts = "
             f"{result.ceiling.kappa:.3f} (95% cluster-bootstrap CI "
-            f"[{result.ceiling.ci[0]:.3f}, {result.ceiling.ci[1]:.3f}]) -- an estimate of "
-            "the consistency ceiling. A judge κ exceeding this value indicates estimation "
-            "noise, not a super-human judge."
+            f"[{result.ceiling.ci[0]:.3f}, {result.ceiling.ci[1]:.3f}]) -- the human-human "
+            "agreement ceiling. A judge κ exceeding this value indicates estimation noise, "
+            "not a super-human judge."
         )
+        lines.append(f"Adjudicated disagreements: {result.n_adjudicated}.")
         lines.append("")
 
     if result.warnings:
@@ -1063,16 +1286,13 @@ def judgment_records_from_judged(
 
 
 def pair_judgments_with_labels(
-    judgments: Sequence[JudgmentRecord],
-    labels: Sequence[CalibrationLabel],
-    *,
-    round_: Literal["initial", "retest"] = "initial",
+    judgments: Sequence[JudgmentRecord], gold: Sequence[GoldLabel]
 ) -> tuple[list[PairedJudgment], int, int]:
     """The offline counterpart to ``pair_with_labels`` (finding F2): joins
-    PERSISTED judgments (not freshly re-judged triples) to owner labels for
-    ``round_``, with the same all-or-nothing output-binding check -- except
-    the check compares each judgment's PERSISTED ``output_sha256`` against
-    its label's directly (no candidate output is available offline to
+    PERSISTED judgments (not freshly re-judged triples) to resolved GOLD
+    labels, with the same all-or-nothing output-binding check -- except the
+    check compares each judgment's PERSISTED ``output_sha256`` against the
+    gold label's directly (no candidate output is available offline to
     re-hash), rather than recomputing the hash from a live ``candidate_value``
     the way ``pair_with_labels`` does. See ``CalibrationBindingError``/module
     docstring."""
@@ -1080,7 +1300,7 @@ def pair_judgments_with_labels(
     entries = [
         ((j.item_id, j.candidate, j.field), j.verdict, j.output_sha256) for j in judgments
     ]
-    return _pair_entries(entries, labels, round_)
+    return _pair_entries(entries, gold)
 
 
 class StaleJudgmentsError(Exception):
@@ -1113,16 +1333,15 @@ def run_calibration_offline(
     ci_level: float = DEFAULT_CI_LEVEL,
     n_resamples: int = DEFAULT_N_RESAMPLES,
     seed: int = 0,
-    retest: bool = False,
 ) -> CalibrationResult:
     """Zero-API-call recompute of the FULL judge-calibration report +
     certificate (finding F2, spec AC5), purely from a previously-persisted
     ``judgments.jsonl`` (a live ``eval calibrate`` run's own judge output) and
     ``labels.jsonl`` -- no ``Judge``/``ModelClient``/candidate run is ever
     touched or constructed. Mirrors ``run_calibration``'s pipeline exactly,
-    substituting persisted judgments for a freshly re-judged triple set (the
-    test-retest ceiling step is unaffected either way: it only ever reads
-    ``labels``, live or offline).
+    substituting persisted judgments for a freshly re-judged triple set (gold
+    resolution and the human-human IAA ceiling are unaffected either way:
+    both only ever read ``labels``, live or offline).
 
     Fails loudly rather than silently recompute against data the certificate
     can no longer trust:
@@ -1130,25 +1349,31 @@ def run_calibration_offline(
     - ``StaleJudgmentsError`` if ``judgments.judge_version`` disagrees with
       the CURRENT ``judge_version()`` -- these judgments no longer describe
       the judge in use; re-run live.
+    - ``DualAnnotationError``/``CalibrationBindingError`` if the two
+      annotators' labels do not satisfy the dual-annotation precondition
+      (``resolve_gold_labels``/``compute_iaa_ceiling``).
     - ``CalibrationBindingError`` if any judgment's persisted
-      ``output_sha256`` disagrees with its matching label's (the same F1
-      binding check ``pair_with_labels`` runs live, applied here to the
+      ``output_sha256`` disagrees with its matching gold label's (the same
+      F1 binding check ``pair_with_labels`` runs live, applied here to the
       PERSISTED hash instead of a freshly recomputed one).
-    - ``ValueError`` if no persisted judgment matches a label at all (mirrors
-      ``run_calibration``'s own guard) -- a wiring problem (mismatched
-      judgments/labels files), not a real calibration outcome.
+    - ``ValueError`` if no persisted judgment matches a gold label at all
+      (mirrors ``run_calibration``'s own guard) -- a wiring problem
+      (mismatched judgments/labels files), not a real calibration outcome.
     """
 
     current_judge_version = compute_judge_version()
     if judgments.judge_version != current_judge_version:
         raise StaleJudgmentsError(judgments.judge_version, current_judge_version)
 
+    gold = resolve_gold_labels(labels)
+    n_adjudicated = sum(1 for g in gold if g.source == "adjudication")
+
     paired, judge_errors_excluded, unlabeled_excluded = pair_judgments_with_labels(
-        judgments.judgments, labels, round_="initial"
+        judgments.judgments, gold
     )
     if not paired:
         raise ValueError(
-            "no labeled judgment matched a persisted calibration judgment -- check that "
+            "no gold label matched a persisted calibration judgment -- check that "
             "labels.jsonl and judgments.jsonl describe the same items"
         )
 
@@ -1160,19 +1385,18 @@ def run_calibration_offline(
         {label: result.kappa for label, result in per_candidate.items()}
     )
 
-    initial_labels = [label for label in labels if label.round == "initial"]
-    fail_count = sum(1 for label in initial_labels if label.verdict == "fail")
-    initial_fail_rate = fail_count / len(initial_labels) if initial_labels else 0.0
+    owner_initial_labels = [
+        label for label in labels if label.round == "initial" and label.annotator == OWNER_ANNOTATOR
+    ]
+    fail_count = sum(1 for label in owner_initial_labels if label.verdict == "fail")
+    initial_fail_rate = fail_count / len(owner_initial_labels) if owner_initial_labels else 0.0
     fail_enrichment_note = initial_fail_rate < STRATIFICATION_FAIL_RATE_THRESHOLD
 
     self_consistency = _self_consistency_from_records(judgments.self_consistency)
 
-    ceiling: KappaResult | None = None
-    ceiling_warnings: tuple[str, ...] = ()
-    if retest:
-        ceiling, ceiling_warnings = compute_retest_ceiling(
-            labels, ci_level=ci_level, n_resamples=n_resamples, seed=seed
-        )
+    ceiling, ceiling_warnings = compute_iaa_ceiling(
+        labels, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+    )
 
     resolved_date = resolve_certificate_date(labels, date_override)
 
@@ -1191,6 +1415,7 @@ def run_calibration_offline(
         self_consistency=self_consistency,
         ceiling=ceiling,
         warnings=agreement_warnings + ceiling_warnings,
+        n_adjudicated=n_adjudicated,
     )
 
 
@@ -1347,9 +1572,13 @@ __all__ = [
     "DEFAULT_SELF_CONSISTENCY_REPEATS",
     "DIVERGENCE_GAP_THRESHOLD",
     "GRAY_ZONE_CI_LOWER_THRESHOLD",
+    "OWNER_ANNOTATOR",
     "STRATIFICATION_FAIL_RATE_THRESHOLD",
     "CalibrationBindingError",
     "CalibrationResult",
+    "DualAnnotationError",
+    "DualAnnotatorCoverage",
+    "GoldLabel",
     "JudgedTriple",
     "JudgmentRecord",
     "JudgmentsFile",
@@ -1362,7 +1591,7 @@ __all__ = [
     "build_triples",
     "check_disjoint_from_golden",
     "compute_agreement",
-    "compute_retest_ceiling",
+    "compute_iaa_ceiling",
     "decide_verdict",
     "hash_label_file",
     "hash_output",
@@ -1377,6 +1606,7 @@ __all__ = [
     "per_candidate_divergence_flag",
     "render_calibration_report",
     "resolve_certificate_date",
+    "resolve_gold_labels",
     "run_calibration",
     "run_calibration_offline",
     "select_fixed_self_consistency_triples",

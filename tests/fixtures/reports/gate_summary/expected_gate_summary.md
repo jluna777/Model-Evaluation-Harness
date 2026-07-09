@@ -5,7 +5,7 @@
 - Judge version: `fixture-judge-version-hash`
 - Overall κ = 0.720 (95% CI [0.550, 0.850])
 - Verdict: **adequate**
-- Test-retest intra-annotator consistency ceiling κ = 0.900
+- Human-human agreement ceiling (inter-annotator κ) = 0.900
 - Per-candidate κ (point estimate only -- the certificate carries a CI for the overall κ above, not per-candidate):
   - candidate a: κ = 0.700
   - candidate b: κ = 0.740

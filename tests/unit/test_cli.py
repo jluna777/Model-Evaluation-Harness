@@ -1119,11 +1119,14 @@ def _write_calibration_labels(path: Path, labels: list[CalibrationLabel]) -> Pat
     return path
 
 
-class TestCalibrateRetestBinding:
-    def test_retest_ceiling_mismatched_output_sha256_clean_exit(self, tmp_path, monkeypatch):
-        """``eval calibrate --retest`` with mismatched output_sha256 between
-        initial and retest labels exits cleanly with CalibrationBindingError
-        (no traceback)."""
+class TestCalibrateDualAnnotationBinding:
+    def test_cross_annotator_mismatched_output_sha256_clean_exit(self, tmp_path, monkeypatch):
+        """``eval calibrate`` (dual annotation is automatic, owner-approved
+        upgrade 2026-07-09) with mismatched output_sha256 between the two
+        annotators' rows for the same key exits cleanly with
+        CalibrationBindingError (no traceback) -- the retired ``--retest``
+        binding check's precedent, now checked between annotators instead of
+        between initial/retest rounds."""
         monkeypatch.chdir(tmp_path)
 
         # Create calibration items
@@ -1134,55 +1137,59 @@ class TestCalibrateRetestBinding:
         emails_path = tmp_path / "data" / "calibration" / "emails.jsonl"
         _write_calibration_emails(emails_path, items)
 
-        # Create labels with mismatched output_sha256 between rounds
+        # Create labels with mismatched output_sha256 between the two annotators
         labels = [
-            # cal-001 initial: one output_sha256
+            # cal-001 owner: one output_sha256
             CalibrationLabel(
-                label_id="lbl-cal-001-a-issue_summary-initial",
+                label_id="lbl-cal-001-a-issue_summary-initial-owner",
                 item_id="cal-001",
                 candidate="a",
                 field="issue_summary",
+                annotator="owner",
                 verdict="pass",
                 critique="test label",
                 label_date=date(2026, 6, 1),
                 round="initial",
-                output_sha256=calibrate.hash_output("initial-value-1"),
+                output_sha256=calibrate.hash_output("owner-value-1"),
             ),
-            # cal-001 retest: different output_sha256 (same key, different output)
+            # cal-001 annotator2: different output_sha256 (same key, different output)
             CalibrationLabel(
-                label_id="lbl-cal-001-a-issue_summary-retest",
+                label_id="lbl-cal-001-a-issue_summary-initial-annotator2",
                 item_id="cal-001",
                 candidate="a",
                 field="issue_summary",
-                verdict="pass",
-                critique="test label",
-                label_date=date(2026, 6, 1),
-                round="retest",
-                output_sha256=calibrate.hash_output("retest-value-1"),
-            ),
-            # cal-002 initial: one output_sha256
-            CalibrationLabel(
-                label_id="lbl-cal-002-a-issue_summary-initial",
-                item_id="cal-002",
-                candidate="a",
-                field="issue_summary",
+                annotator="annotator2",
                 verdict="pass",
                 critique="test label",
                 label_date=date(2026, 6, 1),
                 round="initial",
-                output_sha256=calibrate.hash_output("initial-value-2"),
+                output_sha256=calibrate.hash_output("annotator2-value-1"),
             ),
-            # cal-002 retest: different output_sha256
+            # cal-002 owner: one output_sha256
             CalibrationLabel(
-                label_id="lbl-cal-002-a-issue_summary-retest",
+                label_id="lbl-cal-002-a-issue_summary-initial-owner",
                 item_id="cal-002",
                 candidate="a",
                 field="issue_summary",
+                annotator="owner",
                 verdict="pass",
                 critique="test label",
                 label_date=date(2026, 6, 1),
-                round="retest",
-                output_sha256=calibrate.hash_output("retest-value-2"),
+                round="initial",
+                output_sha256=calibrate.hash_output("owner-value-2"),
+            ),
+            # cal-002 annotator2: different output_sha256
+            CalibrationLabel(
+                label_id="lbl-cal-002-a-issue_summary-initial-annotator2",
+                item_id="cal-002",
+                candidate="a",
+                field="issue_summary",
+                annotator="annotator2",
+                verdict="pass",
+                critique="test label",
+                label_date=date(2026, 6, 1),
+                round="initial",
+                output_sha256=calibrate.hash_output("annotator2-value-2"),
             ),
         ]
         labels_path = tmp_path / "data" / "calibration" / "labels.jsonl"
@@ -1206,7 +1213,6 @@ class TestCalibrateRetestBinding:
             app,
             [
                 "calibrate",
-                "--retest",
                 "--emails",
                 str(emails_path),
                 "--labels",

@@ -148,10 +148,10 @@ Phases honor spec §11's load-bearing order. **◆ = owner validation gate.** Ow
 **Verification:** a unit test reconciles taxonomy.md counts with jsonl tags; 32/18 slice split; reference-side validation passes (T1 strict `GoldenItem`); **◆ owner signs the freeze**.
 
 ### T14 ◆ — Calibration: labels, agreement, certificate, self-consistency
-**Files:** create `data/calibration/{emails.jsonl,labels.jsonl,certificate.json}`, `src/harness/calibrate.py`, CLI `eval calibrate [--retest]`
-**Consumes:** T5, T7, T8, T9. **Owner work:** label 100 field judgments (+ spec §5 stratification loop additions if fail rate < 20%; ~2 h); schedule the 25-relabel retest ≥1 week out (execution is a T19 entry criterion).
-**Produces:** `certificate.json` per spec §5; calibrate report with cluster-bootstrap CIs, prevalence, per-candidate kappas, gray-zone logic, **per-candidate kappa gap > 0.2 → D1-review flag**; **judge self-consistency: 20 fixed (email, reference, candidate-value) triples each judged 3×, verdict flip rate in the report and certificate context**; `eval calibrate` is reportable (fails fast without Langfuse keys — T9 anchor lands here).
-**Verification:** certificate verdict correct on synthetic fixtures for all three states + gray zone + divergence flag; mocked judge with one flipping triple → flip rate 1/20; `--retest` adds the ceiling row; **◆ owner signs the certificate**.
+**Files:** create `data/calibration/{emails.jsonl,labels.jsonl,certificate.json}`, `src/harness/calibrate.py`, CLI `eval calibrate`
+**Consumes:** T5, T7, T8, T9. **Owner work:** label 100 field judgments (+ spec §5 stratification loop additions if fail rate < 20%; ~2 h); adjudicate whatever disagreements the second, independently-labeling annotator's labels surface (dual-annotation upgrade, D2 amendment 2026-07-09 — no calendar gap to schedule).
+**Produces:** `certificate.json` per spec §5; calibrate report with cluster-bootstrap CIs, prevalence, per-candidate kappas, gray-zone logic, **per-candidate kappa gap > 0.2 → D1-review flag**; **judge self-consistency: 20 fixed (email, reference, candidate-value) triples each judged 3×, verdict flip rate in the report and certificate context**; `eval calibrate` is reportable (fails fast without Langfuse keys — T9 anchor lands here); resolves dual-annotation gold + the human-human agreement ceiling automatically once both annotators' labels are complete.
+**Verification:** certificate verdict correct on synthetic fixtures for all three states + gray zone + divergence flag; mocked judge with one flipping triple → flip rate 1/20; dual-annotation gold resolution and the human-human ceiling row verified (agreement/adjudication/incomplete-coverage/binding-mismatch fixtures); **◆ owner signs the certificate**.
 
 ### T15 — Baseline module
 **Files:** create `src/harness/gate/baseline.py`, tests
@@ -176,10 +176,10 @@ Phases honor spec §11's load-bearing order. **◆ = owner validation gate.** Ow
 **Verification:** docs-only PR skips the gate; `src/` PR runs it; exit 1 vs exit 2 produce visibly distinct check labels; `workflow_dispatch --seed-regression` fails with DEMO MODE banner (log linked in ticket).
 
 ### T19 ◆ — README, published artifacts, demo
-**Entry criteria:** owner retest labels committed (`round: "retest"`), `eval calibrate --retest` run, ceiling row present in the certificate report (≥1-week gap scheduled from T14).
+**Entry criteria (simplified, D2 amendment 2026-07-09):** the calibration certificate exists — `eval calibrate` has resolved both annotators' labels into gold and the human-human ceiling row is present in the certificate report. No calendar gap to schedule.
 **Files:** create/replace `README.md`, `results/published/` (committed artifacts for every README number), `.gitignore` exception
-**Produces:** the before/after story per AC3+AC4: scores ± CI, agreement ± CI + ceiling row, gate verdicts, MDE, m, **the 10-run no-change table summary with observed false-alarm count (linking gate-design.md)**; quickstart; the two-command demo; honest-limitations section (single annotator, n, MDE, alias pinning).
-**Verification (AC3/AC4/AC5):** run numbers reproduce byte-exact via `eval rescore results/published/<run>`; agreement numbers reproduce via `eval calibrate [--retest]` on committed labels — both zero API calls (spec AC5 errata); **◆ owner reviews README**.
+**Produces:** the before/after story per AC3+AC4: scores ± CI, agreement ± CI + the human-human ceiling row, gate verdicts, MDE, m, **the 10-run no-change table summary with observed false-alarm count (linking gate-design.md)**; quickstart; the two-command demo; honest-limitations section (dual annotation's own limits, n, MDE, alias pinning).
+**Verification (AC3/AC4/AC5):** run numbers reproduce byte-exact via `eval rescore results/published/<run>`; agreement numbers reproduce via `eval calibrate`/`eval calibrate --offline` on committed labels — both zero API calls (spec AC5 errata); **◆ owner reviews README**.
 
 ### T20 — Acceptance walk
 Walk all five spec §12 criteria against the shipped repo, recording evidence (commands + outputs) in the ticket. Any failure loops back to its owning task. Completion closes the SDD loop (constitution DoD).

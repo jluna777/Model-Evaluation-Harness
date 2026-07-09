@@ -387,10 +387,18 @@ def _certificate_section(
         f"- Verdict: **{certificate.verdict}**",
     ]
     if certificate.ceiling_kappa is not None:
-        lines.append(
-            f"- Test-retest intra-annotator consistency ceiling κ = "
+        ceiling_line = (
+            f"- Human-human agreement ceiling (inter-annotator κ) = "
             f"{certificate.ceiling_kappa:.3f}"
         )
+        if certificate.ceiling_kappa_ci is not None:
+            ceiling_line += (
+                f" (95% CI [{certificate.ceiling_kappa_ci[0]:.3f}, "
+                f"{certificate.ceiling_kappa_ci[1]:.3f}])"
+            )
+        lines.append(ceiling_line)
+    if certificate.n_adjudicated is not None:
+        lines.append(f"- Adjudicated disagreements: {certificate.n_adjudicated}")
     if certificate.per_candidate_kappa_ci is not None:
         lines.append("- Per-candidate κ with 95% cluster-bootstrap CI:")
         for label in sorted(certificate.per_candidate_kappa):

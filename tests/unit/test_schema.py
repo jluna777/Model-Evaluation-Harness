@@ -136,6 +136,7 @@ class TestCalibrationLabel:
             item_id="cal-001",
             candidate="a",
             field="issue_summary",
+            annotator="owner",
             verdict="pass",
             critique="Matches the reference intent.",
             label_date="2026-06-01",
@@ -144,7 +145,69 @@ class TestCalibrationLabel:
         )
         assert label.verdict == "pass"
         assert label.round == "initial"
+        assert label.annotator == "owner"
         assert label.output_sha256 == "a" * 64
+
+    def test_adjudication_round_by_owner_round_trips(self):
+        # Dual-annotation upgrade (2026-07-09): the retired "retest" round is
+        # replaced by "adjudication" -- always by the owner.
+        label = CalibrationLabel(
+            label_id="lbl-002",
+            item_id="cal-001",
+            candidate="a",
+            field="issue_summary",
+            annotator="owner",
+            verdict="fail",
+            critique="Tie-break: missing an essential detail.",
+            label_date="2026-06-02",
+            round="adjudication",
+            output_sha256="b" * 64,
+        )
+        assert label.round == "adjudication"
+
+    def test_second_annotator_is_a_free_string(self):
+        label = CalibrationLabel(
+            label_id="lbl-003",
+            item_id="cal-001",
+            candidate="a",
+            field="issue_summary",
+            annotator="annotator2",
+            verdict="pass",
+            critique="Looks right.",
+            label_date="2026-06-01",
+            round="initial",
+            output_sha256="c" * 64,
+        )
+        assert label.annotator == "annotator2"
+
+    def test_retest_round_no_longer_allowed(self):
+        with pytest.raises(ValidationError):
+            CalibrationLabel(
+                label_id="lbl-004",
+                item_id="cal-001",
+                candidate="a",
+                field="issue_summary",
+                annotator="owner",
+                verdict="pass",
+                critique="x",
+                label_date="2026-06-01",
+                round="retest",
+                output_sha256="d" * 64,
+            )
+
+    def test_annotator_is_required(self):
+        with pytest.raises(ValidationError):
+            CalibrationLabel(
+                label_id="lbl-001",
+                item_id="cal-001",
+                candidate="a",
+                field="issue_summary",
+                verdict="pass",
+                critique="Matches the reference intent.",
+                label_date="2026-06-01",
+                round="initial",
+                output_sha256="a" * 64,
+            )
 
     def test_output_sha256_is_required(self):
         with pytest.raises(ValidationError):
@@ -153,6 +216,7 @@ class TestCalibrationLabel:
                 item_id="cal-001",
                 candidate="a",
                 field="issue_summary",
+                annotator="owner",
                 verdict="pass",
                 critique="Matches the reference intent.",
                 label_date="2026-06-01",
@@ -201,3 +265,35 @@ class TestCertificate:
             date="2026-07-04",
         )
         assert certificate.per_candidate_kappa_ci == {"a": (0.5, 0.85), "b": (0.55, 0.9)}
+
+    def test_ceiling_kappa_ci_and_n_adjudicated_default_to_none(self):
+        # Additive dual-annotation-upgrade fields (2026-07-09): absent input
+        # -> None, reproducing the pre-upgrade certificate shape exactly.
+        certificate = Certificate(
+            judge_version="deadbeef",
+            overall_kappa=0.72,
+            kappa_ci=(0.55, 0.85),
+            per_candidate_kappa={"a": 0.7, "b": 0.74},
+            verdict="adequate",
+            label_file_hash="sha256:abc123",
+            date="2026-07-04",
+        )
+        assert certificate.ceiling_kappa_ci is None
+        assert certificate.n_adjudicated is None
+
+    def test_ceiling_kappa_ci_and_n_adjudicated_round_trip_when_present(self):
+        certificate = Certificate(
+            judge_version="deadbeef",
+            overall_kappa=0.72,
+            kappa_ci=(0.55, 0.85),
+            per_candidate_kappa={"a": 0.7, "b": 0.74},
+            verdict="adequate",
+            ceiling_kappa=0.85,
+            ceiling_kappa_ci=(0.7, 0.95),
+            n_adjudicated=3,
+            label_file_hash="sha256:abc123",
+            date="2026-07-04",
+        )
+        assert certificate.ceiling_kappa == pytest.approx(0.85)
+        assert certificate.ceiling_kappa_ci == (0.7, 0.95)
+        assert certificate.n_adjudicated == 3

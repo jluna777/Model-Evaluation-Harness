@@ -31,7 +31,7 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 
 ## D2 — Judge calibration and agreement reporting
 
-**Status:** Decided 2026-07-04 · Amended 2026-07-04a
+**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-09
 **Decision:** Binary pass/fail rubric with written rationale. Calibration data is disjoint from the golden set: dedicated calibration emails, both candidates' outputs, every free-text field labeled by the owner, stratified toward borderline/failing outputs. Cohen's kappa (with cluster-bootstrap CI) is the single deciding agreement statistic, reported per candidate; raw agreement and prevalence are descriptive context. Owner test-retest relabeling provides an estimated consistency ceiling. Operational parameters: spec §5.
 
 **Options considered:** (1) binary rubric + stratified set + test-retest *(chosen)*; (2) 1–5 graded rubric (weighted kappa + Spearman); (3) binary with minimal calibration, no retest.
@@ -50,6 +50,17 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 - **Re-certification after any judge change uses freshly drafted calibration emails** — re-certifying on the emails whose disagreements drove a rubric revision would make the published kappa selected, not measured (spec §5).
 - The certificate pins the judge only; candidate-prompt changes shift the judged-output distribution and are accepted as a stated v1 limitation.
 - Fail-label enrichment means agreement is measured on a harder-than-operational distribution (conservative); the report acknowledges the shift.
+
+**Amendment 2026-07-09 (owner, dual-annotation upgrade):** replaces single-annotator test-retest with dual independent annotation. Both the owner (primary annotator) and a second, independent annotator label the full initial judgment set from separate hash-bound sheets, neither seeing the other's verdicts. Disagreements are adjudicated by the owner; adjudicated labels plus spontaneous-agreement labels form the final gold set that judge agreement is measured against. Inter-annotator (human-human) agreement — Cohen's kappa between the two annotators, its own cluster-bootstrap CI — replaces test-retest as the measured ceiling on the certificate; the decision semantics are unchanged (a judge kappa exceeding the ceiling is estimation noise, not a super-human judge). The certificate additionally discloses `n_adjudicated` — the count of disagreements resolved by adjudication.
+
+**Options considered (this amendment):** (1) dual independent annotation + owner adjudication *(chosen)*; (2) keep single-annotator test-retest; (3) three-annotator majority vote with no adjudication.
+
+**Rationale (this amendment):**
+- Reproducibility over stability: test-retest measures one annotator's OWN consistency across two sittings — a within-person stability estimate. Inter-annotator agreement measures whether the labeling task is well-specified enough that a SECOND, independent person reaches the same verdicts — a between-person reproducibility estimate. Reproducibility is the stronger claim for a calibration ceiling: it certifies the labeling standard, not just the labeler.
+- Removes the ≥1-week calendar gap the test-retest design required (spec §5, T14/T19 build-order dependency): the second annotator labels in parallel with the owner rather than a week later, shortening the calibration timeline materially.
+- Adjudicated labels are better gold than either annotator's raw verdict alone: a disagreement flags genuine ambiguity, and the owner's adjudication — informed by seeing BOTH verdicts and critiques — is a more considered judgment than either annotator's first-pass label written without that context.
+- Judge-vs-human agreement measured against human-vs-human agreement (the IAA ceiling) is the literature-standard adequacy framing for annotation tasks — inter-rater reliability is the conventional benchmark a machine rater is held to, more standard than comparing a judge to one annotator's own retest stability.
+- The ceiling measures task ambiguity — not annotator inconsistency — only if both annotators apply the SAME labeling rules: the second annotator must read the written rubric/conventions before labeling, exactly as the owner does. This is a stated precondition of the upgrade, not an automatic guarantee, and is named explicitly so a future reader does not mistake a badly-briefed second annotator's low agreement for judge inadequacy.
 
 **Revisit if:** the judge fails adequacy twice; a second annotator becomes available; per-candidate agreement diverges (→ D1 review).
 
