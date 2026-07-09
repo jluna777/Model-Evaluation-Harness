@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass
 # Must match `models.judge` in configs/default.yaml (spec §2). Kept as an
 # independent, pinned constant rather than read from config so the hash is a
 # pure function of code, not of an external YAML file.
-JUDGE_MODEL_ID = "gemini-3.5-flash"
+JUDGE_MODEL_ID = "gemini-2.5-pro"
 
 PROMPT_PREAMBLE = (
     "You are grading one free-text field of an automated customer-support-"

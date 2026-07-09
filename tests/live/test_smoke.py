@@ -81,7 +81,7 @@ class TestGeminiLiveSmoke:
     def test_complete_structured_against_real_api(self):
         api_key = _require_key("GEMINI_API_KEY")
         client = GeminiClient(
-            model="gemini-3.5-flash",
+            model="gemini-2.5-pro",
             client=genai.Client(api_key=api_key),
         )
 

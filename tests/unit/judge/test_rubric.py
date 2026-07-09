@@ -64,7 +64,7 @@ class TestJudgeVersionHash:
 
     def test_changes_when_the_judge_model_id_changes(self, monkeypatch):
         before = rubric.judge_version()
-        monkeypatch.setattr(rubric, "JUDGE_MODEL_ID", "gemini-2.5-pro")
+        monkeypatch.setattr(rubric, "JUDGE_MODEL_ID", "some-other-judge-model")
 
         assert rubric.judge_version() != before
 

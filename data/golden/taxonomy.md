@@ -100,7 +100,7 @@ Claude Haiku 4.5 / Anthropic; Candidate B: GPT-5.4 mini / OpenAI).
 
 | Family | `meta.generator` value | Planned count | Share |
 |---|---|---:|---:|
-| Gemini (distinct — third provider, matches the judge's family; see Provenance & coupling below) | `gemini-3.5-flash` | 40 | 80% |
+| Gemini (distinct — third provider, matches the judge's family; see Provenance & coupling below) | `gemini-2.5-flash` | 40 | 80% |
 | Claude (Anthropic — same family as Candidate A) | `claude-fable-5` | ≤10 (10 authored this batch) | ≤20% |
 
 This plan sits exactly at the bound: 40/50 = 80% distinct-family (meets "≥80%"
@@ -118,7 +118,7 @@ frozen by the owner.
 
 ## Provenance & coupling
 
-- **The judge is Gemini-family** (`gemini-3.5-flash`, escalation `gemini-2.5-pro`;
+- **The judge is Gemini-family** (`gemini-2.5-pro` since 2026-07-09, fallback `gemini-3.5-flash`; see decisions.md D1; was `gemini-3.5-flash`, escalation `gemini-2.5-pro`;
   D1) — the same family planned to draft 80% of golden items. This is a real
   generator–judge coupling and is named here deliberately rather than left to a
   limitations paragraph (constitution Principle 3).

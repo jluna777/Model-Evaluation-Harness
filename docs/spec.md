@@ -44,7 +44,7 @@ Secondary requests are omitted from reference answers. Multi-ticket extraction (
 |---|---|---|---|
 | Candidate A | Claude Haiku 4.5 | `claude-haiku-4-5-20251001` (dated snapshot) | native, constrained decoding |
 | Candidate B | GPT-5.4 mini | `gpt-5.4-mini` (dated snapshot if offered at implementation time; resolved ID recorded in `configs/default.yaml`) | native, strict JSON schema |
-| Judge | Gemini 3.5 Flash | `gemini-3.5-flash` (stable GA; escalation: `gemini-2.5-pro`) | native; output re-validated with Pydantic |
+| Judge | Gemini 2.5 Pro | `gemini-2.5-pro` (stable GA; re-pinned 2026-07-09 per D1 amendment; fallback: `gemini-3.5-flash`) | native; output re-validated with Pydantic |
 
 Candidates run at temperature 0. SDKs: `anthropic`, `openai`, `google-genai`, versions pinned in `pyproject.toml`.
 
@@ -65,7 +65,7 @@ The model interface is a thin internal protocol (`complete_structured(email, sch
 - Pointwise, reference-guided: each free-text field of each candidate output is judged in its own call — inputs are the email, the field's reference value, the candidate's value, and the binary rubric; output is `{verdict: pass|fail, rationale}`, Pydantic-validated.
 - Rubric (binary, per field): *pass = same factual content as the reference — same issue/action, no added claims, no missing essentials; wording may differ freely.* Rubric text, ordering, and examples are pinned and identical for both candidates.
 - **Few-shot examples:** pass/fail-labeled examples with one-line critiques, hand-written or drawn exclusively from `data/dev/` — never from golden or calibration items. They are part of the versioned judge prompt; changing them is a judge change.
-- Judge config: `gemini-3.5-flash`, temperature 0. The judge version = hash of {judge model, prompt, rubric, few-shots}; any change invalidates the current calibration certificate (§5).
+- Judge config: `gemini-2.5-pro` (re-pinned 2026-07-09, D1 amendment; fallback `gemini-3.5-flash`), temperature 0. The judge version = hash of {judge model, prompt, rubric, few-shots}; any change invalidates the current calibration certificate (§5).
 - **Judge health diagnostics (reported, never gating):**
   - score-vs-length correlation per candidate;
   - **judge self-consistency:** at certification time, 20 fixed (email, reference, candidate-value) triples are each judged 3 times; the verdict flip rate is reported. (Cross-replicate verdict variance is a different quantity — *judged-field run variance* — and feeds the §6 variance decomposition.)

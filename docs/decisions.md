@@ -6,8 +6,8 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 
 ## D1 — Judge protocol and judge model
 
-**Status:** Decided 2026-07-04 · Amended 2026-07-04a
-**Decision:** Pointwise, reference-guided judging with a third-provider judge (`gemini-3.5-flash`; escalation `gemini-2.5-pro`). The judge grades each candidate's free-text fields independently against the golden reference — binary rubric, one field per judge call, temperature 0. Model comparison is computed from paired per-item score deltas, never from head-to-head judging. Operational parameters: spec §4, §6.
+**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-09
+**Decision:** Pointwise, reference-guided judging with a third-provider judge (`gemini-2.5-pro` since 2026-07-09 — see amendment; initially `gemini-3.5-flash`, now the fallback). The judge grades each candidate's free-text fields independently against the golden reference — binary rubric, one field per judge call, temperature 0. Model comparison is computed from paired per-item score deltas, never from head-to-head judging. Operational parameters: spec §4, §6.
 
 **Options considered:** (1) pointwise + third-provider judge *(chosen)*; (2) head-to-head pairwise with two-pass position swap (Arena-Hard protocol); (3) pointwise + offline head-to-head diagnostic.
 
@@ -20,6 +20,8 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 - Verbosity: reference-guided grading with a binary rubric is the fit mitigation for 1–2-sentence fields; a score-vs-length correlation is logged as a judge-health diagnostic.
 
 **Amendment 2026-07-04a (post-review):** few-shot pass/fail examples with critiques are part of the judge protocol; they are hand-written or drawn exclusively from `data/dev/` — never golden or calibration items — and are versioned inside the judge prompt (leakage guard; spec §4). Judge self-consistency is measured by repeated judge calls on identical (email, reference, value) triples — cross-replicate verdict variance is a different quantity and feeds the variance decomposition (spec §4, §6).
+
+**Amendment 2026-07-09 (owner):** the judge pin moves to `gemini-2.5-pro`, exercising the pre-approved escalation path early — on the merits, not merely availability. (1) The bias literature this decision was grounded in warns that cheap/fast-tier judges are the most bias-susceptible class and weakest at rubric adherence; the judge's task profile (disciplined binary rubric application over short contexts) favors pro-class reasoning over flash-class throughput, which the judge never needed at ~600 calls/run. (2) Cost was never load-bearing (~$1–2/run delta at v1 volumes); optimizing it traded away instrument quality for a constraint the project does not have. (3) A multi-day capacity incident on `gemini-3.5-flash` (503 UNAVAILABLE, 2026-07-08/09, verified provider-side: same key and client succeeded against sibling models throughout) surfaced availability-under-load as a selection criterion the original decision underweighted for a model pinned inside a CI gate whose false-alarm story cannot absorb flakiness; `gemini-2.5-pro` remained stable through the same window. The pin changed before any calibration certificate existed, so nothing was invalidated. `gemini-3.5-flash` becomes the documented fallback. As always, the choice is validated empirically: the D2 certificate must show κ ≥ 0.6 against owner labels or the judge escalates further.
 
 **Revisit if:** calibration (D2) shows inadequate agreement after judge escalation; per-candidate agreement diverges (differential-bias flag); or v2 adds subjective quality dimensions where pairwise sensitivity matters.
 
