@@ -1010,6 +1010,133 @@ class TestResolveGoldLabels:
         n_adjudicated = sum(1 for g in gold if g.source == "adjudication")
         assert n_adjudicated == 2
 
+    def test_adjudication_row_from_non_owner_raises_naming_the_row(self):
+        """Finding: a round='adjudication' row is only ever looked up keyed
+        to the owner (spec §5), so a stray non-owner adjudication row was
+        previously filtered out invisibly instead of raising."""
+
+        labels = _dual_labels({"cal-001": ("pass", "fail")})
+        labels.append(
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="adjudication",
+                annotator="annotator2",
+                candidate_value="cal-001-value",
+            )
+        )
+
+        with pytest.raises(calibrate.DualAnnotationError) as excinfo:
+            resolve_gold_labels(labels)
+
+        message = str(excinfo.value)
+        assert "non-owner" in message
+        assert "annotator2" in message
+        assert "cal-001" in message
+
+    def test_adjudication_row_on_agreed_key_raises_naming_the_key(self):
+        """Finding: an owner adjudication row keyed to a triple where the two
+        annotators already agree was previously hash-checked but its verdict
+        silently discarded -- a later edit to either initial row could then
+        silently pick up this stale row as gold. It must raise instead."""
+
+        labels = _dual_labels({"cal-001": ("pass", "pass")})
+        labels.append(
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="adjudication",
+                annotator="owner",
+                candidate_value="cal-001-value",
+            )
+        )
+
+        with pytest.raises(calibrate.DualAnnotationError) as excinfo:
+            resolve_gold_labels(labels)
+
+        message = str(excinfo.value)
+        assert "already agree" in message
+        assert "('cal-001', 'a', 'issue_summary')" in message
+
+    def test_adjudication_row_outside_shared_keys_raises_naming_the_key(self):
+        """Finding: an adjudication row keyed to a triple outside the shared
+        initial key set (a typo'd item_id/candidate/field) was previously
+        ignored entirely, while the disagreement it was meant to resolve
+        went on to fail as "unadjudicated" -- misdirecting the fix. It must
+        be named directly instead."""
+
+        labels = _dual_labels({"cal-001": ("pass", "fail")})
+        labels.append(
+            make_label(
+                "cal-999",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="adjudication",
+                annotator="owner",
+                candidate_value="cal-999-value",
+            )
+        )
+
+        with pytest.raises(calibrate.DualAnnotationError) as excinfo:
+            resolve_gold_labels(labels)
+
+        message = str(excinfo.value)
+        assert "outside the shared initial-round key set" in message
+        assert "('cal-999', 'a', 'issue_summary')" in message
+
+    def test_adjudication_round_reports_all_three_violations_together(self):
+        """The whole adjudication round is validated up front (finding): all
+        three violation kinds present at once are reported in a single
+        error, not just the first one encountered."""
+
+        labels = _dual_labels({"cal-001": ("pass", "fail"), "cal-002": ("pass", "pass")})
+        labels.append(
+            make_label(
+                "cal-001",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="adjudication",
+                annotator="annotator2",
+                candidate_value="cal-001-value",
+            )
+        )
+        labels.append(
+            make_label(
+                "cal-002",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="adjudication",
+                annotator="owner",
+                candidate_value="cal-002-value",
+            )
+        )
+        labels.append(
+            make_label(
+                "cal-999",
+                "a",
+                "issue_summary",
+                "fail",
+                round_="adjudication",
+                annotator="owner",
+                candidate_value="cal-999-value",
+            )
+        )
+
+        with pytest.raises(calibrate.DualAnnotationError) as excinfo:
+            resolve_gold_labels(labels)
+
+        message = str(excinfo.value)
+        assert "non-owner" in message
+        assert "already agree" in message
+        assert "outside the shared initial-round key set" in message
+
 
 # --------------------------------------------------------------------------
 # Disjointness from golden.
@@ -1501,6 +1628,35 @@ class TestRunCalibrationIntegration:
                 label_file_hash="fixture-hash",
                 n_resamples=50,
             )
+
+    def test_labels_defect_raises_before_any_judge_invocation(self):
+        """Finding 2: every DualAnnotationError/CalibrationBindingError
+        ``run_calibration`` can raise via ``resolve_gold_labels`` is
+        computable from ``labels`` alone -- it must fail before
+        ``judge_triples`` spends a single judge call, not after (previously,
+        the full judge spend over both candidates happened first and was
+        never persisted on failure, re-burning it on every labels-file fix
+        iteration)."""
+
+        run_a, run_b, labels, _unused_judge = _calibration_fixture()
+        # Break dual-annotation coverage entirely -- keep only the owner's
+        # rows, so resolve_gold_labels raises "exactly 2 annotators".
+        broken_labels = [label for label in labels if label.annotator == "owner"]
+
+        client = _KeyedJudgeClient(verdict_for=lambda candidate_value, idx: "pass")
+        judge = Judge(client)
+
+        with pytest.raises(calibrate.DualAnnotationError, match="exactly 2 annotators"):
+            run_calibration(
+                run_a=run_a,
+                run_b=run_b,
+                labels=broken_labels,
+                judge=judge,
+                label_file_hash="fixture-hash",
+                n_resamples=50,
+            )
+
+        assert client.calls == []
 
     def test_gold_resolves_but_no_overlap_with_judged_triples_raises(self):
         """Dual-annotation coverage is satisfied but for keys that don't
@@ -2169,7 +2325,28 @@ class TestCalibrateCLIFailFast:
         monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
 
         emails_path = _write_dataset(tmp_path / "emails.jsonl", [_cli_item("cal-001")])
-        labels_path = _write_labels(tmp_path / "labels.jsonl", [])
+        # Finding 2: labels are now validated before the Langfuse fail-fast
+        # check, so this test uses a labels file that clears dual-annotation
+        # validation cleanly (both annotators agreeing on one key) -- an
+        # empty/defective labels file would now raise DualAnnotationError
+        # first, which is exercised separately in this class's own
+        # ``test_labels_only_error_fails_before_trace_context_or_client_construction``.
+        labels_path = _write_labels(
+            tmp_path / "labels.jsonl",
+            [
+                make_label(
+                    "cal-001", "a", "issue_summary", "pass", annotator="owner", candidate_value="v"
+                ),
+                make_label(
+                    "cal-001",
+                    "a",
+                    "issue_summary",
+                    "pass",
+                    annotator="annotator2",
+                    candidate_value="v",
+                ),
+            ],
+        )
         config_path = _write_calibrate_config(tmp_path / "config.yaml")
 
         def _forbid_build_model_key(label, config):
@@ -2199,6 +2376,64 @@ class TestCalibrateCLIFailFast:
         assert result.exit_code == 1
         assert "Traceback" not in result.output
         assert "credentials" in result.output.lower() or "langfuse" in result.output.lower()
+
+    def test_labels_only_error_fails_before_trace_context_or_client_construction(
+        self, tmp_path, monkeypatch
+    ):
+        """Finding 2: a DualAnnotationError/CalibrationBindingError raised by
+        ``resolve_gold_labels`` is computable from ``labels.jsonl`` alone --
+        it must fail before ``TraceContext.for_run`` or any candidate/judge
+        client construction, costing zero API calls and no client setup."""
+
+        monkeypatch.chdir(tmp_path)
+
+        emails_path = _write_dataset(tmp_path / "emails.jsonl", [_cli_item("cal-001")])
+        # Only ONE annotator's initial labels -- DualAnnotationError,
+        # resolvable from labels.jsonl alone, well before any tracing/client
+        # work.
+        labels_path = _write_labels(
+            tmp_path / "labels.jsonl",
+            [make_label("cal-001", "a", "issue_summary", "pass", annotator="owner")],
+        )
+        config_path = _write_calibrate_config(tmp_path / "config.yaml")
+
+        class _ForbiddenTraceContext:
+            @staticmethod
+            def for_run(config: object, reportable: bool, **kwargs: object) -> object:
+                raise AssertionError(
+                    "TraceContext.for_run must not be called before labels-only validation"
+                )
+
+        def _forbid_build_model_key(label, config):
+            raise AssertionError(
+                "_build_model_key must not be called before labels-only validation"
+            )
+
+        def _forbid_build_judge_client(config):
+            raise AssertionError(
+                "_build_judge_client must not be called before labels-only validation"
+            )
+
+        monkeypatch.setattr(cli, "TraceContext", _ForbiddenTraceContext)
+        monkeypatch.setattr(cli, "_build_model_key", _forbid_build_model_key)
+        monkeypatch.setattr(cli, "_build_judge_client", _forbid_build_judge_client)
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(emails_path),
+                "--labels",
+                str(labels_path),
+                "--config",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "exactly 2 annotators" in result.output
 
 
 class TestCalibrateCLIHappyPath:

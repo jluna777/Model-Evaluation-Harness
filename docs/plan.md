@@ -56,7 +56,7 @@ docs/gate-design.md    # analytic false-alarm justification + threat model + re-
 
 ## Build order and owner gates
 
-Phases honor spec §11's load-bearing order. **◆ = owner validation gate.** Owner data work (Phase B) overlaps library work (Phase A); calibration labeling is scheduled at the earliest possible date so the ≥1-week retest gap (owner retest is a named T19 entry criterion) never blocks shipping.
+Phases honor spec §11's load-bearing order. **◆ = owner validation gate.** Owner data work (Phase B) overlaps library work (Phase A); calibration labeling is scheduled at the earliest possible date, with both annotators labeling in parallel (D2 amendment 2026-07-09) — no calendar gap to block shipping, since T19's entry criterion is the committed certificate.
 
 - **Phase A — library (T1–T11):** skeleton → scoring → stats → clients → judge → runner → tracing → reports → CLI.
 - **Phase B — data (T12–T14, owner-heavy):** dev set + prompt freeze ◆ → golden draft + open-coding + freeze ◆ → calibration labeling + certificate ◆. B starts as soon as T6 lands.

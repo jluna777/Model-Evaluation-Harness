@@ -79,7 +79,15 @@ disagree, raising loudly (``DualAnnotationError``) and naming every key if a
 disagreement has no adjudication row. Judge agreement/kappa is computed
 against this resolved gold, never against either annotator's raw label
 directly. ``Certificate.n_adjudicated`` discloses how many gold labels came
-from adjudication rather than spontaneous agreement.
+from adjudication rather than spontaneous agreement. Before any of that,
+``_validate_adjudication_round`` checks the WHOLE adjudication round up
+front and raises ``DualAnnotationError`` naming every offending row for any
+of: a non-owner adjudication row, an adjudication row on a key the two
+annotators already agree on, or an adjudication row keyed outside the shared
+initial key set -- each previously either silently ignored or silently
+discarded rather than raising. Gold resolution (and therefore this
+validation) runs before the judge is ever invoked in ``run_calibration``,
+since none of it depends on a live judge call.
 
 **Bootstrap omission disclosure (D2/agreement.py):** ``cohens_kappa``'s CI
 path may emit exactly one ``RuntimeWarning`` disclosing how many degenerate
@@ -496,6 +504,84 @@ class GoldLabel:
     source: Literal["agreement", "adjudication"]
 
 
+def _validate_adjudication_round(
+    labels: Sequence[CalibrationLabel], coverage: DualAnnotatorCoverage
+) -> dict[tuple[str, str, str], CalibrationLabel]:
+    """Validates every ``round="adjudication"`` row up front, before any gold
+    is resolved -- three schema-valid but semantically invalid shapes are
+    collected together and reported in one loud ``DualAnnotationError``,
+    never silently ignored or checked one at a time:
+
+    1. A ``round="adjudication"`` row whose ``annotator`` is not
+       ``coverage.owner`` -- spec §5 states adjudication rows are always the
+       owner's; a stray non-owner row was previously filtered out invisibly
+       by only ever looking up adjudications keyed to the owner.
+    2. An owner adjudication row keyed to a (item_id, candidate, field)
+       triple where the two annotators' ``"initial"`` verdicts already
+       AGREE -- adjudication only makes sense for a disagreement. Leaving
+       such a row in place and simply discarding its verdict (the previous
+       behavior) means a later edit to either initial row that turns
+       agreement into disagreement would silently pick up this stale row as
+       gold, rather than surfacing that the row needs attention.
+    3. An owner adjudication row keyed to a triple OUTSIDE the shared
+       initial key set (a typo'd item_id/candidate/field) -- previously
+       ignored entirely while the disagreement it was meant to resolve went
+       on to fail as "unadjudicated", misdirecting the fix to the wrong
+       place.
+
+    Returns the validated ``{key: CalibrationLabel}`` map of owner
+    adjudication rows -- every key in it is guaranteed to be one of
+    ``coverage.shared_keys`` where the two annotators' initial verdicts
+    disagree, ready for the hash check and gold resolution that follow.
+    """
+
+    non_owner_rows = sorted(
+        (label.annotator, label.item_id, label.candidate, label.field)
+        for label in labels
+        if label.round == "adjudication" and label.annotator != coverage.owner
+    )
+
+    # Duplicate-key detection among the owner's own adjudication rows reuses
+    # `_labels_by_annotator_round`'s existing all-or-nothing convention
+    # (raises ValueError on a duplicate).
+    adjudication_by_key = _labels_by_annotator_round(labels, coverage.owner, "adjudication")
+
+    shared_key_set = set(coverage.shared_keys)
+    agreed_keys = {
+        key
+        for key in coverage.shared_keys
+        if coverage.owner_by_key[key].verdict == coverage.other_by_key[key].verdict
+    }
+
+    keys_outside_shared = sorted(key for key in adjudication_by_key if key not in shared_key_set)
+    keys_on_agreed_verdicts = sorted(key for key in adjudication_by_key if key in agreed_keys)
+
+    problems: list[str] = []
+    if non_owner_rows:
+        problems.append(
+            f"{len(non_owner_rows)} adjudication row(s) from a non-owner annotator -- "
+            "round='adjudication' rows must always be authored by the owner "
+            f"({coverage.owner!r}, spec §5); (annotator, item_id, candidate, field): "
+            f"{non_owner_rows}"
+        )
+    if keys_on_agreed_verdicts:
+        problems.append(
+            f"{len(keys_on_agreed_verdicts)} adjudication row(s) keyed to (item_id, candidate, "
+            "field) triple(s) where the two annotators' initial verdicts already agree -- "
+            f"adjudication only resolves a disagreement: {keys_on_agreed_verdicts}"
+        )
+    if keys_outside_shared:
+        problems.append(
+            f"{len(keys_outside_shared)} adjudication row(s) keyed to (item_id, candidate, "
+            "field) triple(s) outside the shared initial-round key set (check for a typo'd "
+            f"item_id/candidate/field): {keys_outside_shared}"
+        )
+    if problems:
+        raise DualAnnotationError("; ".join(problems))
+
+    return adjudication_by_key
+
+
 def resolve_gold_labels(labels: Sequence[CalibrationLabel]) -> list[GoldLabel]:
     """Final gold labels for judge-agreement measurement (owner-approved
     dual-annotation upgrade, 2026-07-09): the owner's verdict where the two
@@ -504,6 +590,13 @@ def resolve_gold_labels(labels: Sequence[CalibrationLabel]) -> list[GoldLabel]:
     disagree. Requires the same complete, correctly-bound dual coverage as
     ``compute_iaa_ceiling`` (``_verify_dual_annotator_coverage``) -- gold can
     never be resolved from an incomplete or unbound label set.
+
+    The whole ``round="adjudication"`` round is validated up front
+    (``_validate_adjudication_round``) before any gold is resolved: a
+    non-owner adjudication row, an adjudication row on a key the two
+    annotators already agree on, or an adjudication row keyed outside the
+    shared initial key set each raise a loud ``DualAnnotationError`` naming
+    every offending row.
 
     Every disagreement without a matching adjudication row is a loud
     ``DualAnnotationError`` naming every unadjudicated key -- gold is never
@@ -514,14 +607,13 @@ def resolve_gold_labels(labels: Sequence[CalibrationLabel]) -> list[GoldLabel]:
     """
 
     coverage = _verify_dual_annotator_coverage(labels)
-    adjudication_by_key = _labels_by_annotator_round(labels, coverage.owner, "adjudication")
+    adjudication_by_key = _validate_adjudication_round(labels, coverage)
 
-    adjudication_mismatches = [
+    adjudication_mismatches = sorted(
         key
-        for key in coverage.shared_keys
-        if (adjudication := adjudication_by_key.get(key)) is not None
-        and adjudication.output_sha256 != coverage.owner_by_key[key].output_sha256
-    ]
+        for key, adjudication in adjudication_by_key.items()
+        if adjudication.output_sha256 != coverage.owner_by_key[key].output_sha256
+    )
     if adjudication_mismatches:
         raise CalibrationBindingError(adjudication_mismatches)
 
@@ -1029,15 +1121,22 @@ def run_calibration(
     if no judged triple has a matching gold label at all -- there is nothing
     to compute agreement on, which signals a wiring problem (mismatched
     dataset/label files) rather than a real calibration outcome to report on.
+
+    Gold is resolved BEFORE the judge is ever invoked: every
+    ``DualAnnotationError``/``CalibrationBindingError`` this function can
+    raise is computable from ``labels`` alone, so a labels-file defect fails
+    before spending a single judge call on ``judge_triples`` (finding: a
+    ~100-call judge spend used to run first and was never persisted on
+    failure, re-burning the full spend on every labels-file fix iteration).
     """
 
     triples_a = build_triples("a", run_a)
     triples_b = build_triples("b", run_b)
     all_triples = triples_a + triples_b
 
-    judged = judge_triples(judge, all_triples)
-
     gold = resolve_gold_labels(labels)
+
+    judged = judge_triples(judge, all_triples)
     n_adjudicated = sum(1 for g in gold if g.source == "adjudication")
 
     paired, judge_errors_excluded, unlabeled_excluded = pair_with_labels(judged, gold)

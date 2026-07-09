@@ -23,7 +23,7 @@ Derived from `docs/plan.md` (Validated v1.0). One ticket per plan task; tickets 
 | T16 | [Gate command + real baselines](T16-gate.md) | C | T01–T05, T07–T15 | |
 | T17 | [Gate-design doc + no-change demonstration](T17-gate-design-doc.md) | C | T16 | |
 | T18 | [CI workflow](T18-ci-workflow.md) | D | T16, T17 | |
-| T19 | [README, published artifacts, demo](T19-readme-published.md) | D | T14 retest, T17, T18 | ◆ |
+| T19 | [README, published artifacts, demo](T19-readme-published.md) | D | T14, T17, T18 | ◆ |
 | T20 | [Acceptance walk](T20-acceptance-walk.md) | D | T19 | |
 
-**Scheduling notes:** Phase B (owner data work) starts as soon as T06 lands and overlaps Phase A. T14's initial labeling is scheduled at the earliest possible date — the ≥1-week retest gap is a T19 entry criterion, not a T14 blocker. T16 is the convergence point: it needs the frozen prompt (T12), frozen dataset (T13), and calibration certificate (T14) before generating real baselines.
+**Scheduling notes:** Phase B (owner data work) starts as soon as T06 lands and overlaps Phase A. T14's initial labeling is scheduled at the earliest possible date — both annotators label in parallel (D2 amendment 2026-07-09), so T19's entry criterion is the committed certificate, not a calendar gap. T16 is the convergence point: it needs the frozen prompt (T12), frozen dataset (T13), and calibration certificate (T14) before generating real baselines.

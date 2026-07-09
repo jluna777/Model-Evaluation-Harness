@@ -881,9 +881,15 @@ def calibrate(
     (``harness.calibrate.resolve_gold_labels`` -- owner adjudication wins
     every disagreement) and computes the human-human agreement (IAA) ceiling
     (``compute_iaa_ceiling``) alongside judge agreement. Missing/incomplete
-    second-annotator coverage, or a disagreement with no adjudication row,
-    raises ``DualAnnotationError`` -- mapped to a clean exit 1 by
-    ``_clean_exit_on_expected_errors``, never a traceback.
+    second-annotator coverage, an adjudication row that is not the owner's,
+    an adjudication row on an already-agreed key or outside the shared key
+    set, or a disagreement with no adjudication row, all raise
+    ``DualAnnotationError`` -- mapped to a clean exit 1 by
+    ``_clean_exit_on_expected_errors``, never a traceback. This gold
+    resolution runs immediately after the labels file is loaded, before the
+    ``MissingTracingError`` check below and any candidate/judge client
+    construction -- a labels-file defect is computable from ``labels`` alone,
+    so it costs zero API calls and no client setup.
 
     Live (default): always reportable -- fails fast with ``MissingTracingError``
     if Langfuse credentials are absent, before any candidate or judge client is
@@ -939,6 +945,16 @@ def calibrate(
         # calibration run -- config.k is never inherited here.
         calibrate_cfg = effective_cfg.model_copy(update={"k": 1})
         calib_labels = calibrate_module.load_calibration_labels(labels_path)
+
+        # Finding: every DualAnnotationError/CalibrationBindingError this
+        # command can raise over labels.jsonl is computable from the labels
+        # alone (`resolve_gold_labels`) -- validate immediately, before the
+        # TraceContext/client construction below, so a labels-file defect
+        # costs zero API calls and no client setup (the same fail-before-
+        # construction precedent as MissingTracingError). `run_calibration`
+        # repeats this same pure resolution internally -- it must stay
+        # correct standalone, so calling it twice here is fine.
+        calibrate_module.resolve_gold_labels(calib_labels)
 
         # Fail-fast anchor (spec §5/§8, T9/T11): both TraceContexts are
         # constructed -- calibrate is always reportable -- before ANY
