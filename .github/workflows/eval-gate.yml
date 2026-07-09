@@ -85,7 +85,9 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        run: uv sync
+        # Locked sync guarantees the gate's CI reproducibility by failing
+        # loudly if uv.lock drifts from pyproject.toml.
+        run: uv sync --locked
 
       - name: Clean results/runs (belt-and-braces)
         # `eval gate` already guarantees a fresh, invocation-unique runs_root
@@ -136,12 +138,46 @@ jobs:
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           cat gate-report.md
 
+      - name: Redact secrets from report
+        if: always() && steps.gate.outcome == 'success'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+        shell: bash
+        # Defense-in-depth: scrub each secret's literal value from the report
+        # before posting to job summary or PR comment. GitHub Actions' log
+        # masking does not apply to gh pr comment --body-file, so SDK error
+        # text containing credential material bypasses automatic redaction --
+        # we redact here instead.
+        run: |
+          python -c "
+          import os
+          secrets = [
+              os.getenv('ANTHROPIC_API_KEY', ''),
+              os.getenv('OPENAI_API_KEY', ''),
+              os.getenv('GEMINI_API_KEY', ''),
+              os.getenv('LANGFUSE_PUBLIC_KEY', ''),
+              os.getenv('LANGFUSE_SECRET_KEY', ''),
+          ]
+          with open('gate-report.md', 'r') as f:
+              content = f.read()
+          for secret in secrets:
+              if secret:
+                  content = content.replace(secret, '***REDACTED***')
+          with open('gate-report.md', 'w') as f:
+              f.write(content)
+          "
+
       - name: Write job summary
+        if: always() && steps.gate.outcome == 'success'
         shell: bash
         run: cat gate-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post PR comment
-        if: github.event_name == 'pull_request'
+        if: always() && steps.gate.outcome == 'success' && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }} # automatic Actions token, not one of the five secrets above
         shell: bash
@@ -175,4 +211,11 @@ jobs:
         shell: bash
         run: |
           echo "::error title=Gate: measurement error::eval gate exited 2 -- the gate could not produce a trustworthy measurement (missing/mismatched baseline, judge-error budget exceeded, an aborted run, or a setup precondition failure such as missing credentials). This is NOT a candidate regression -- see the job summary or PR comment for details."
+          exit 1
+
+      - name: "FAIL: unexpected exit code"
+        if: steps.gate.outputs.exit_code != '0' && steps.gate.outputs.exit_code != '1' && steps.gate.outputs.exit_code != '2'
+        shell: bash
+        run: |
+          echo "::error title=Gate: unexpected exit code::eval gate exited with an unmapped code (${{ steps.gate.outputs.exit_code }}). The gate's contract (spec section 7) specifies only 0/1/2; an unmapped code indicates a gate implementation bug or a catastrophic failure (e.g., Python/CLI invocation crashed)."
           exit 1
