@@ -5,8 +5,11 @@ from harness.config import load_config
 from harness.judge import rubric
 
 RUBRIC_SENTENCE = (
-    "pass = same factual content as the reference — same issue/action, "
-    "no added claims, no missing essentials; wording may differ freely."
+    "pass = same issue/action as the reference, with no missing essentials "
+    "— additional detail is acceptable when it is accurate and grounded in "
+    "the email; fail = content not grounded in the email (invented or "
+    "hallucinated), contradicting the email or reference, or missing "
+    "something essential; wording may differ freely."
 )
 
 

@@ -63,7 +63,7 @@ The model interface is a thin internal protocol (`complete_structured(email, sch
 ## 4. Judge (D1)
 
 - Pointwise, reference-guided: each free-text field of each candidate output is judged in its own call — inputs are the email, the field's reference value, the candidate's value, and the binary rubric; output is `{verdict: pass|fail, rationale}`, Pydantic-validated.
-- Rubric (binary, per field): *pass = same factual content as the reference — same issue/action, no added claims, no missing essentials; wording may differ freely.* Rubric text, ordering, and examples are pinned and identical for both candidates.
+- Rubric (binary, per field, amended 2026-07-09): *pass = same issue/action as the reference, with no missing essentials — additional detail is acceptable when it is accurate and grounded in the email; fail = content not grounded in the email (invented or hallucinated), contradicting the email or reference, or missing something essential; wording may differ freely.* Rubric text, ordering, and examples are pinned and identical for both candidates.
 - **Few-shot examples:** pass/fail-labeled examples with one-line critiques, hand-written or drawn exclusively from `data/dev/` — never from golden or calibration items. They are part of the versioned judge prompt; changing them is a judge change.
 - Judge config: `gemini-2.5-pro` (re-pinned 2026-07-09, D1 amendment; fallback `gemini-3.5-flash`), temperature 0. The judge version = hash of {judge model, prompt, rubric, few-shots}; any change invalidates the current calibration certificate (§5).
 - **Judge health diagnostics (reported, never gating):**

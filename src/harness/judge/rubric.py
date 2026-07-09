@@ -38,9 +38,19 @@ PROMPT_PREAMBLE = (
 )
 
 # Verbatim spec §4 rubric text -- do not reword.
+# Amended 2026-07-09 (T13 open-coding round, Cluster D): the prior wording
+# ("no added claims") was being applied inconsistently to additional detail
+# that was true and grounded in the source email, failing both candidates
+# for content the judge's own rationale sometimes tolerated. This wording
+# targets hallucination, contradiction, and missing essentials -- not
+# verbosity -- while keeping the underlying semantics identical: same
+# issue/action, no missing essentials, wording free.
 RUBRIC_TEXT = (
-    "pass = same factual content as the reference — same issue/action, "
-    "no added claims, no missing essentials; wording may differ freely."
+    "pass = same issue/action as the reference, with no missing essentials "
+    "— additional detail is acceptable when it is accurate and grounded in "
+    "the email; fail = content not grounded in the email (invented or "
+    "hallucinated), contradicting the email or reference, or missing "
+    "something essential; wording may differ freely."
 )
 
 

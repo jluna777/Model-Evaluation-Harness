@@ -8,10 +8,19 @@ against golden or calibration items (spec §3, constitution Principle 6). It
 was re-frozen as ``prompt_version: 2`` on 2026-07-08 (owner ruling) to state
 the severity-aware priority rule in full -- the only wording change is the
 ``- priority:`` definition line; the only consumers of v1 were dev-scratch
-runs, never a golden or baseline run, so no re-baseline was required. Any
-future wording change must bump ``version`` and go through the
-``eval gate --update-baseline`` procedure (spec §7) -- that discipline is
-absolute, the judge_version analog for prompts.
+runs, never a golden or baseline run, so no re-baseline was required. It was
+re-frozen again as ``prompt_version: 3`` on 2026-07-09 (owner ruling, T13
+open-coding round, Cluster A defect) because v2's priority rule stated
+``urgent``, ``high``, and a ``normal`` fallback but never defined ``low`` --
+structurally unreachable for the 24% of golden items whose reference
+priority is ``low``. The only wording change is again the ``- priority:``
+definition line, adding a ``low`` clause and tightening the ``normal``
+clause so the two compose; the only consumers of v2 were dev-scratch runs
+and the uncalibrated open-coding draft run, never a golden or baseline run,
+so no re-baseline was required. Any future wording change must bump
+``version`` and go through the ``eval gate --update-baseline`` procedure
+(spec §7) -- that discipline is absolute, the judge_version analog for
+prompts.
 
 ``DEGRADED_DEMO_PROMPT`` (T16) exists solely for ``eval gate
 --seed-regression``'s documented demo mode: it is a deliberately weakened
@@ -52,8 +61,11 @@ class PromptTemplate:
 # procedure (spec §7) -- do not edit this text in place.
 # Re-frozen as v2 on 2026-07-08 (owner ruling): the `- priority:` line below
 # now states the severity-aware rule in full. No other wording changed.
+# Re-frozen as v3 on 2026-07-09 (owner ruling, T13 open-coding round, Cluster
+# A defect): the `- priority:` line now also defines `low`. No other wording
+# changed.
 EXTRACTION_PROMPT = PromptTemplate(
-    version=2,
+    version=3,
     template=(
         "Extract a structured support ticket from the customer support email below.\n\n"
         "From: {from_}\n"
@@ -79,8 +91,12 @@ EXTRACTION_PROMPT = PromptTemplate(
         "structural-failure hazard) regardless of stated timing or tone -- a calm \"no rush\" "
         "report of a gas leak is still urgent. Otherwise use high or urgent only under genuine "
         "forward time pressure: a stated date or event, roughly within the next two weeks, that "
-        "the resolution must precede. Use normal when neither signal is present. Tone alone is "
-        "never the signal -- content is.\n"
+        "the resolution must precede. Use low for requests with no concrete, unresolved problem "
+        "and no time pressure -- general inquiries, pre-sale product questions, feedback, or "
+        "account/administrative asks, including anything the customer explicitly marks as "
+        "no-hurry. Use normal for actionable issues -- a concrete problem needing resolution -- "
+        "when neither a safety nor a time-pressure signal is present; it remains the default "
+        "when nothing else applies. Tone alone is never the signal -- content is.\n"
         "- customer_name: the customer's name exactly as it appears in the email, or null "
         "if no name is given.\n"
         "- order_id: the order number exactly as it appears (form ORD-NNNNN), or null if "

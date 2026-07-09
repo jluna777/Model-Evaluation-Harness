@@ -60,10 +60,13 @@ class TestExtractionPromptFrozen:
     """T12: EXTRACTION_PROMPT is frozen against data/dev/ only. Re-frozen as
     prompt_version 2 on 2026-07-08 (owner ruling) to state the severity-aware
     priority rule in full -- any prompt wording change must bump the version,
-    no exceptions (the judge_version analog), so this pin moves 1 -> 2 here."""
+    no exceptions (the judge_version analog), so this pin moved 1 -> 2 here.
+    Re-frozen again as prompt_version 3 on 2026-07-09 (owner ruling, T13
+    open-coding round, Cluster A defect) to define `low`, so this pin moves
+    2 -> 3."""
 
-    def test_version_is_frozen_at_two(self):
-        assert EXTRACTION_PROMPT.version == 2
+    def test_version_is_frozen_at_three(self):
+        assert EXTRACTION_PROMPT.version == 3
 
     def test_rendered_prompt_contains_tie_break_sentence_verbatim(self):
         rendered = EXTRACTION_PROMPT.render(_email())
@@ -91,6 +94,16 @@ class TestExtractionPromptFrozen:
         rendered = EXTRACTION_PROMPT.render(_email())
         assert "safety-critical issue" in rendered
         assert "regardless of stated timing or tone" in rendered
+
+    def test_rendered_prompt_defines_low_priority(self):
+        # v3 re-freeze (owner ruling, 2026-07-09, T13 open-coding Cluster A):
+        # v2 never defined `low`, leaving it structurally unreachable for the
+        # 24% of golden items whose reference priority is `low`. A stable
+        # substring of the new `low` clause must survive in the rendered
+        # prompt, and it must compose with an unconditional `normal` default.
+        rendered = EXTRACTION_PROMPT.render(_email())
+        assert "Use low for requests with no concrete, unresolved problem" in rendered
+        assert "Use normal for actionable issues" in rendered
 
     def test_rendered_prompt_instructs_schema_only_output(self):
         rendered = EXTRACTION_PROMPT.render(_email())

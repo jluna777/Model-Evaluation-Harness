@@ -127,6 +127,10 @@ class TestFingerprint:
         # and hard-coding the result, so this test fails loudly if the
         # refactor ever changes a fingerprint's value, not just its
         # stability/reproducibility (already covered above).
+        # Recomputed 2026-07-09 (T13 open-coding round): `configs/default.yaml`
+        # `prompt_version` moved 2 -> 3 (Cluster A defect, `low` now defined),
+        # which is itself a fingerprint component -- an intentional hash
+        # change, not a refactor regression.
         config = load_config(DEFAULT_CONFIG_PATH)
 
         fp = fingerprint(
@@ -137,4 +141,4 @@ class TestFingerprint:
             calibration_verdict="adequate",
         )
 
-        assert fp == "d74a075bc9090d4bdc7f5f3f00ab57814291b6f005a304967e8a80861430591b"
+        assert fp == "e2ad03bdb22618e73e8ceea5977c595f2025a97838df35dc4e6673d5852f8487"
