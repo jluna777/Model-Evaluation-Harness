@@ -31,7 +31,7 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 
 ## D2 — Judge calibration and agreement reporting
 
-**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-09
+**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-09, 2026-07-09b
 **Decision:** Binary pass/fail rubric with written rationale. Calibration data is disjoint from the golden set: dedicated calibration emails, both candidates' outputs, every free-text field labeled by the owner, stratified toward borderline/failing outputs. Cohen's kappa (with cluster-bootstrap CI) is the single deciding agreement statistic, reported per candidate; raw agreement and prevalence are descriptive context. Owner test-retest relabeling provides an estimated consistency ceiling. Operational parameters: spec §5.
 
 **Options considered:** (1) binary rubric + stratified set + test-retest *(chosen)*; (2) 1–5 graded rubric (weighted kappa + Spearman); (3) binary with minimal calibration, no retest.
@@ -61,6 +61,13 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 - Adjudicated labels are better gold than either annotator's raw verdict alone: a disagreement flags genuine ambiguity, and the owner's adjudication — informed by seeing BOTH verdicts and critiques — is a more considered judgment than either annotator's first-pass label written without that context.
 - Judge-vs-human agreement measured against human-vs-human agreement (the IAA ceiling) is the literature-standard adequacy framing for annotation tasks — inter-rater reliability is the conventional benchmark a machine rater is held to, more standard than comparing a judge to one annotator's own retest stability.
 - The ceiling measures task ambiguity — not annotator inconsistency — only if both annotators apply the SAME labeling rules: the second annotator must read the written rubric/conventions before labeling, exactly as the owner does. This is a stated precondition of the upgrade, not an automatic guarantee, and is named explicitly so a future reader does not mistake a badly-briefed second annotator's low agreement for judge inadequacy.
+
+**Amendment 2026-07-09b (owner, population-parity correction):** every number on the calibration certificate — judge kappa (overall and per-candidate), the ceiling kappa and its CI, and `n_adjudicated` — must be computed over exactly one population: the paired, validly-judged key set. A gold label with no corresponding judgment, or a judged key that neither annotator labeled, now raises `DualAnnotationError` naming every offending key — this replaces the prior `unlabeled_excluded` tolerance, under which a judged-but-unlabeled key was silently dropped from judge kappa while the ceiling kept computing over the full labeled set regardless. A judge error remains the one tolerated gap, now excluded from the ceiling kappa and `n_adjudicated` as well as judge kappa, so the two populations never diverge.
+
+**Rationale (this amendment):**
+- The ceiling is only a valid comparison target for judge kappa if both are computed over the same set of judgments: comparing a judge kappa on one population against a ceiling kappa on a different, larger or smaller one silently invalidates the "judge kappa exceeding the ceiling is estimation noise" claim the certificate rests on.
+- Output-hash binding (F1) cannot catch this class of drift: a label and a judgment that no longer correspond to each other are simply absent from one side or the other, not mismatched — divergence removes keys from the paired set rather than corrupting a shared key, so it escapes the hash check entirely.
+- Consistent with the module's loud-never-silent convention: every other label-file inconsistency (`DualAnnotationError`/`CalibrationBindingError`) already raises rather than silently excludes; the retired `unlabeled_excluded` count was the one remaining silent-tolerance exception.
 
 **Revisit if:** the judge fails adequacy twice; a second annotator becomes available; per-candidate agreement diverges (→ D1 review).
 

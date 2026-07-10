@@ -89,6 +89,31 @@ discarded rather than raising. Gold resolution (and therefore this
 validation) runs before the judge is ever invoked in ``run_calibration``,
 since none of it depends on a live judge call.
 
+**Population parity (owner-ruled correction, 2026-07-09):** every number on
+the certificate -- judge kappa (overall and per-candidate), the ceiling
+kappa + its CI (``compute_iaa_ceiling``), and ``Certificate.n_adjudicated``
+-- is computed over exactly ONE population: the paired, validly-judged key
+set. ``_pair_entries`` (shared by ``pair_with_labels``/``pair_judgments_
+with_labels``) enforces this right after its output-binding check (finding
+F1): a gold label with no corresponding judgment, or a judged key labeled by
+neither annotator, each raise ``DualAnnotationError`` naming every
+offending key -- this REPLACES the old ``unlabeled_excluded`` tolerance,
+under which a judged-but-unlabeled key was silently excluded from judge
+kappa while the ceiling kept computing over the full doubly-labeled set
+regardless. That population mismatch is exactly the kind of drift output-
+hash binding cannot catch: divergence removes a key from the paired set
+rather than corrupting a shared one, so it never trips the F1 check. A
+judge error (``verdict is None``) remains the one tolerated gap -- the
+judge failing on a key is not a label-file bug -- now excluded from the
+ceiling kappa and ``n_adjudicated`` as well as judge kappa (previously only
+the latter), so the key set behind judge kappa and the key set behind
+ceiling kappa/``n_adjudicated`` are identical by construction after these
+checks run. Live (``run_calibration``): the population-parity checks run
+after judging, since they depend on the judgment set; the labels-only
+validations above still run first. Offline (``run_calibration_offline``):
+every input is already on disk, so every check runs before any statistic is
+computed.
+
 **Bootstrap omission disclosure (D2/agreement.py):** ``cohens_kappa``'s CI
 path may emit exactly one ``RuntimeWarning`` disclosing how many degenerate
 bootstrap resamples were omitted (see ``stats/agreement.py``'s module
@@ -309,9 +334,10 @@ class CalibrationBindingError(Exception):
     All-or-nothing: raised only after every judged item has been checked,
     naming EVERY mismatched ``(item_id, candidate, field)`` key and the total
     count -- pairing never proceeds partially. Silently excluding just the
-    mismatched keys (the way an unlabeled/judge-error triple is excluded)
-    would hide exactly the kind of silent misalignment this check exists to
-    catch, so it is a hard failure instead.
+    mismatched keys (the way a judge-error triple is excluded, the one
+    tolerated gap -- population-parity invariant, 2026-07-09) would hide
+    exactly the kind of silent misalignment this check exists to catch, so
+    it is a hard failure instead.
     """
 
     def __init__(self, mismatches: Sequence[tuple[str, str, str]]) -> None:
@@ -331,11 +357,17 @@ class DualAnnotationError(Exception):
     D2): exactly two annotators with ``round="initial"`` labels, one of them
     ``OWNER_ANNOTATOR``, both covering the EXACT same set of ``(item_id,
     candidate, field)`` keys, and -- for ``resolve_gold_labels`` -- every
-    disagreement between them backed by an owner adjudication row. Never
-    partially resolved: every message names every offending key so the
-    labels file can be fixed directly, mirroring ``CalibrationBindingError``'s
-    all-or-nothing precedent. The CLI maps this to a clean exit 1
-    (``_clean_exit_on_expected_errors``), never a traceback."""
+    disagreement between them backed by an owner adjudication row. Also
+    raised by ``_pair_entries`` (population-parity invariant, owner-ruled
+    2026-07-09, module docstring) when a gold label has no corresponding
+    judgment, or a judged key was labeled by neither annotator -- the SAME
+    "the labels file and the rest of the data must describe the exact same
+    keys" family of check, just against the judgment set instead of the
+    second annotator's rows. Never partially resolved: every message names
+    every offending key so the labels file can be fixed directly, mirroring
+    ``CalibrationBindingError``'s all-or-nothing precedent. The CLI maps this
+    to a clean exit 1 (``_clean_exit_on_expected_errors``), never a
+    traceback."""
 
 
 def _initial_labels_by_annotator(
@@ -461,6 +493,7 @@ def _verify_dual_annotator_coverage(
 def compute_iaa_ceiling(
     labels: Sequence[CalibrationLabel],
     *,
+    keys: Sequence[tuple[str, str, str]] | None = None,
     ci_level: float = DEFAULT_CI_LEVEL,
     n_resamples: int = DEFAULT_N_RESAMPLES,
     seed: int = 0,
@@ -474,12 +507,30 @@ def compute_iaa_ceiling(
     (``_verify_dual_annotator_coverage``) -- there is no partial-intersection
     tolerance the way the old ceiling had, because an incomplete second
     annotator undermines the ceiling's whole premise.
+
+    ``keys`` (population-parity invariant, owner-ruled 2026-07-09), when
+    given, restricts the computation to that key subset -- the SAME
+    validly-judged population judge kappa is computed over (``_pair_
+    entries``'s ``valid_keys``), so a judge error on one key shrinks the
+    ceiling's population together with judge kappa's, never independently.
+    Every key in ``keys`` is expected to already be one of the doubly-
+    labeled ``shared_keys`` (guaranteed upstream by ``_pair_entries``'s
+    population-parity check); a ``keys`` entry outside ``shared_keys`` is
+    silently ignored rather than raised, since restriction is purely a
+    subset filter. When omitted (the default), the ceiling is computed over
+    the full doubly-labeled set -- used by direct/standalone callers of this
+    function that have no judgment set to restrict against.
     """
 
     coverage = _verify_dual_annotator_coverage(labels)
-    a = [coverage.owner_by_key[k].verdict for k in coverage.shared_keys]
-    b = [coverage.other_by_key[k].verdict for k in coverage.shared_keys]
-    clusters = [k[0] for k in coverage.shared_keys]  # item_id (email)
+    if keys is None:
+        selected = coverage.shared_keys
+    else:
+        allowed = set(keys)
+        selected = tuple(k for k in coverage.shared_keys if k in allowed)
+    a = [coverage.owner_by_key[k].verdict for k in selected]
+    b = [coverage.other_by_key[k].verdict for k in selected]
+    clusters = [k[0] for k in selected]  # item_id (email)
     result, messages = _kappa_with_capture(
         a, b, clusters, ci_level=ci_level, n_resamples=n_resamples, seed=seed
     )
@@ -691,16 +742,38 @@ def _gold_by_key(gold: Sequence[GoldLabel]) -> dict[tuple[str, str, str], GoldLa
 def _pair_entries(
     entries: Sequence[tuple[tuple[str, str, str], Literal["pass", "fail"] | None, str]],
     gold: Sequence[GoldLabel],
-) -> tuple[list[PairedJudgment], int, int]:
-    """Shared pairing/binding-check core for ``pair_with_labels`` (live,
-    entries carry a freshly-recomputed ``hash_output``) and
-    ``pair_judgments_with_labels`` (offline, entries carry a previously-
-    persisted hash) -- finding F1/F2. ``entries`` is ``(key, verdict, hash)``
-    per judged item, in judged order.
+) -> tuple[list[PairedJudgment], int, tuple[tuple[str, str, str], ...]]:
+    """Shared pairing/binding-check/population-parity core for
+    ``pair_with_labels`` (live, entries carry a freshly-recomputed
+    ``hash_output``) and ``pair_judgments_with_labels`` (offline, entries
+    carry a previously-persisted hash) -- finding F1/F2, and the
+    population-parity invariant (owner-ruled, 2026-07-09, module docstring).
+    ``entries`` is ``(key, verdict, hash)`` per judged item, in judged order.
 
-    The binding check runs to completion over every entry with a matching
-    gold label BEFORE any pairing happens (all-or-nothing, module docstring):
-    on any ``CalibrationBindingError``, nothing is paired at all.
+    Three checks run, each to completion over every entry, before any
+    pairing happens -- all-or-nothing, in this order:
+
+    1. **Output binding (finding F1):** any entry whose hash disagrees with
+       its matching gold label's raises ``CalibrationBindingError`` naming
+       every mismatched key.
+    2. **Gold label with no corresponding judgment:** a key present in
+       ``gold`` (the doubly-labeled, resolved set) but absent from
+       ``entries`` raises ``DualAnnotationError`` -- nothing legitimate
+       produces this; it means ``labels.jsonl`` and the judged/persisted
+       judgment set have drifted apart.
+    3. **Judgment that neither annotator labeled:** a key present in
+       ``entries`` but absent from ``gold`` raises ``DualAnnotationError``
+       -- this REPLACES the old ``unlabeled_excluded`` tolerance: a judged
+       key with no label from either annotator is a labels-file gap, not a
+       benign, silently-counted exclusion.
+
+    After both population checks pass, ``gold`` and ``entries`` describe the
+    EXACT same key set. The one tolerated gap is a judge error (``verdict is
+    None``): those keys are excluded from the returned ``paired`` judgments
+    and from ``valid_keys`` -- the SAME population the caller must also use
+    for the ceiling kappa and ``n_adjudicated`` (population-parity
+    invariant) -- while still counted in the returned ``judge_errors``
+    count and disclosed in the report, never silently dropped.
     """
 
     by_gold = _gold_by_key(gold)
@@ -713,36 +786,61 @@ def _pair_entries(
     if mismatches:
         raise CalibrationBindingError(mismatches)
 
+    judged_keys = {key for key, _verdict, _output_hash in entries}
+    gold_keys = set(by_gold)
+
+    gold_without_judgment = sorted(gold_keys - judged_keys)
+    judged_without_gold = sorted(judged_keys - gold_keys)
+    problems: list[str] = []
+    if gold_without_judgment:
+        problems.append(
+            f"{len(gold_without_judgment)} gold label(s) have no corresponding judgment -- "
+            "labels.jsonl and the judged/persisted judgment set describe different items; "
+            "either the item was never judged or the judged/persisted data is stale "
+            f"(item_id, candidate, field): {gold_without_judgment}"
+        )
+    if judged_without_gold:
+        problems.append(
+            f"{len(judged_without_gold)} judged key(s) were labeled by neither annotator -- "
+            "every judged field must be doubly labeled (round='initial' by both annotators) "
+            f"before it can be judged; add the missing labels (item_id, candidate, field): "
+            f"{judged_without_gold}"
+        )
+    if problems:
+        raise DualAnnotationError("; ".join(problems))
+
     paired: list[PairedJudgment] = []
     judge_errors = 0
-    unlabeled = 0
+    valid_keys: list[tuple[str, str, str]] = []
     for key, verdict, _output_hash in entries:
-        g = by_gold.get(key)
-        if g is None:
-            unlabeled += 1
-            continue
+        g = by_gold[key]
         if verdict is None:
             judge_errors += 1
             continue
+        valid_keys.append(key)
         paired.append(
             PairedJudgment(
                 item_id=key[0], candidate=key[1], owner_verdict=g.verdict, judge_verdict=verdict
             )
         )
-    return paired, judge_errors, unlabeled
+    return paired, judge_errors, tuple(valid_keys)
 
 
 def pair_with_labels(
     judged: Sequence[JudgedTriple], gold: Sequence[GoldLabel]
-) -> tuple[list[PairedJudgment], int, int]:
+) -> tuple[list[PairedJudgment], int, tuple[tuple[str, str, str], ...]]:
     """Joins judged triples to resolved GOLD labels (``resolve_gold_labels``).
 
-    Returns ``(paired, judge_errors_excluded, unlabeled_excluded)``: a judge
-    error (``verdict is None``) is excluded, never coerced to ``"fail"``
-    (spec §7); a judged triple with no matching gold label is excluded and
-    counted separately (e.g. a stratification-loop addition not yet
-    labeled). Both exclusion counts are disclosed in the report rather than
-    silently dropped.
+    Returns ``(paired, judge_errors_excluded, valid_keys)``: a judge error
+    (``verdict is None``) is excluded from ``paired``, never coerced to
+    ``"fail"`` (spec §7), and its key is likewise excluded from
+    ``valid_keys`` -- the population-parity invariant (owner-ruled,
+    2026-07-09, module docstring): the caller must use this SAME
+    ``valid_keys`` set to restrict the ceiling kappa and ``n_adjudicated``,
+    so judge kappa and those two numbers are always computed over identical
+    key sets. A judged triple with no matching gold label, or a gold label
+    with no matching judged triple, is no longer silently excluded (the
+    retired ``unlabeled_excluded`` tolerance) -- see ``_pair_entries``.
 
     **Output-binding check (finding F1):** before any of the above, every
     gold label whose key matches a judged triple has its ``output_sha256``
@@ -1066,8 +1164,15 @@ class CalibrationResult:
 
     ``n_adjudicated`` (dual-annotation upgrade, 2026-07-09): count of gold
     labels resolved via owner adjudication rather than spontaneous agreement
-    between the two annotators -- honest disclosure, surfaced verbatim on
-    ``Certificate.n_adjudicated``.
+    between the two annotators, restricted to the same valid, judge-error-
+    free population as judge kappa (population-parity invariant, owner-ruled
+    2026-07-09) -- honest disclosure, surfaced verbatim on ``Certificate.
+    n_adjudicated``.
+
+    ``unlabeled_excluded`` is retired (population-parity invariant,
+    2026-07-09): a judged key with no label from either annotator is now a
+    loud ``DualAnnotationError`` (``_pair_entries``), never a silently
+    counted exclusion, so there is nothing left to disclose here.
     """
 
     judge_version: str
@@ -1080,7 +1185,6 @@ class CalibrationResult:
     initial_fail_rate: float
     fail_enrichment_note: bool
     judge_errors_excluded: int
-    unlabeled_excluded: int
     self_consistency: SelfConsistencyResult
     ceiling: KappaResult | None
     warnings: tuple[str, ...]
@@ -1116,18 +1220,25 @@ def run_calibration(
     single-annotator design's degraded, ceiling-less mode no longer exists.
 
     Raises ``DualAnnotationError``/``CalibrationBindingError`` (via
-    ``resolve_gold_labels``/``compute_iaa_ceiling``) if the two annotators'
-    labels do not satisfy the dual-annotation precondition, or ``ValueError``
-    if no judged triple has a matching gold label at all -- there is nothing
-    to compute agreement on, which signals a wiring problem (mismatched
-    dataset/label files) rather than a real calibration outcome to report on.
+    ``resolve_gold_labels``/``pair_with_labels``/``compute_iaa_ceiling``) if
+    the two annotators' labels do not satisfy the dual-annotation
+    precondition, or ``ValueError`` if no judged triple has a matching gold
+    label at all -- there is nothing to compute agreement on, which signals a
+    wiring problem (mismatched dataset/label files) rather than a real
+    calibration outcome to report on.
 
     Gold is resolved BEFORE the judge is ever invoked: every
-    ``DualAnnotationError``/``CalibrationBindingError`` this function can
-    raise is computable from ``labels`` alone, so a labels-file defect fails
-    before spending a single judge call on ``judge_triples`` (finding: a
-    ~100-call judge spend used to run first and was never persisted on
-    failure, re-burning the full spend on every labels-file fix iteration).
+    ``DualAnnotationError``/``CalibrationBindingError`` ``resolve_gold_
+    labels`` can raise is computable from ``labels`` alone, so a labels-file
+    defect fails before spending a single judge call on ``judge_triples``
+    (finding: a ~100-call judge spend used to run first and was never
+    persisted on failure, re-burning the full spend on every labels-file fix
+    iteration). ``pair_with_labels``'s population-parity checks (a gold label
+    with no corresponding judgment, or a judged key labeled by neither
+    annotator -- owner-ruled 2026-07-09, module docstring) necessarily run
+    AFTER judging instead, since they depend on the judgment set; their
+    result, ``valid_keys``, then restricts the ceiling kappa and
+    ``n_adjudicated`` to the SAME population judge kappa was computed over.
     """
 
     triples_a = build_triples("a", run_a)
@@ -1137,9 +1248,13 @@ def run_calibration(
     gold = resolve_gold_labels(labels)
 
     judged = judge_triples(judge, all_triples)
-    n_adjudicated = sum(1 for g in gold if g.source == "adjudication")
 
-    paired, judge_errors_excluded, unlabeled_excluded = pair_with_labels(judged, gold)
+    # Population-parity invariant (owner-ruled, 2026-07-09, module
+    # docstring): these checks depend on the judgment set, so -- unlike the
+    # labels-only validations inside resolve_gold_labels above -- they
+    # necessarily run after judging. `valid_keys` is the SAME population the
+    # ceiling kappa and n_adjudicated below must also use.
+    paired, judge_errors_excluded, valid_keys = pair_with_labels(judged, gold)
     if not paired:
         raise ValueError(
             "no gold label matched a judged calibration output -- check that "
@@ -1170,8 +1285,18 @@ def run_calibration(
         judge, fixed_triples, repeats=self_consistency_repeats
     )
 
+    # Population-parity invariant: the ceiling is restricted to `valid_keys`
+    # -- the exact same key set judge kappa was just computed over -- and
+    # n_adjudicated is restricted to that same set, so a judge error on one
+    # key shrinks both together (never just judge kappa, as before).
     ceiling, ceiling_warnings = compute_iaa_ceiling(
-        labels, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+        labels, keys=valid_keys, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+    )
+    valid_key_set = set(valid_keys)
+    n_adjudicated = sum(
+        1
+        for g in gold
+        if g.source == "adjudication" and (g.item_id, g.candidate, g.field) in valid_key_set
     )
 
     resolved_date = resolve_certificate_date(labels, date_override)
@@ -1187,7 +1312,6 @@ def run_calibration(
         initial_fail_rate=initial_fail_rate,
         fail_enrichment_note=fail_enrichment_note,
         judge_errors_excluded=judge_errors_excluded,
-        unlabeled_excluded=unlabeled_excluded,
         self_consistency=self_consistency,
         ceiling=ceiling,
         warnings=agreement_warnings + ceiling_warnings,
@@ -1270,9 +1394,9 @@ def render_calibration_report(result: CalibrationResult) -> str:
         lines.append("")
 
     lines.append(
-        f"Excluded from agreement: {result.judge_errors_excluded} judge error(s) (never "
-        f"counted as fail, spec §7), {result.unlabeled_excluded} judged field(s) with no "
-        "matching label."
+        f"Excluded from judge kappa, the ceiling kappa, and n_adjudicated alike "
+        f"(population-parity invariant): {result.judge_errors_excluded} judge error(s) (never "
+        "counted as fail, spec §7)."
     )
     lines.append("")
 
@@ -1386,7 +1510,7 @@ def judgment_records_from_judged(
 
 def pair_judgments_with_labels(
     judgments: Sequence[JudgmentRecord], gold: Sequence[GoldLabel]
-) -> tuple[list[PairedJudgment], int, int]:
+) -> tuple[list[PairedJudgment], int, tuple[tuple[str, str, str], ...]]:
     """The offline counterpart to ``pair_with_labels`` (finding F2): joins
     PERSISTED judgments (not freshly re-judged triples) to resolved GOLD
     labels, with the same all-or-nothing output-binding check -- except the
@@ -1394,7 +1518,12 @@ def pair_judgments_with_labels(
     gold label's directly (no candidate output is available offline to
     re-hash), rather than recomputing the hash from a live ``candidate_value``
     the way ``pair_with_labels`` does. See ``CalibrationBindingError``/module
-    docstring."""
+    docstring.
+
+    Returns ``(paired, judge_errors_excluded, valid_keys)`` -- the same
+    population-parity contract ``pair_with_labels`` returns (see there and
+    ``_pair_entries``): the caller must restrict the ceiling kappa and
+    ``n_adjudicated`` to this SAME ``valid_keys`` set."""
 
     entries = [
         ((j.item_id, j.candidate, j.field), j.verdict, j.output_sha256) for j in judgments
@@ -1439,8 +1568,11 @@ def run_calibration_offline(
     ``labels.jsonl`` -- no ``Judge``/``ModelClient``/candidate run is ever
     touched or constructed. Mirrors ``run_calibration``'s pipeline exactly,
     substituting persisted judgments for a freshly re-judged triple set (gold
-    resolution and the human-human IAA ceiling are unaffected either way:
-    both only ever read ``labels``, live or offline).
+    resolution is unaffected either way: it only ever reads ``labels``, live
+    or offline). Unlike the live path, every input here is already on disk,
+    so every check -- gold resolution's labels-only validations AND ``pair_
+    judgments_with_labels``'s population-parity checks alike (owner-ruled,
+    2026-07-09, module docstring) -- runs before any statistic is computed.
 
     Fails loudly rather than silently recompute against data the certificate
     can no longer trust:
@@ -1451,6 +1583,11 @@ def run_calibration_offline(
     - ``DualAnnotationError``/``CalibrationBindingError`` if the two
       annotators' labels do not satisfy the dual-annotation precondition
       (``resolve_gold_labels``/``compute_iaa_ceiling``).
+    - ``DualAnnotationError`` if a gold label has no corresponding persisted
+      judgment, or a persisted judgment's key was labeled by neither
+      annotator (population-parity invariant, ``pair_judgments_with_
+      labels``/``_pair_entries``) -- replaces the retired ``unlabeled_
+      excluded`` tolerance.
     - ``CalibrationBindingError`` if any judgment's persisted
       ``output_sha256`` disagrees with its matching gold label's (the same
       F1 binding check ``pair_with_labels`` runs live, applied here to the
@@ -1465,9 +1602,11 @@ def run_calibration_offline(
         raise StaleJudgmentsError(judgments.judge_version, current_judge_version)
 
     gold = resolve_gold_labels(labels)
-    n_adjudicated = sum(1 for g in gold if g.source == "adjudication")
 
-    paired, judge_errors_excluded, unlabeled_excluded = pair_judgments_with_labels(
+    # Population-parity invariant (owner-ruled, 2026-07-09, module
+    # docstring): `valid_keys` is the same population the ceiling kappa and
+    # n_adjudicated below must also be restricted to.
+    paired, judge_errors_excluded, valid_keys = pair_judgments_with_labels(
         judgments.judgments, gold
     )
     if not paired:
@@ -1494,7 +1633,13 @@ def run_calibration_offline(
     self_consistency = _self_consistency_from_records(judgments.self_consistency)
 
     ceiling, ceiling_warnings = compute_iaa_ceiling(
-        labels, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+        labels, keys=valid_keys, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+    )
+    valid_key_set = set(valid_keys)
+    n_adjudicated = sum(
+        1
+        for g in gold
+        if g.source == "adjudication" and (g.item_id, g.candidate, g.field) in valid_key_set
     )
 
     resolved_date = resolve_certificate_date(labels, date_override)
@@ -1510,7 +1655,6 @@ def run_calibration_offline(
         initial_fail_rate=initial_fail_rate,
         fail_enrichment_note=fail_enrichment_note,
         judge_errors_excluded=judge_errors_excluded,
-        unlabeled_excluded=unlabeled_excluded,
         self_consistency=self_consistency,
         ceiling=ceiling,
         warnings=agreement_warnings + ceiling_warnings,

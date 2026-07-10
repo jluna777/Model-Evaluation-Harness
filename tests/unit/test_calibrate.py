@@ -371,31 +371,29 @@ class TestJudgeTriples:
 
 
 class TestPairWithLabels:
-    def test_pairs_matching_gold_and_excludes_judge_errors_and_unlabeled(self):
+    def test_pairs_matching_gold_and_excludes_judge_errors(self):
         email = make_item("cal-001").email
         triples = [
             Triple("cal-001", "a", "issue_summary", email, "ref", "v1"),  # gold, pass/pass
             Triple("cal-001", "a", "requested_action", email, "ref", "v2"),  # judge error
-            Triple("cal-002", "a", "issue_summary", email, "ref", "v3"),  # unlabeled
         ]
         judged = [
             JudgedTriple(triples[0], verdict="pass", error=None, rationale="ok"),
             JudgedTriple(triples[1], verdict=None, error="refusal", rationale=None),
-            JudgedTriple(triples[2], verdict="pass", error=None, rationale="ok"),
         ]
         gold = [
             make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
             make_gold("cal-001", "a", "requested_action", "pass", candidate_value="v2"),
         ]
 
-        paired, judge_errors, unlabeled = pair_with_labels(judged, gold)
+        paired, judge_errors, valid_keys = pair_with_labels(judged, gold)
 
         assert len(paired) == 1
         assert paired[0].item_id == "cal-001"
         assert paired[0].owner_verdict == "pass"
         assert paired[0].judge_verdict == "pass"
         assert judge_errors == 1
-        assert unlabeled == 1
+        assert valid_keys == (("cal-001", "a", "issue_summary"),)
 
     def test_duplicate_gold_for_same_key_raises(self):
         gold = [
@@ -405,6 +403,84 @@ class TestPairWithLabels:
 
         with pytest.raises(ValueError, match="duplicate"):
             pair_with_labels([], gold)
+
+
+# --------------------------------------------------------------------------
+# pair_with_labels: population-parity invariant (owner-ruled, 2026-07-09)
+# --------------------------------------------------------------------------
+
+
+class TestPairWithLabelsPopulationParity:
+    def test_gold_without_judgment_raises(self):
+        """Case 1: a gold label whose key has no corresponding judged entry
+        at all raises DualAnnotationError, not a silent skip."""
+
+        gold = [make_gold("cal-999", "a", "issue_summary", "pass", candidate_value="v")]
+
+        with pytest.raises(calibrate.DualAnnotationError) as excinfo:
+            pair_with_labels([], gold)
+
+        message = str(excinfo.value)
+        assert "no corresponding judgment" in message
+        assert "('cal-999', 'a', 'issue_summary')" in message
+
+    def test_judgment_unlabeled_by_both_annotators_raises(self):
+        """Case 2: a judged triple whose key was labeled by neither
+        annotator (absent from gold) raises DualAnnotationError -- replaces
+        the old unlabeled_excluded tolerance."""
+
+        email = make_item("cal-001").email
+        triple = Triple("cal-001", "a", "issue_summary", email, "ref", "v1")
+        judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
+
+        with pytest.raises(calibrate.DualAnnotationError) as excinfo:
+            pair_with_labels(judged, [])
+
+        message = str(excinfo.value)
+        assert "labeled by neither annotator" in message
+        assert "('cal-001', 'a', 'issue_summary')" in message
+
+    def test_both_directions_reported_together(self):
+        """Both population-parity violations, when present at once, are
+        reported in a single error, mirroring the existing all-violations-
+        together convention (`_validate_adjudication_round`)."""
+
+        email = make_item("cal-001").email
+        triple = Triple("cal-001", "a", "issue_summary", email, "ref", "v1")
+        judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
+        gold = [make_gold("cal-999", "a", "issue_summary", "pass", candidate_value="v")]
+
+        with pytest.raises(calibrate.DualAnnotationError) as excinfo:
+            pair_with_labels(judged, gold)
+
+        message = str(excinfo.value)
+        assert "no corresponding judgment" in message
+        assert "labeled by neither annotator" in message
+
+    def test_judge_error_key_is_tolerated_and_excluded_from_valid_keys(self):
+        """The ONE tolerated gap: a judge error on a key that IS doubly
+        labeled excludes it from `paired` and from the returned `valid_keys`,
+        without raising."""
+
+        email = make_item("cal-001").email
+        triples = [
+            Triple("cal-001", "a", "issue_summary", email, "ref", "v1"),
+            Triple("cal-002", "a", "issue_summary", email, "ref", "v2"),
+        ]
+        judged = [
+            JudgedTriple(triples[0], verdict=None, error="refusal", rationale=None),
+            JudgedTriple(triples[1], verdict="pass", error=None, rationale="ok"),
+        ]
+        gold = [
+            make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
+            make_gold("cal-002", "a", "issue_summary", "pass", candidate_value="v2"),
+        ]
+
+        paired, judge_errors, valid_keys = pair_with_labels(judged, gold)
+
+        assert judge_errors == 1
+        assert len(paired) == 1
+        assert valid_keys == (("cal-002", "a", "issue_summary"),)
 
 
 # --------------------------------------------------------------------------
@@ -457,26 +533,24 @@ class TestPairWithLabelsOutputBinding:
         judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
         gold = [make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="exact-value")]
 
-        paired, judge_errors, unlabeled = pair_with_labels(judged, gold)
+        paired, judge_errors, valid_keys = pair_with_labels(judged, gold)
 
         assert len(paired) == 1
         assert judge_errors == 0
-        assert unlabeled == 0
+        assert valid_keys == (("cal-001", "a", "issue_summary"),)
 
-    def test_unlabeled_triple_is_never_hash_checked(self):
-        """A triple with no matching gold label at all can't mismatch --
-        there is no label to compare against, so it is simply counted
-        unlabeled."""
+    def test_unlabeled_triple_is_never_hash_checked_but_raises_population_parity_error(self):
+        """A triple with no matching gold label at all can't mismatch by
+        hash -- there is no label to compare against -- but under the
+        population-parity invariant (2026-07-09) it is no longer silently
+        counted "unlabeled": it raises DualAnnotationError instead."""
 
         email = make_item("cal-001").email
         triple = Triple("cal-001", "a", "issue_summary", email, "ref", "anything")
         judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
 
-        paired, judge_errors, unlabeled = pair_with_labels(judged, [])
-
-        assert paired == []
-        assert judge_errors == 0
-        assert unlabeled == 1
+        with pytest.raises(calibrate.DualAnnotationError, match="labeled by neither annotator"):
+            pair_with_labels(judged, [])
 
 
 # --------------------------------------------------------------------------
@@ -898,6 +972,58 @@ class TestComputeIaaCeiling:
             compute_iaa_ceiling(labels)
 
 
+class TestComputeIaaCeilingKeyRestriction:
+    """``keys`` (population-parity invariant, owner-ruled 2026-07-09):
+    restricts the ceiling computation to a given key subset -- the same
+    valid, judge-error-free population judge kappa is computed over."""
+
+    def test_keys_param_restricts_which_keys_are_used(self, monkeypatch):
+        captured: list[list[str]] = []
+        real_cohens_kappa = agreement_module.cohens_kappa
+
+        def _spy(a, b, *, clusters=None, **kwargs):
+            captured.append(list(clusters))
+            return real_cohens_kappa(a, b, clusters=clusters, **kwargs)
+
+        monkeypatch.setattr(calibrate, "cohens_kappa", _spy)
+
+        labels = _dual_labels(
+            {
+                f"cal-{i:03d}": ("fail" if i == 2 else "pass", "fail" if i == 2 else "pass")
+                for i in range(1, 7)
+            }
+        )
+        all_keys = tuple(
+            sorted({(lbl.item_id, lbl.candidate, lbl.field) for lbl in labels})
+        )
+        restricted = all_keys[:-1]  # drop exactly one key
+
+        compute_iaa_ceiling(labels, keys=restricted, n_resamples=50, seed=0)
+
+        assert len(captured[0]) == len(restricted) == len(all_keys) - 1
+
+    def test_omitted_keys_uses_full_doubly_labeled_set(self, monkeypatch):
+        captured: list[list[str]] = []
+        real_cohens_kappa = agreement_module.cohens_kappa
+
+        def _spy(a, b, *, clusters=None, **kwargs):
+            captured.append(list(clusters))
+            return real_cohens_kappa(a, b, clusters=clusters, **kwargs)
+
+        monkeypatch.setattr(calibrate, "cohens_kappa", _spy)
+
+        labels = _dual_labels(
+            {
+                f"cal-{i:03d}": ("fail" if i == 2 else "pass", "fail" if i == 2 else "pass")
+                for i in range(1, 7)
+            }
+        )
+
+        compute_iaa_ceiling(labels, n_resamples=50, seed=0)
+
+        assert len(captured[0]) == 6
+
+
 # --------------------------------------------------------------------------
 # Gold resolution -- dual-annotation upgrade, 2026-07-09.
 # --------------------------------------------------------------------------
@@ -1291,7 +1417,6 @@ def _sample_result(**overrides) -> CalibrationResult:
         initial_fail_rate=0.25,
         fail_enrichment_note=False,
         judge_errors_excluded=0,
-        unlabeled_excluded=0,
         self_consistency=SelfConsistencyResult(
             n_triples=20,
             repeats=3,
@@ -1444,12 +1569,10 @@ class TestRenderCalibrationReport:
         assert "Bootstrap Disclosures" not in actual
 
     def test_excluded_counts_rendered(self):
-        actual = render_calibration_report(
-            _sample_result(judge_errors_excluded=2, unlabeled_excluded=3)
-        )
+        actual = render_calibration_report(_sample_result(judge_errors_excluded=2))
 
         assert "2 judge error(s)" in actual
-        assert "3 judged field(s)" in actual
+        assert "population-parity invariant" in actual
 
 
 # --------------------------------------------------------------------------
@@ -1458,11 +1581,18 @@ class TestRenderCalibrationReport:
 
 
 def _calibration_fixture():
-    """6 calibration items, 2 candidates, 2 fields = 24 triples total.
-    Designed for exact, hand-verifiable agreement: one unlabeled triple, one
-    judge-error triple, and perfect (gold-verdict == judge-verdict) agreement
-    everywhere else, with one "fail" pair per candidate so neither candidate's
-    subset collapses to a single category.
+    """6 calibration items, 2 candidates, 2 fields = 24 triples total, EVERY
+    key labeled by both annotators (population-parity invariant, 2026-07-09:
+    a judged key with no label from either annotator is now a loud
+    ``DualAnnotationError``, not a silently-excluded "unlabeled" judgment --
+    see ``TestRunCalibrationIntegration``/``TestRunCalibrationOffline``'s
+    dedicated tests for that behavior). One key, ("cal-006", "b",
+    "issue_summary"), is still a JUDGE error (verdict is ``None``) -- the ONE
+    tolerated gap, excluded from judge kappa, the ceiling kappa, AND
+    ``n_adjudicated`` alike, while still labeled normally by both annotators
+    like every other key. One "fail" pair per candidate keeps neither
+    candidate's subset collapsed to a single category; every other key has
+    perfect (gold-verdict == judge-verdict) agreement.
 
     Dual-annotation upgrade (2026-07-09): every labeled key gets BOTH an
     ``"owner"`` and an ``"annotator2"`` row, mirroring each other exactly
@@ -1494,7 +1624,6 @@ def _calibration_fixture():
     run_b = make_run_artifact("b", items, rows_by_candidate["b"])
 
     fail_pairs = {("cal-002", "a", "issue_summary"), ("cal-004", "b", "requested_action")}
-    unlabeled = ("cal-005", "a", "requested_action")
     judge_error = ("cal-006", "b", "issue_summary")
 
     labels: list[CalibrationLabel] = []
@@ -1505,21 +1634,17 @@ def _calibration_fixture():
                 key = (item_id, candidate, f)
                 value = cv(item_id, candidate, f)
                 label_verdict = "fail" if key in fail_pairs else "pass"
-                if key != unlabeled:
-                    for annotator in ("owner", "annotator2"):
-                        labels.append(
-                            make_label(
-                                item_id,
-                                candidate,
-                                f,
-                                label_verdict,
-                                candidate_value=value,
-                                annotator=annotator,
-                            )
+                for annotator in ("owner", "annotator2"):
+                    labels.append(
+                        make_label(
+                            item_id,
+                            candidate,
+                            f,
+                            label_verdict,
+                            candidate_value=value,
+                            annotator=annotator,
                         )
-                # Every triple is judged regardless of whether it ends up
-                # labeled -- judge_triples judges the full triple set, and
-                # pairing (not judging) is what excludes the unlabeled one.
+                    )
                 if key == judge_error:
                     verdict_table[value] = "__error__"
                 else:
@@ -1548,14 +1673,16 @@ class TestRunCalibrationIntegration:
         assert result.verdict == "adequate"
         assert result.divergence_flag is False
         assert result.judge_errors_excluded == 1
-        assert result.unlabeled_excluded == 1
         assert set(result.per_candidate) == {"a", "b"}
         assert result.per_candidate["a"].kappa == pytest.approx(1.0)
         assert result.per_candidate["b"].kappa == pytest.approx(1.0)
         assert result.self_consistency.n_triples == 20  # default self-consistency n
         # Ceiling is now unconditional (dual-annotation upgrade): both
         # annotators mirror each other exactly in this fixture -> kappa 1.0,
-        # zero adjudicated disagreements.
+        # zero adjudicated disagreements. The one judge error (excluded from
+        # judge kappa above) is ALSO excluded from the ceiling's population
+        # (population-parity invariant, 2026-07-09) -- see
+        # TestPopulationParityInvariant for a test that proves this directly.
         assert result.ceiling is not None
         assert result.ceiling.kappa == pytest.approx(1.0)
         assert result.n_adjudicated == 0
@@ -1659,9 +1786,11 @@ class TestRunCalibrationIntegration:
         assert client.calls == []
 
     def test_gold_resolves_but_no_overlap_with_judged_triples_raises(self):
-        """Dual-annotation coverage is satisfied but for keys that don't
-        exist among the judged triples at all -- pairing (not gold
-        resolution) is what must raise here."""
+        """Case 1 (population-parity invariant, 2026-07-09): dual-annotation
+        coverage is satisfied, but for keys that don't exist among the
+        judged triples at all -- this is now a loud DualAnnotationError
+        naming the orphan key, not the old generic "no gold label matched"
+        ValueError."""
 
         run_a, run_b, _labels, judge = _calibration_fixture()
         orphan_key = ("nonexistent-item", "a", "issue_summary")
@@ -1672,7 +1801,7 @@ class TestRunCalibrationIntegration:
             ),
         ]
 
-        with pytest.raises(ValueError, match="no gold label matched"):
+        with pytest.raises(calibrate.DualAnnotationError, match="no corresponding judgment"):
             run_calibration(
                 run_a=run_a,
                 run_b=run_b,
@@ -1681,6 +1810,72 @@ class TestRunCalibrationIntegration:
                 label_file_hash="fixture-hash",
                 n_resamples=50,
             )
+
+    def test_judged_key_unlabeled_by_both_annotators_raises(self):
+        """Case 2 (population-parity invariant, 2026-07-09): a judged key
+        that neither annotator labeled must raise DualAnnotationError --
+        replaces the old unlabeled_excluded tolerance."""
+
+        run_a, run_b, labels, judge = _calibration_fixture()
+        dropped_key = ("cal-001", "a", "issue_summary")
+        remaining_labels = [
+            label
+            for label in labels
+            if (label.item_id, label.candidate, label.field) != dropped_key
+        ]
+
+        with pytest.raises(calibrate.DualAnnotationError, match="labeled by neither annotator"):
+            run_calibration(
+                run_a=run_a,
+                run_b=run_b,
+                labels=remaining_labels,
+                judge=judge,
+                label_file_hash="fixture-hash",
+                n_resamples=50,
+            )
+
+
+class TestPopulationParityInvariant:
+    """Owner-ruled correction, 2026-07-09: judge kappa (overall and per-
+    candidate), the ceiling kappa, and n_adjudicated must all be computed
+    over exactly the same paired, validly-judged key set. A judge error on
+    one key is the one tolerated gap -- it must shrink the population
+    behind every one of those numbers together, not just judge kappa."""
+
+    def test_judge_error_shrinks_judge_kappa_and_ceiling_populations_together(self, monkeypatch):
+        call_lengths: list[int] = []
+        real_cohens_kappa = agreement_module.cohens_kappa
+
+        def _spy(a, b, *, clusters=None, **kwargs):
+            call_lengths.append(len(a))
+            return real_cohens_kappa(a, b, clusters=clusters, **kwargs)
+
+        monkeypatch.setattr(calibrate, "cohens_kappa", _spy)
+
+        run_a, run_b, labels, judge = _calibration_fixture()
+        result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            seed=0,
+        )
+
+        # Calls, in order: overall judge kappa, per-candidate "a", per-
+        # candidate "b", then the ceiling kappa.
+        assert len(call_lengths) == 4
+        overall_n, cand_a_n, cand_b_n, ceiling_n = call_lengths
+        # 24 doubly-labeled keys total, minus the fixture's one judge error
+        # (candidate "b", so candidate "a"'s subset of 12 is untouched).
+        assert overall_n == 23
+        assert cand_a_n == 12
+        assert cand_b_n == 11
+        # The ceiling's population is IDENTICAL to judge kappa's overall
+        # population -- the same judge error shrank both together.
+        assert ceiling_n == overall_n == 23
+        assert result.n_adjudicated == 0
 
 
 # --------------------------------------------------------------------------
@@ -1719,7 +1914,7 @@ class TestJudgmentRecordsFromJudged:
 
 
 class TestPairJudgmentsWithLabels:
-    def test_pairs_matching_and_excludes_judge_errors_and_unlabeled(self):
+    def test_pairs_matching_and_excludes_judge_errors(self):
         judgments = [
             calibrate.JudgmentRecord(
                 "cal-001", "a", "issue_summary", "pass", None, "ok",
@@ -1729,21 +1924,33 @@ class TestPairJudgmentsWithLabels:
                 "cal-001", "a", "requested_action", None, "refusal", None,
                 calibrate.hash_output("v2"), "jv",
             ),
-            calibrate.JudgmentRecord(
-                "cal-002", "a", "issue_summary", "pass", None, "ok",
-                calibrate.hash_output("v3"), "jv",
-            ),
         ]
         gold = [
             make_gold("cal-001", "a", "issue_summary", "pass", candidate_value="v1"),
             make_gold("cal-001", "a", "requested_action", "pass", candidate_value="v2"),
         ]
 
-        paired, judge_errors, unlabeled = calibrate.pair_judgments_with_labels(judgments, gold)
+        paired, judge_errors, valid_keys = calibrate.pair_judgments_with_labels(judgments, gold)
 
         assert len(paired) == 1
         assert judge_errors == 1
-        assert unlabeled == 1
+        assert valid_keys == (("cal-001", "a", "issue_summary"),)
+
+    def test_judgment_unlabeled_by_both_annotators_raises(self):
+        """Case 2 (population-parity invariant, 2026-07-09), offline unit
+        level: a persisted judgment whose key was labeled by neither
+        annotator raises DualAnnotationError -- replaces the old
+        unlabeled_excluded tolerance."""
+
+        judgments = [
+            calibrate.JudgmentRecord(
+                "cal-002", "a", "issue_summary", "pass", None, "ok",
+                calibrate.hash_output("v3"), "jv",
+            ),
+        ]
+
+        with pytest.raises(calibrate.DualAnnotationError, match="labeled by neither annotator"):
+            calibrate.pair_judgments_with_labels(judgments, [])
 
     def test_persisted_hash_mismatch_raises_binding_error(self):
         judgments = [
@@ -1902,7 +2109,6 @@ class TestRunCalibrationOffline:
         assert offline_result.overall.ci == pytest.approx(live_result.overall.ci)
         assert offline_result.verdict == live_result.verdict
         assert offline_result.judge_errors_excluded == live_result.judge_errors_excluded
-        assert offline_result.unlabeled_excluded == live_result.unlabeled_excluded
         assert offline_result.self_consistency.n_triples == live_result.self_consistency.n_triples
         assert offline_result.self_consistency.flip_rate == pytest.approx(
             live_result.self_consistency.flip_rate
@@ -2027,6 +2233,10 @@ class TestRunCalibrationOffline:
             )
 
     def test_gold_resolves_but_no_overlap_with_judgments_raises(self):
+        """Case 1 (population-parity invariant, 2026-07-09): now a loud
+        DualAnnotationError naming the orphan key, not the old generic "no
+        gold label matched" ValueError."""
+
         run_a, run_b, labels, judge = _calibration_fixture()
         live_result = run_calibration(
             run_a=run_a,
@@ -2049,17 +2259,17 @@ class TestRunCalibrationOffline:
             ),
         ]
 
-        with pytest.raises(ValueError, match="no gold label matched"):
+        with pytest.raises(calibrate.DualAnnotationError, match="no corresponding judgment"):
             calibrate.run_calibration_offline(
                 judgments=judgments_file, labels=orphan_labels, label_file_hash="fixture-hash",
                 n_resamples=50,
             )
 
-    def test_ceiling_reflects_full_label_set_independent_of_judgments(self):
-        """``compute_iaa_ceiling`` only ever reads ``labels`` -- adding a
-        disagreement for items never judged at all must still move the
-        offline-recomputed ceiling, proving it is computed purely from
-        labels rather than from the persisted judgments file."""
+    def test_judgment_unlabeled_by_both_annotators_raises(self):
+        """Case 2 (population-parity invariant, 2026-07-09), offline path: a
+        persisted judgment whose key was labeled by neither annotator must
+        raise DualAnnotationError, not be silently excluded as
+        'unlabeled_excluded'."""
 
         run_a, run_b, labels, judge = _calibration_fixture()
         live_result = run_calibration(
@@ -2071,14 +2281,49 @@ class TestRunCalibrationOffline:
             n_resamples=50,
             seed=0,
         )
-        assert live_result.ceiling is not None
-        assert live_result.ceiling.kappa == pytest.approx(1.0)
+        judgments_file = self._judgments_file_from_live_result(live_result)
+
+        dropped_key = ("cal-001", "a", "issue_summary")
+        remaining_labels = [
+            label
+            for label in labels
+            if (label.item_id, label.candidate, label.field) != dropped_key
+        ]
+
+        with pytest.raises(calibrate.DualAnnotationError, match="labeled by neither annotator"):
+            calibrate.run_calibration_offline(
+                judgments=judgments_file,
+                labels=remaining_labels,
+                label_file_hash="fixture-hash",
+                n_resamples=50,
+            )
+
+    def test_never_judged_disagreement_now_raises_population_parity_error(self):
+        """Population-parity invariant (owner-ruled, 2026-07-09) supersedes
+        the OLD behavior this test used to pin (a label for a never-judged
+        item silently moving the offline-recomputed ceiling): a gold label
+        for an item that was NEVER judged at all (absent from the persisted
+        judgment set) now raises DualAnnotationError naming the orphan key,
+        because every certificate number must be computed over exactly one,
+        paired, validly-judged population -- the ceiling is no longer free to
+        read a broader population than judge kappa does."""
+
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            seed=0,
+        )
         judgments_file = self._judgments_file_from_live_result(live_result)
 
         # Owner and annotator2 disagree on "cal-999" (never judged at all --
         # it isn't among run_a/run_b's items) -- an owner adjudication row
-        # resolves the disagreement so resolve_gold_labels still succeeds,
-        # while the raw disagreement still counts toward compute_iaa_ceiling.
+        # resolves the disagreement so resolve_gold_labels itself succeeds,
+        # but "cal-999" still has no corresponding judgment.
         extra_owner = make_label(
             "cal-999", "a", "issue_summary", "pass",
             annotator="owner", candidate_value="extra-value", label_id="lbl-extra-owner",
@@ -2093,16 +2338,14 @@ class TestRunCalibrationOffline:
             candidate_value="extra-value", label_id="lbl-extra-adjudication",
         )
 
-        offline_result = calibrate.run_calibration_offline(
-            judgments=judgments_file,
-            labels=[*labels, extra_owner, extra_other, extra_adjudication],
-            label_file_hash="fixture-hash",
-            n_resamples=200,
-            seed=0,
-        )
-
-        assert offline_result.ceiling is not None
-        assert offline_result.ceiling.kappa < 1.0
+        with pytest.raises(calibrate.DualAnnotationError, match="no corresponding judgment"):
+            calibrate.run_calibration_offline(
+                judgments=judgments_file,
+                labels=[*labels, extra_owner, extra_other, extra_adjudication],
+                label_file_hash="fixture-hash",
+                n_resamples=200,
+                seed=0,
+            )
 
 
 # --------------------------------------------------------------------------
