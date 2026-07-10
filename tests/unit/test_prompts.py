@@ -145,6 +145,15 @@ class TestExtractionPromptFrozen:
         assert "account = login, credentials, profile" in rendered
         assert "product = a problem or question about a specific product" in rendered
         assert "other = anything else, including general, catalog" in rendered
+        # The three boundary clauses below are what reconcile the definitions
+        # with the existing labels (named-product pre-sale asks are `product`
+        # per golden-013/015/033/034/dev-010; pre-sale customs questions are
+        # `shipping` per golden-007; golden-018 stays `other`). They must be
+        # pinned verbatim or a wording "simplification" can silently move the
+        # category boundary while every other test stays green.
+        assert "owned, ordered, or asked about by name" in rendered
+        assert "or shipping/customs questions for an order" in rendered
+        assert "not about one specific product or order" in rendered
 
     def test_rendered_prompt_instructs_schema_only_output(self):
         rendered = EXTRACTION_PROMPT.render(_email())
