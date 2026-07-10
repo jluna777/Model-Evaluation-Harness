@@ -62,11 +62,15 @@ class TestExtractionPromptFrozen:
     priority rule in full -- any prompt wording change must bump the version,
     no exceptions (the judge_version analog), so this pin moved 1 -> 2 here.
     Re-frozen again as prompt_version 3 on 2026-07-09 (owner ruling, T13
-    open-coding round, Cluster A defect) to define `low`, so this pin moves
-    2 -> 3."""
+    open-coding round, Cluster A defect) to define `low`, so this pin moved
+    2 -> 3. Re-frozen again as prompt_version 4 on 2026-07-09 (owner ruling,
+    T13 open-coding round, Clusters B/C plus the category boundary) to split
+    the `high`/`urgent` boundary on a same/next-day line, state the
+    already-late clause, and define the `category` enum values, so this pin
+    moves 3 -> 4."""
 
-    def test_version_is_frozen_at_three(self):
-        assert EXTRACTION_PROMPT.version == 3
+    def test_version_is_frozen_at_four(self):
+        assert EXTRACTION_PROMPT.version == 4
 
     def test_rendered_prompt_contains_tie_break_sentence_verbatim(self):
         rendered = EXTRACTION_PROMPT.render(_email())
@@ -104,6 +108,43 @@ class TestExtractionPromptFrozen:
         rendered = EXTRACTION_PROMPT.render(_email())
         assert "Use low for requests with no concrete, unresolved problem" in rendered
         assert "Use normal for actionable issues" in rendered
+
+    def test_rendered_prompt_splits_high_and_urgent_on_same_or_next_day(self):
+        # v4 re-freeze (owner ruling, 2026-07-09, T13 open-coding Cluster B):
+        # v3's "use high or urgent only under genuine forward time pressure"
+        # never said which -- both candidates defaulted to urgent. The
+        # rendered prompt must now state the same/next-day split explicitly:
+        # urgent for a same-day/next-day forward deadline (absent safety),
+        # high for other genuine forward pressure within roughly two weeks.
+        rendered = EXTRACTION_PROMPT.render(_email())
+        assert "same-day or next-day" in rendered
+        assert "Use high for other genuine forward time pressure" in rendered
+
+    def test_rendered_prompt_states_already_late_is_not_forward_pressure(self):
+        # v4 re-freeze (owner ruling, 2026-07-09, T13 open-coding Cluster C):
+        # a delay that already happened, with no upcoming date or event the
+        # resolution must precede, is not forward time pressure -- normal
+        # applies regardless of eager language (golden-008 is the canonical
+        # probe; golden-027/040 exhibit the same pattern incidentally).
+        rendered = EXTRACTION_PROMPT.render(_email())
+        assert "already" in rendered
+        assert "is not forward time pressure" in rendered
+        assert "get it moving" in rendered
+        assert "expedite" in rendered
+        assert "at your earliest convenience" in rendered
+
+    def test_rendered_prompt_defines_category_values(self):
+        # v4 re-freeze (owner ruling, 2026-07-09, T13 open-coding round): the
+        # bare `category` enum line never defined its five values, leaving
+        # the product/other boundary undocumented (golden-018: a general,
+        # non-product-specific inquiry is `other`, not `product`). The
+        # rendered prompt must now carry a one-line definition per value.
+        rendered = EXTRACTION_PROMPT.render(_email())
+        assert "billing = charges, refunds, invoices" in rendered
+        assert "shipping = delivery, tracking" in rendered
+        assert "account = login, credentials, profile" in rendered
+        assert "product = a problem or question about a specific product" in rendered
+        assert "other = anything else, including general, catalog" in rendered
 
     def test_rendered_prompt_instructs_schema_only_output(self):
         rendered = EXTRACTION_PROMPT.render(_email())

@@ -44,19 +44,43 @@ block at the bottom is what the test parses.
 **Sum check:** row 1–8 (nominal) = 18+2+2+2+2+2+2+2 = **32**. Row 9–17 (adversarial) =
 2×9 = **18**. Total = **50**.
 
-## Priority labeling convention (owner ruling, severity-aware, 2026-07-08)
+## Priority labeling convention (owner ruling, severity-aware, 2026-07-08; refined 2026-07-09)
 
 Extends, and does not reverse, the dev-004 forward-time-pressure convention
 (`docs/decisions.md` D4, 2026-07-07): `priority: urgent` whenever the email's
 *content* is safety-critical (a real risk of injury, fire, gas, electrical, or
 structural-failure hazard), **regardless of stated timing or tone** — a calmly
 worded "no rush" report of a gas leak is still `urgent`. Absent a
-safety-critical signal, `high`/`urgent` apply only under **genuine forward
-time pressure**: a stated date or event, roughly within a **two-week window**,
-that the resolution must precede. `normal` applies otherwise — non-safety
-defects with no forward deadline stay `normal` (dev-004 precedent). Tone is
-never the signal, content is. Full brief-level rationale and worked examples:
-`data/golden/briefs.md`'s "Urgency convention" and golden-046/golden-048.
+safety-critical signal, the forward-time-pressure tiers split on how soon the
+stated date or event falls: `urgent` when the resolution must precede
+something **same-day or next-day**; `high` for other **genuine forward time
+pressure** — a stated date or event, roughly within a **two-week window**,
+that the resolution must precede, but not same-day or next-day. A delay that
+has **already occurred**, with no upcoming date or event the resolution must
+precede, is **not** forward time pressure — such requests stay `normal`
+(absent a safety signal) no matter how eager the language ("get it moving,"
+"expedite," "at your earliest convenience"); see the
+`retrospective_delay_no_deadline` note below. `normal` applies otherwise —
+non-safety defects with no forward deadline stay `normal` (dev-004
+precedent). Tone is never the signal, content is. Full brief-level rationale
+and worked examples: `data/golden/briefs.md`'s "Urgency convention" and
+golden-046/golden-048.
+
+### `retrospective_delay_no_deadline` note (owner ruling, 2026-07-09)
+
+Not a new `meta.categories` tag — no dataset item is re-tagged or otherwise
+edited by this note. It names a pattern of the priority convention above for
+future item authors and reviewers: an **already-occurred** delay, described
+with urgency-coded language ("get it moving," "expedite," "at your earliest
+convenience") but with **no forward date or event** the resolution must
+precede, is not forward time pressure and scores `normal` (absent a safety
+signal). **golden-008** (`meta.categories: baseline`) is the canonical,
+deliberately designed probe for this pattern — it was authored explicitly as
+the priority-calibration negative control ("eagerness alone does not
+warrant high/urgent priority without a concrete deadline"). **golden-027**
+(`multi_request_plain`) and **golden-040** (`under_extraction`) exhibit the
+same pattern incidentally under their existing tags; their `priority:
+normal` labels are correct under this convention.
 
 Ticket categories (`expected.category`: billing/shipping/account/product/other) are
 not a separate row here — they are the schema's own enum and are additionally spread

@@ -37,17 +37,24 @@ elaboration of that contract.
   Frostline Insulated Gloves, Windward Packable Windbreaker, Cinder Fire Starter
   Kit, Longtrail Duffel Bag 90L, Pinnacle Climbing Harness, Lowland Camp Lantern,
   Ridgetop Bear Canister.
-- **Urgency convention (owner ruling, severity-aware, 2026-07-08, extends
-  dev-004 2026-07-07):** `priority: urgent` whenever the email's *content* is
-  safety-critical (a real risk of injury, fire, gas, electrical, or
-  structural-failure hazard) **regardless of stated timing or tone** — a
-  calmly worded "no rush" report of a gas leak is still `urgent`. Absent a
-  safety-critical signal, `high`/`urgent` apply only under **genuine forward
-  time pressure**: a stated date or event, roughly within a **two-week
-  window**, that the resolution must precede. `normal` otherwise. Past-tense
-  incidents, frustration, or drama with no safety issue and no upcoming
-  deadline stay `normal` (dev-004 precedent, unchanged) — tone is never the
-  signal, content is.
+- **Urgency convention (owner ruling, severity-aware, 2026-07-08; refined
+  2026-07-09; extends dev-004 2026-07-07):** `priority: urgent` whenever the
+  email's *content* is safety-critical (a real risk of injury, fire, gas,
+  electrical, or structural-failure hazard) **regardless of stated timing or
+  tone** — a calmly worded "no rush" report of a gas leak is still `urgent`.
+  Absent a safety-critical signal, `urgent` also applies when a stated
+  forward deadline or event is **same-day or next-day**; `high` covers other
+  **genuine forward time pressure** — a stated date or event, roughly within
+  a **two-week window**, that the resolution must precede, but not same-day
+  or next-day. A delay that has **already occurred**, with no upcoming date
+  or event the resolution must precede, is **not** forward time pressure —
+  `normal` applies (absent a safety signal) no matter how eager the language
+  ("get it moving," "expedite," "at your earliest convenience"); see
+  `taxonomy.md`'s `retrospective_delay_no_deadline` note (golden-008 is the
+  canonical probe; golden-027/040 exhibit the pattern incidentally). Other
+  past-tense incidents, frustration, or drama with no safety issue and no
+  upcoming deadline stay `normal` (dev-004 precedent, unchanged) — tone is
+  never the signal, content is.
 - **Primary-request rule (spec §1, canonical three-step wording):** every
   multi-request brief below states which step of the rule the correct answer
   hinges on.

@@ -131,6 +131,9 @@ class TestFingerprint:
         # `prompt_version` moved 2 -> 3 (Cluster A defect, `low` now defined),
         # which is itself a fingerprint component -- an intentional hash
         # change, not a refactor regression.
+        # Recomputed again 2026-07-09 (T13 open-coding round): `prompt_version`
+        # moved 3 -> 4 (Clusters B/C plus the category boundary), another
+        # intentional hash change for the same reason.
         config = load_config(DEFAULT_CONFIG_PATH)
 
         fp = fingerprint(
@@ -141,4 +144,4 @@ class TestFingerprint:
             calibration_verdict="adequate",
         )
 
-        assert fp == "e2ad03bdb22618e73e8ceea5977c595f2025a97838df35dc4e6673d5852f8487"
+        assert fp == "b1ec3406d1562a03c4883b95ce660cf949f0f1e128736bfcd057683d3ce1c9fc"

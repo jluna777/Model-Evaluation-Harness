@@ -7,7 +7,7 @@ models:
   candidate_b: gpt-5.4-mini
   judge: gemini-2.5-pro
 
-prompt_version: 3
+prompt_version: 4
 
 dataset:
   path: data/golden/golden.jsonl
