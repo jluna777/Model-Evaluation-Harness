@@ -196,6 +196,19 @@ whose resolved gold verdict is nonetheless ``"pass"`` (a perturbation the
 human standard did not flag -- legitimate gold either way, disclosed rather
 than hidden).
 
+``real_only_kappa`` is itself ``None`` -- distinct from the "no fail-probe
+set used" ``None`` above -- whenever the non-probe subset is single-category
+(commit 471a41a review, Critical finding): this is the EXPECTED production
+state (the real items never fail, which is exactly why the fail-probe set
+exists in the first place), not a corner case. Cohen's kappa is undefined
+(0/0) for a single-shared-category sample by ``harness.stats.agreement.
+cohens_kappa``'s documented convention, and ``compute_real_only_kappa``
+detects this up front and returns ``None`` rather than let ``harness.stats.
+bootstrap.bca_ci``'s observed-NaN ``ValueError`` escape uncaught.
+``build_certificate`` stores ``null``, and ``render_calibration_report``
+renders an explicit "undefined" disclosure line in the Perturbation Probe
+Set section rather than silently omitting the real-only κ bullet.
+
 Offline parity: ``JudgmentRecord`` carries a persisted ``is_probe`` flag
 (default ``False``, so every pre-existing ``judgments.jsonl`` round-trips
 unchanged) set from the live run's own probe-item membership
@@ -1192,13 +1205,31 @@ def compute_real_only_kappa(
     Returns ``None`` when fewer than 2 non-probe paired judgments remain --
     ``cohens_kappa`` requires at least 2 paired observations, and callers
     only invoke this when a fail-probe set was actually used, so a
-    real-only population this small signals nothing meaningful to compute."""
+    real-only population this small signals nothing meaningful to compute.
+
+    Also returns ``None`` when the non-probe subset collapses onto a single
+    shared category -- gold verdict AND judge verdict both "pass" (or both
+    "fail") for every real item (commit 471a41a review, Critical finding).
+    This is not a corner case: it is the EXPECTED production state the
+    fail-probe design exists to work around (module docstring -- the owner's
+    real fail rate is 0% at prompt v4). Cohen's kappa is undefined (0/0) for
+    a single-shared-category sample by ``harness.stats.agreement.
+    cohens_kappa``'s documented convention (chance agreement hits 1), and
+    ``harness.stats.bootstrap.bca_ci`` raises ``ValueError`` for a NaN
+    *observed* statistic rather than silently returning a NaN CI -- that
+    ValueError must never reach a caller of this function. Detecting the
+    degenerate case up front (rather than calling ``cohens_kappa`` and
+    catching the exception) mirrors the ``<2``-observations guard above:
+    both are "there is nothing meaningful to compute" early returns, not
+    error handling."""
 
     real_only = [p for p in paired if p.item_id not in probe_item_ids]
     if len(real_only) < 2:
         return None
     a = [p.owner_verdict for p in real_only]
     b = [p.judge_verdict for p in real_only]
+    if len(set(a) | set(b)) < 2:
+        return None
     clusters = [p.item_id for p in real_only]
     result, messages = _kappa_with_capture(
         a, b, clusters, ci_level=ci_level, n_resamples=n_resamples, seed=seed
@@ -1686,7 +1717,14 @@ def render_calibration_report(result: CalibrationResult) -> str:
     fires, the stratification fail-rate note, judge self-consistency, the
     human-human agreement (IAA) ceiling row (dual-annotation upgrade,
     2026-07-09, when computed) with the adjudicated-disagreement count, and
-    any bootstrap-omission disclosures."""
+    any bootstrap-omission disclosures.
+
+    When a fail-probe set was used but ``result.real_only_kappa`` is
+    ``None`` (``compute_real_only_kappa``'s degenerate-real-subset case,
+    commit 471a41a review), the Perturbation Probe Set section renders an
+    explicit "undefined" disclosure line instead of silently omitting the
+    real-only κ bullet -- never hidden, mirroring this module's other
+    disclosure conventions."""
 
     lines: list[str] = ["# Judge Calibration Report", ""]
     lines.append(f"- Judge version: `{result.judge_version}`")
@@ -1794,6 +1832,15 @@ def render_calibration_report(result: CalibrationResult) -> str:
                 f"[{result.real_only_kappa.ci[0]:.3f}, {result.real_only_kappa.ci[1]:.3f}]) -- "
                 "reported alongside the primary overall κ above, never replacing it as the "
                 "decision statistic."
+            )
+        else:
+            lines.append(
+                "- Real-only κ (judge vs. gold, non-probe items only): **undefined** -- the "
+                "real subset is single-category (judge and gold agree \"pass\" everywhere), so "
+                "chance agreement is 1 and kappa is 0/0 (harness.stats.agreement's documented "
+                "convention). This is the expected production state the fail-probe set exists "
+                "to work around (the real items essentially never fail); disclosed here rather "
+                "than silently omitted."
             )
         lines.append(
             f"- Perturbed rows the resolved gold still passed: "

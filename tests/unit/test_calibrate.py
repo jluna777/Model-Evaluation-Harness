@@ -1000,6 +1000,31 @@ class TestComputeRealOnlyKappa:
 
         assert result is None
 
+    def test_returns_none_when_real_subset_is_single_category(self):
+        """Regression (commit 471a41a review, Critical finding): the real
+        subset collapsing onto ONE shared category (gold "pass" AND judge
+        "pass" everywhere) is the EXPECTED production state (module
+        docstring: the owner's real fail rate is 0% at prompt v4, which is
+        exactly why the fail-probe set exists). Cohen's kappa is undefined
+        (0/0) for a single-shared-category subset (harness.stats.agreement's
+        documented convention) -- this must return None, mirroring the
+        <2-observations early return, rather than let the BCa bootstrap's
+        observed-NaN ValueError (harness.stats.bootstrap.bca_ci) escape
+        uncaught. Reviewer's exact repro shape: ~20 real pass/pass pairs + 2
+        probe fail pairs."""
+
+        paired = [self._paired(f"cal-{i:03d}", "a", "pass", "pass") for i in range(1, 21)]
+        paired += [
+            self._paired("cal-101", "a", "fail", "fail"),  # probe
+            self._paired("cal-102", "a", "fail", "fail"),  # probe
+        ]
+
+        result = calibrate.compute_real_only_kappa(
+            paired, probe_item_ids={"cal-101", "cal-102"}, n_resamples=50
+        )
+
+        assert result is None
+
 
 # --------------------------------------------------------------------------
 # decide_verdict / per_candidate_divergence_flag
@@ -2657,6 +2682,247 @@ class TestRunCalibrationOfflineWithFailProbeSet:
                 perturbation_overlay=bad_overlay,
                 n_resamples=50,
             )
+
+
+# --------------------------------------------------------------------------
+# Regression (commit 471a41a review, Critical finding): the real subset is
+# fully single-category (gold "pass" AND judge "pass" everywhere) -- the
+# EXPECTED production state the fail-probe design exists to work around
+# (module docstring). run_calibration/run_calibration_offline must both
+# complete and disclose real_only_kappa=None rather than let
+# harness.stats.bootstrap's observed-NaN ValueError escape uncaught.
+# --------------------------------------------------------------------------
+
+
+def _all_pass_real_with_probe_fail_fixture():
+    """5 real items (cal-201..cal-205) x 2 candidates x 2 fields = 20 real
+    keys, every one gold "pass" AND judge "pass" -- the real subset
+    collapses onto a single shared category. 2 probe items (cal-301/
+    cal-302) x 2 candidates x 2 fields = 8 probe keys; exactly 2 of them
+    (one per candidate) are overlaid with corrupted text that both
+    annotators and the judge correctly flag "fail", so the OVERALL
+    (probe-included) kappa stays well-defined at 1.0 (perfect agreement
+    everywhere) -- only the real-only restriction is degenerate. Mirrors the
+    reviewer's exact repro shape: ~20 real pass/pass pairs + 2 probe fail
+    pairs.
+    """
+
+    real_item_ids = [f"cal-{200 + i:03d}" for i in range(1, 6)]
+    real_items = [make_item(i) for i in real_item_ids]
+
+    def cv(item_id: str, candidate: str, field: str, *, tag: str = "value") -> str:
+        return f"{item_id}-{candidate}-{field}-{tag}"
+
+    rows_by_candidate: dict[str, list[RunRow]] = {"a": [], "b": []}
+    for item_id in real_item_ids:
+        for candidate in ("a", "b"):
+            rows_by_candidate[candidate].append(
+                make_row(
+                    item_id,
+                    0,
+                    issue_summary=cv(item_id, candidate, "issue_summary"),
+                    requested_action=cv(item_id, candidate, "requested_action"),
+                )
+            )
+    run_a = make_run_artifact("a", real_items, rows_by_candidate["a"])
+    run_b = make_run_artifact("b", real_items, rows_by_candidate["b"])
+
+    probe_item_ids = ["cal-301", "cal-302"]
+    probe_items = [make_item(i) for i in probe_item_ids]
+    probe_rows_by_candidate: dict[str, list[RunRow]] = {"a": [], "b": []}
+    for item_id in probe_item_ids:
+        for candidate in ("a", "b"):
+            probe_rows_by_candidate[candidate].append(
+                make_row(
+                    item_id,
+                    0,
+                    issue_summary=cv(item_id, candidate, "issue_summary", tag="real"),
+                    requested_action=cv(item_id, candidate, "requested_action", tag="real"),
+                )
+            )
+    probe_run_a = make_run_artifact("a", probe_items, probe_rows_by_candidate["a"])
+    probe_run_b = make_run_artifact("b", probe_items, probe_rows_by_candidate["b"])
+
+    caught_keys = [
+        ("cal-301", "a", "issue_summary"),
+        ("cal-302", "b", "requested_action"),
+    ]
+    perturbed_values = {
+        caught_keys[0]: "corrupted-cal-301-a-issue_summary",
+        caught_keys[1]: "corrupted-cal-302-b-requested_action",
+    }
+    overlay = [
+        make_overlay_row(*key, perturbed_values[key], corruption_type="ungrounded_addition")
+        for key in caught_keys
+    ]
+
+    labels: list[CalibrationLabel] = []
+    verdict_table: dict[str, str] = {}
+
+    for item_id in real_item_ids:
+        for candidate in ("a", "b"):
+            for field_name in ("issue_summary", "requested_action"):
+                value = cv(item_id, candidate, field_name)
+                for annotator in ("owner", "annotator2"):
+                    labels.append(
+                        make_label(
+                            item_id,
+                            candidate,
+                            field_name,
+                            "pass",
+                            candidate_value=value,
+                            annotator=annotator,
+                        )
+                    )
+                verdict_table[value] = "pass"
+
+    for item_id in probe_item_ids:
+        for candidate in ("a", "b"):
+            for field_name in ("issue_summary", "requested_action"):
+                key = (item_id, candidate, field_name)
+                real_value = cv(item_id, candidate, field_name, tag="real")
+                if key in perturbed_values:
+                    seen_value, verdict = perturbed_values[key], "fail"
+                else:
+                    seen_value, verdict = real_value, "pass"
+                for annotator in ("owner", "annotator2"):
+                    labels.append(
+                        make_label(
+                            item_id,
+                            candidate,
+                            field_name,
+                            verdict,
+                            candidate_value=seen_value,
+                            annotator=annotator,
+                        )
+                    )
+                verdict_table[seen_value] = verdict
+
+    def _verdict_for(candidate_value: str, idx: int) -> str:
+        return verdict_table[candidate_value]
+
+    client = _KeyedJudgeClient(verdict_for=_verdict_for)
+    judge = Judge(client)
+
+    return run_a, run_b, probe_run_a, probe_run_b, labels, judge, overlay
+
+
+class TestRunCalibrationDegenerateRealOnlyKappa:
+    def test_live_run_completes_with_real_only_kappa_none(self):
+        run_a, run_b, probe_run_a, probe_run_b, labels, judge, overlay = (
+            _all_pass_real_with_probe_fail_fixture()
+        )
+
+        result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=probe_run_a,
+            probe_run_b=probe_run_b,
+            perturbation_overlay=overlay,
+            n_resamples=50,
+            seed=0,
+        )
+
+        assert result.real_only_kappa is None
+        # Overall (probe-included) kappa is unaffected by the degenerate
+        # real-only restriction -- both categories are present in the union
+        # (perfect agreement everywhere), so it stays well-defined.
+        assert result.overall.kappa == pytest.approx(1.0)
+
+    def test_certificate_stores_null_real_only_kappa(self):
+        run_a, run_b, probe_run_a, probe_run_b, labels, judge, overlay = (
+            _all_pass_real_with_probe_fail_fixture()
+        )
+        result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=probe_run_a,
+            probe_run_b=probe_run_b,
+            perturbation_overlay=overlay,
+            n_resamples=50,
+            seed=0,
+        )
+
+        certificate = build_certificate(result)
+
+        assert certificate.real_only_kappa is None
+        assert certificate.real_only_kappa_ci is None
+
+    def test_report_discloses_undefined_real_only_kappa_explicitly(self):
+        """The report must not silently drop the real-only κ line when it is
+        undefined -- it must say so, mirroring the module's other disclosure
+        lines (e.g. the D1-review/stratification blockquotes)."""
+
+        run_a, run_b, probe_run_a, probe_run_b, labels, judge, overlay = (
+            _all_pass_real_with_probe_fail_fixture()
+        )
+        result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=probe_run_a,
+            probe_run_b=probe_run_b,
+            perturbation_overlay=overlay,
+            n_resamples=50,
+            seed=0,
+        )
+
+        report = render_calibration_report(result)
+
+        assert "Real-only" in report
+        assert "undefined" in report
+        assert "single-category" in report
+
+    def test_offline_recompute_also_completes_with_real_only_kappa_none(self):
+        run_a, run_b, probe_run_a, probe_run_b, labels, judge, overlay = (
+            _all_pass_real_with_probe_fail_fixture()
+        )
+        live_result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=probe_run_a,
+            probe_run_b=probe_run_b,
+            perturbation_overlay=overlay,
+            n_resamples=50,
+            seed=0,
+        )
+        judgments_file = calibrate.JudgmentsFile(
+            judge_version=live_result.judge_version,
+            written_at="2026-07-13T00:00:00+00:00",
+            judgments=tuple(
+                calibrate.judgment_records_from_judged(
+                    live_result.judged_triples,
+                    judge_version=live_result.judge_version,
+                    probe_item_ids=live_result.probe_item_ids,
+                )
+            ),
+            self_consistency=live_result.self_consistency_records,
+        )
+
+        offline_result = calibrate.run_calibration_offline(
+            judgments=judgments_file,
+            labels=labels,
+            label_file_hash="fixture-hash",
+            perturbation_overlay=overlay,
+            n_resamples=50,
+            seed=0,
+        )
+
+        assert offline_result.real_only_kappa is None
+        offline_certificate = build_certificate(offline_result)
+        assert offline_certificate.real_only_kappa is None
+        assert "undefined" in render_calibration_report(offline_result)
 
 
 # --------------------------------------------------------------------------
