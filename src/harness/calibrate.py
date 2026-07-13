@@ -150,6 +150,62 @@ actually being judged now (``pair_with_labels``/``pair_judgments_with_
 labels``) -- never a silent partial exclusion, which would hide exactly the
 kind of corruption this check exists to catch.
 
+**Fail-probe perturbation set (D2 amendment 2026-07-10, owner-approved):**
+the owner's initial fail rate on the real 100 calibration judgments is 0% at
+prompt v4 -- Cohen's kappa degenerates without fail prevalence, and spec
+§5's >=20% floor cannot be reached by harder REAL emails alone (evidence:
+the stratification loop already tried). The fix is a SECOND, independent
+item source -- ``data/calibration/emails-fail-probe.jsonl`` (~10 items, same
+``GoldenItem`` schema, ids continuing the ``cal-0NN`` sequence, never
+touching the original ``emails.jsonl``) -- run through the exact same
+``build_triples``/``_get_or_run`` seam at k=1, PLUS a committed overlay file
+(``data/calibration/perturbations.jsonl``, ``PerturbationOverlay`` rows) that
+replaces specific (probe item, candidate, field) keys' real candidate output
+with a deliberately corrupted value. ``validate_perturbation_overlay``
+enforces the overlay's binding invariant -- every key must reference a probe
+item and an actually-judgeable (item_id, candidate, field) triple, never the
+original emails file, never a typo'd/nonexistent key, never a duplicate --
+all-or-nothing, naming every offending key, mirroring
+``_validate_adjudication_round``'s convention. ``apply_perturbation_overlay``
+then substitutes the overlaid value onto the reconstructed ``Triple`` BEFORE
+anything downstream ever sees it: the same overlaid ``Triple.candidate_value``
+flows into ``labeling_template_rows`` (so a labeling sheet generated from
+overlaid triples is correctly hash-bound to the CORRUPTED text, never the
+real output), into every label's ``output_sha256`` binding check
+(``pair_with_labels``), and into ``judge_triples`` (the judge judges the
+corrupted text). Rows with no overlay entry keep the real run output
+unchanged -- a probe item is not required to carry a planted fail.
+
+Statistics (spec §5, superseding its fail-enrichment paragraph for this
+path): probe items are independent new emails that cluster by their own
+``item_id`` exactly like any other email -- NO special clustering, no
+separate population. ``run_calibration``/``run_calibration_offline``
+concatenate probe triples with the real ones and let every existing
+dual-annotation mechanism (gold resolution, judge agreement, the IAA
+ceiling, population parity) run over the UNION unchanged. Disclosure-only
+additions, all ``None`` when no fail-probe set was used (``CalibrationResult.
+n_perturbed``/``achieved_fail_prevalence``/``real_only_kappa``/
+``perturbed_rows_passed_by_gold``, surfaced on ``Certificate`` identically):
+the count of overlaid rows, the achieved fail prevalence of the resolved
+gold over the FULL combined population (the number that satisfies the >=20%
+floor for this path), a real-only Cohen's kappa restricted to non-probe
+items (``compute_real_only_kappa``) reported ALONGSIDE -- never replacing --
+the primary overall kappa (which stays the full, probe-included population
+and the sole adequacy-decision statistic), and the count of overlaid rows
+whose resolved gold verdict is nonetheless ``"pass"`` (a perturbation the
+human standard did not flag -- legitimate gold either way, disclosed rather
+than hidden).
+
+Offline parity: ``JudgmentRecord`` carries a persisted ``is_probe`` flag
+(default ``False``, so every pre-existing ``judgments.jsonl`` round-trips
+unchanged) set from the live run's own probe-item membership
+(``judgment_records_from_judged``'s ``probe_item_ids`` argument) --
+``run_calibration_offline`` derives its own probe-item and valid-probe-key
+sets straight from that flag, needing no ``RunArtifact``/candidate items of
+any kind, so it can re-validate the SAME overlay file and reproduce the
+SAME disclosure numbers with zero API calls, exactly like every other
+statistic this module recomputes offline.
+
 **Zero-API recomputability (finding F2):** a live run persists every judge
 call it makes -- one row per judged triple plus every self-consistency
 repeat -- to ``data/calibration/judgments.jsonl`` (``write_judgments_jsonl``,
@@ -175,8 +231,8 @@ import json
 import math
 import os
 import warnings
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
@@ -184,7 +240,13 @@ from typing import Literal
 from harness.judge.judge import Judge
 from harness.judge.rubric import judge_version as compute_judge_version
 from harness.runner import RunArtifact
-from harness.schema import CalibrationLabel, Certificate, EmailInput, GoldenItem
+from harness.schema import (
+    CalibrationLabel,
+    Certificate,
+    EmailInput,
+    GoldenItem,
+    PerturbationOverlay,
+)
 from harness.scoring.composite import JUDGED_FIELDS
 from harness.stats.agreement import KappaResult, cohens_kappa
 
@@ -902,6 +964,149 @@ def labeling_template_rows(triples: Sequence[Triple], annotator: str) -> list[di
 
 
 # --------------------------------------------------------------------------
+# Perturbation overlay (fail-probe design, D2 amendment 2026-07-10): module
+# docstring's "Fail-probe perturbation set" section.
+# --------------------------------------------------------------------------
+
+
+class PerturbationOverlayError(Exception):
+    """Raised when ``data/calibration/perturbations.jsonl`` does not satisfy
+    the fail-probe design's binding invariant (D2 amendment 2026-07-10):
+    every overlay row's ``(item_id, candidate, field)`` key must reference an
+    item from the fail-probe emails file AND an actually-judgeable triple
+    reconstructed from that file's candidate runs -- never a key belonging to
+    the original ``emails.jsonl``, never a key that doesn't exist at all
+    (typo'd item_id/candidate/field), never a duplicate key within the
+    overlay file itself. All violations are collected and named together in
+    one message, all-or-nothing -- mirroring ``DualAnnotationError``/
+    ``_validate_adjudication_round``'s existing convention -- never a partial
+    application where some overlay rows apply and others are silently
+    dropped."""
+
+
+def validate_perturbation_overlay(
+    overlay: Sequence[PerturbationOverlay],
+    *,
+    probe_item_ids: Collection[str],
+    valid_probe_keys: Collection[tuple[str, str, str]],
+) -> dict[tuple[str, str, str], PerturbationOverlay]:
+    """Validates every row of ``overlay`` against the fail-probe run's own
+    reconstructed triples, returning the validated ``{key: PerturbationOverlay}``
+    mapping ``apply_perturbation_overlay`` consumes.
+
+    ``probe_item_ids`` is every item id belonging to the fail-probe emails
+    file (never the original ``emails.jsonl``); ``valid_probe_keys`` is every
+    ``(item_id, candidate, field)`` key that actually exists among the
+    fail-probe run's reconstructed ``Triple``s (live) or persisted judgments
+    (offline, via ``JudgmentRecord.is_probe``) -- the SAME triples/judgments
+    ``run_calibration``/``run_calibration_offline`` are about to judge/have
+    already judged.
+
+    Three violation kinds, checked per row and collected together (never
+    raised on the first one found):
+
+    1. A duplicate key within the overlay file itself.
+    2. A key whose ``item_id`` is not among ``probe_item_ids`` -- it targets
+       the original ``emails.jsonl`` (or some other, unrelated item) instead
+       of the fail-probe file.
+    3. A key whose ``item_id`` IS a probe item, but the full ``(item_id,
+       candidate, field)`` key is not among ``valid_probe_keys`` -- nonexistent:
+       a typo'd field/candidate, or a probe item the run never actually
+       produced a judgeable output for.
+    """
+
+    probe_ids = set(probe_item_ids)
+    valid_keys = set(valid_probe_keys)
+
+    seen: set[tuple[str, str, str]] = set()
+    duplicates: list[tuple[str, str, str]] = []
+    targets_original_file: list[tuple[str, str, str]] = []
+    nonexistent: list[tuple[str, str, str]] = []
+    validated: dict[tuple[str, str, str], PerturbationOverlay] = {}
+
+    for row in overlay:
+        key = (row.item_id, row.candidate, row.field)
+        if key in seen:
+            duplicates.append(key)
+            continue
+        seen.add(key)
+        if row.item_id not in probe_ids:
+            targets_original_file.append(key)
+            continue
+        if key not in valid_keys:
+            nonexistent.append(key)
+            continue
+        validated[key] = row
+
+    problems: list[str] = []
+    if targets_original_file:
+        problems.append(
+            f"{len(targets_original_file)} overlay row(s) target the original emails file "
+            "(or some other item outside the fail-probe set), not "
+            f"data/calibration/emails-fail-probe.jsonl: {sorted(targets_original_file)}"
+        )
+    if nonexistent:
+        problems.append(
+            f"{len(nonexistent)} overlay row(s) reference (item_id, candidate, field) key(s) "
+            "that don't exist among the fail-probe run's judgeable triples (check for a "
+            f"typo'd item_id/candidate/field): {sorted(nonexistent)}"
+        )
+    if duplicates:
+        problems.append(
+            f"{len(duplicates)} duplicate overlay row(s) for the same (item_id, candidate, "
+            f"field) key in perturbations.jsonl: {sorted(duplicates)}"
+        )
+    if problems:
+        raise PerturbationOverlayError("; ".join(problems))
+
+    return validated
+
+
+def apply_perturbation_overlay(
+    triples: Sequence[Triple],
+    overlay_by_key: Mapping[tuple[str, str, str], PerturbationOverlay],
+) -> list[Triple]:
+    """Replaces each fail-probe ``Triple``'s ``candidate_value`` with its
+    overlay row's ``perturbed_value`` when a matching key exists in
+    ``overlay_by_key`` (already validated by ``validate_perturbation_overlay``)
+    -- everywhere downstream that reads the returned ``Triple``s (labeling
+    sheets, label output-hash binding, ``judge_triples``) sees the overlaid
+    text, never the real candidate output, for exactly these keys. A triple
+    with no matching overlay entry is returned unchanged: a fail-probe item
+    is not required to carry a planted fail."""
+
+    result: list[Triple] = []
+    for t in triples:
+        overlay_row = overlay_by_key.get((t.item_id, t.candidate, t.field))
+        if overlay_row is None:
+            result.append(t)
+        else:
+            result.append(replace(t, candidate_value=overlay_row.perturbed_value))
+    return result
+
+
+def load_perturbation_overlay(path: str | Path) -> list[PerturbationOverlay]:
+    """Parses ``data/calibration/perturbations.jsonl`` into
+    ``PerturbationOverlay`` rows. Returns an empty list when ``path`` does
+    not exist -- an absent overlay file is a valid, meaningful state (a
+    fail-probe set with zero planted fails), mirroring the fail-probe emails
+    file's own absent-file convention (spec §5: optional, absent = no
+    overlay)."""
+
+    path = Path(path)
+    if not path.exists():
+        return []
+    rows: list[PerturbationOverlay] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(PerturbationOverlay.model_validate(json.loads(line)))
+    return rows
+
+
+# --------------------------------------------------------------------------
 # Agreement statistics.
 # --------------------------------------------------------------------------
 
@@ -964,6 +1169,41 @@ def compute_agreement(
         all_warnings.extend(msgs)
 
     return overall, per_candidate, tuple(all_warnings)
+
+
+def compute_real_only_kappa(
+    paired: Sequence[PairedJudgment],
+    probe_item_ids: Collection[str],
+    *,
+    ci_level: float = DEFAULT_CI_LEVEL,
+    n_resamples: int = DEFAULT_N_RESAMPLES,
+    seed: int = 0,
+) -> tuple[KappaResult, tuple[str, ...]] | None:
+    """Judge-vs-gold Cohen's kappa restricted to NON-probe items only
+    (fail-probe design, D2 amendment 2026-07-10) -- reported ALONGSIDE the
+    primary overall kappa (``compute_agreement``'s ``overall``), never
+    replacing it as the adequacy-decision statistic. ``probe_item_ids`` is
+    every item id belonging to the fail-probe set (both live and offline
+    paths derive this independently -- see the module docstring); an empty
+    ``probe_item_ids`` simply means every paired judgment is "real",
+    reproducing the same population ``compute_agreement``'s overall kappa
+    already used.
+
+    Returns ``None`` when fewer than 2 non-probe paired judgments remain --
+    ``cohens_kappa`` requires at least 2 paired observations, and callers
+    only invoke this when a fail-probe set was actually used, so a
+    real-only population this small signals nothing meaningful to compute."""
+
+    real_only = [p for p in paired if p.item_id not in probe_item_ids]
+    if len(real_only) < 2:
+        return None
+    a = [p.owner_verdict for p in real_only]
+    b = [p.judge_verdict for p in real_only]
+    clusters = [p.item_id for p in real_only]
+    result, messages = _kappa_with_capture(
+        a, b, clusters, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+    )
+    return result, tuple(messages)
 
 
 def decide_verdict(
@@ -1173,6 +1413,16 @@ class CalibrationResult:
     2026-07-09): a judged key with no label from either annotator is now a
     loud ``DualAnnotationError`` (``_pair_entries``), never a silently
     counted exclusion, so there is nothing left to disclose here.
+
+    ``n_perturbed``/``achieved_fail_prevalence``/``real_only_kappa``/
+    ``perturbed_rows_passed_by_gold``/``probe_item_ids`` (additive, D2
+    amendment 2026-07-10 -- fail-probe/perturbation design, module
+    docstring): all at their default (``None``/``frozenset()``) when no
+    fail-probe set was used, reproducing pre-amendment behavior exactly.
+    ``probe_item_ids`` is every item id the fail-probe run judged (used by
+    the CLI to mark persisted judgments' ``JudgmentRecord.is_probe`` for
+    offline parity) -- disclosed on ``CalibrationResult`` but NOT itself
+    written to ``Certificate`` (only the derived counts/statistics are).
     """
 
     judge_version: str
@@ -1191,6 +1441,11 @@ class CalibrationResult:
     judged_triples: tuple[JudgedTriple, ...] = ()
     self_consistency_records: tuple[SelfConsistencyRecord, ...] = ()
     n_adjudicated: int = 0
+    n_perturbed: int | None = None
+    achieved_fail_prevalence: float | None = None
+    real_only_kappa: KappaResult | None = None
+    perturbed_rows_passed_by_gold: int | None = None
+    probe_item_ids: frozenset[str] = frozenset()
 
 
 def run_calibration(
@@ -1200,6 +1455,9 @@ def run_calibration(
     labels: Sequence[CalibrationLabel],
     judge: Judge,
     label_file_hash: str,
+    probe_run_a: RunArtifact | None = None,
+    probe_run_b: RunArtifact | None = None,
+    perturbation_overlay: Sequence[PerturbationOverlay] = (),
     date_override: date | None = None,
     self_consistency_n: int = DEFAULT_SELF_CONSISTENCY_N,
     self_consistency_repeats: int = DEFAULT_SELF_CONSISTENCY_REPEATS,
@@ -1208,24 +1466,37 @@ def run_calibration(
     seed: int = 0,
 ) -> CalibrationResult:
     """The full judge-calibration measurement (spec §5, §4, dual-annotation
-    upgrade 2026-07-09): reconstructs triples from both candidates'
-    persisted calibration runs, re-judges them with the current judge,
-    resolves the FINAL gold labels from the two annotators' labels
-    (``resolve_gold_labels`` -- owner adjudication wins every disagreement),
-    computes overall/per-candidate judge agreement against that gold, the
-    adequacy verdict, the per-candidate divergence flag, the stratification
-    fail-rate note, judge self-consistency, and the human-human agreement
-    (IAA) ceiling (``compute_iaa_ceiling``) -- both gold resolution and the
-    ceiling are computed unconditionally now (no opt-in flag): the retired
+    upgrade 2026-07-09; fail-probe perturbation set, D2 amendment 2026-07-10):
+    reconstructs triples from both candidates' persisted calibration runs,
+    re-judges them with the current judge, resolves the FINAL gold labels
+    from the two annotators' labels (``resolve_gold_labels`` -- owner
+    adjudication wins every disagreement), computes overall/per-candidate
+    judge agreement against that gold, the adequacy verdict, the
+    per-candidate divergence flag, the stratification fail-rate note, judge
+    self-consistency, and the human-human agreement (IAA) ceiling
+    (``compute_iaa_ceiling``) -- both gold resolution and the ceiling are
+    computed unconditionally now (no opt-in flag): the retired
     single-annotator design's degraded, ceiling-less mode no longer exists.
+
+    ``probe_run_a``/``probe_run_b`` (fail-probe design, module docstring):
+    when either is given, that candidate's fail-probe run (``data/
+    calibration/emails-fail-probe.jsonl``, same ``build_triples`` seam) is
+    reconstructed, its triples validated against ``perturbation_overlay``
+    (``validate_perturbation_overlay``) and overlaid (``apply_perturbation_
+    overlay``), then concatenated with the real triples -- every downstream
+    statistic (gold resolution, judge agreement, the ceiling, population
+    parity) runs over that UNION unchanged, per spec §5's superseding
+    fail-probe rule. Omitting both (the default) reproduces pre-amendment
+    behavior exactly, including every disclosure field staying ``None``.
 
     Raises ``DualAnnotationError``/``CalibrationBindingError`` (via
     ``resolve_gold_labels``/``pair_with_labels``/``compute_iaa_ceiling``) if
     the two annotators' labels do not satisfy the dual-annotation
-    precondition, or ``ValueError`` if no judged triple has a matching gold
-    label at all -- there is nothing to compute agreement on, which signals a
-    wiring problem (mismatched dataset/label files) rather than a real
-    calibration outcome to report on.
+    precondition, ``PerturbationOverlayError`` if ``perturbation_overlay``
+    does not satisfy its own binding invariant, or ``ValueError`` if no
+    judged triple has a matching gold label at all -- there is nothing to
+    compute agreement on, which signals a wiring problem (mismatched
+    dataset/label files) rather than a real calibration outcome to report on.
 
     Gold is resolved BEFORE the judge is ever invoked: every
     ``DualAnnotationError``/``CalibrationBindingError`` ``resolve_gold_
@@ -1233,17 +1504,42 @@ def run_calibration(
     defect fails before spending a single judge call on ``judge_triples``
     (finding: a ~100-call judge spend used to run first and was never
     persisted on failure, re-burning the full spend on every labels-file fix
-    iteration). ``pair_with_labels``'s population-parity checks (a gold label
-    with no corresponding judgment, or a judged key labeled by neither
-    annotator -- owner-ruled 2026-07-09, module docstring) necessarily run
-    AFTER judging instead, since they depend on the judgment set; their
-    result, ``valid_keys``, then restricts the ceiling kappa and
-    ``n_adjudicated`` to the SAME population judge kappa was computed over.
+    iteration). The overlay is validated and applied right after that, still
+    before any judge call, for the same reason -- a broken perturbations.jsonl
+    must never burn judge spend either. ``pair_with_labels``'s
+    population-parity checks (a gold label with no corresponding judgment,
+    or a judged key labeled by neither annotator -- owner-ruled 2026-07-09,
+    module docstring) necessarily run AFTER judging instead, since they
+    depend on the judgment set; their result, ``valid_keys``, then restricts
+    the ceiling kappa and ``n_adjudicated`` to the SAME population judge
+    kappa was computed over.
     """
 
     triples_a = build_triples("a", run_a)
     triples_b = build_triples("b", run_b)
-    all_triples = triples_a + triples_b
+    main_triples = triples_a + triples_b
+
+    probe_triples: list[Triple] = []
+    if probe_run_a is not None:
+        probe_triples += build_triples("a", probe_run_a)
+    if probe_run_b is not None:
+        probe_triples += build_triples("b", probe_run_b)
+
+    has_probe_set = probe_run_a is not None or probe_run_b is not None
+    probe_item_ids: set[str] = set()
+    if probe_run_a is not None:
+        probe_item_ids |= {item.id for item in probe_run_a.items}
+    if probe_run_b is not None:
+        probe_item_ids |= {item.id for item in probe_run_b.items}
+
+    overlay_by_key = validate_perturbation_overlay(
+        perturbation_overlay,
+        probe_item_ids=probe_item_ids,
+        valid_probe_keys={(t.item_id, t.candidate, t.field) for t in probe_triples},
+    )
+    probe_triples = apply_perturbation_overlay(probe_triples, overlay_by_key)
+
+    all_triples = main_triples + probe_triples
 
     gold = resolve_gold_labels(labels)
 
@@ -1253,7 +1549,8 @@ def run_calibration(
     # docstring): these checks depend on the judgment set, so -- unlike the
     # labels-only validations inside resolve_gold_labels above -- they
     # necessarily run after judging. `valid_keys` is the SAME population the
-    # ceiling kappa and n_adjudicated below must also use.
+    # ceiling kappa and n_adjudicated below must also use. It spans the
+    # UNION of real + probe triples (fail-probe design) unchanged.
     paired, judge_errors_excluded, valid_keys = pair_with_labels(judged, gold)
     if not paired:
         raise ValueError(
@@ -1301,6 +1598,28 @@ def run_calibration(
 
     resolved_date = resolve_certificate_date(labels, date_override)
 
+    # Fail-probe disclosure (D2 amendment 2026-07-10): only populated when a
+    # probe set was actually used -- omitting both probe_run_a/probe_run_b
+    # (the default) reproduces every one of these fields as None exactly.
+    n_perturbed: int | None = None
+    achieved_fail_prevalence: float | None = None
+    real_only_kappa: KappaResult | None = None
+    perturbed_rows_passed_by_gold: int | None = None
+    real_only_warnings: tuple[str, ...] = ()
+    if has_probe_set:
+        n_perturbed = len(overlay_by_key)
+        achieved_fail_prevalence = 1.0 - overall.prevalence
+        real_only = compute_real_only_kappa(
+            paired, probe_item_ids, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+        )
+        if real_only is not None:
+            real_only_kappa, real_only_warnings = real_only
+        perturbed_rows_passed_by_gold = sum(
+            1
+            for g in gold
+            if (g.item_id, g.candidate, g.field) in overlay_by_key and g.verdict == "pass"
+        )
+
     return CalibrationResult(
         judge_version=compute_judge_version(),
         label_file_hash=label_file_hash,
@@ -1314,18 +1633,27 @@ def run_calibration(
         judge_errors_excluded=judge_errors_excluded,
         self_consistency=self_consistency,
         ceiling=ceiling,
-        warnings=agreement_warnings + ceiling_warnings,
+        warnings=agreement_warnings + ceiling_warnings + real_only_warnings,
         judged_triples=tuple(judged),
         self_consistency_records=tuple(self_consistency_records),
         n_adjudicated=n_adjudicated,
+        n_perturbed=n_perturbed,
+        achieved_fail_prevalence=achieved_fail_prevalence,
+        real_only_kappa=real_only_kappa,
+        perturbed_rows_passed_by_gold=perturbed_rows_passed_by_gold,
+        probe_item_ids=frozenset(probe_item_ids),
     )
 
 
 def build_certificate(result: CalibrationResult) -> Certificate:
     """Builds the committed ``Certificate`` (spec §5) from an already-computed
     ``CalibrationResult`` -- every field named in spec §5, including the
-    additive ``per_candidate_kappa_ci`` (T14) and, from the dual-annotation
-    upgrade (2026-07-09), ``ceiling_kappa_ci`` and ``n_adjudicated``."""
+    additive ``per_candidate_kappa_ci`` (T14), from the dual-annotation
+    upgrade (2026-07-09) ``ceiling_kappa_ci`` and ``n_adjudicated``, and from
+    the fail-probe/perturbation design (D2 amendment 2026-07-10)
+    ``n_perturbed``/``achieved_fail_prevalence``/``real_only_kappa``/
+    ``real_only_kappa_ci``/``perturbed_rows_passed_by_gold`` -- all ``None``
+    when ``result`` carries no fail-probe disclosure (no probe set used)."""
 
     return Certificate(
         judge_version=result.judge_version,
@@ -1339,6 +1667,15 @@ def build_certificate(result: CalibrationResult) -> Certificate:
         n_adjudicated=result.n_adjudicated,
         label_file_hash=result.label_file_hash,
         date=result.date,
+        n_perturbed=result.n_perturbed,
+        achieved_fail_prevalence=result.achieved_fail_prevalence,
+        real_only_kappa=(
+            result.real_only_kappa.kappa if result.real_only_kappa is not None else None
+        ),
+        real_only_kappa_ci=(
+            result.real_only_kappa.ci if result.real_only_kappa is not None else None
+        ),
+        perturbed_rows_passed_by_gold=result.perturbed_rows_passed_by_gold,
     )
 
 
@@ -1436,6 +1773,34 @@ def render_calibration_report(result: CalibrationResult) -> str:
         lines.append(f"Adjudicated disagreements: {result.n_adjudicated}.")
         lines.append("")
 
+    if result.n_perturbed is not None:
+        lines.append("## Perturbation Probe Set")
+        lines.append("")
+        lines.append(
+            "Fail-side content is controlled perturbation of real candidate outputs "
+            "(D2 amendment 2026-07-10), disclosed here rather than distribution-shifted "
+            "email selection -- superseding spec §5's fail-enrichment paragraph for this path."
+        )
+        lines.append(f"- Overlaid rows (n_perturbed): {result.n_perturbed}")
+        if result.achieved_fail_prevalence is not None:
+            lines.append(
+                "- Achieved fail prevalence of the resolved gold (combined, probe-included "
+                f"population): {result.achieved_fail_prevalence:.1%}"
+            )
+        if result.real_only_kappa is not None:
+            lines.append(
+                f"- Real-only κ (judge vs. gold, non-probe items only) = "
+                f"{result.real_only_kappa.kappa:.3f} (95% cluster-bootstrap CI "
+                f"[{result.real_only_kappa.ci[0]:.3f}, {result.real_only_kappa.ci[1]:.3f}]) -- "
+                "reported alongside the primary overall κ above, never replacing it as the "
+                "decision statistic."
+            )
+        lines.append(
+            f"- Perturbed rows the resolved gold still passed: "
+            f"{result.perturbed_rows_passed_by_gold}"
+        )
+        lines.append("")
+
     if result.warnings:
         lines.append("## Bootstrap Disclosures")
         lines.append("")
@@ -1457,7 +1822,16 @@ class JudgmentRecord:
     """One persisted main-agreement judgment (finding F2) -- a judged
     triple's verdict plus enough (``output_sha256``, ``judge_version``) to
     re-verify its label binding and judge currency later without needing the
-    ``RunArtifact`` this triple was originally reconstructed from."""
+    ``RunArtifact`` this triple was originally reconstructed from.
+
+    ``is_probe`` (additive, D2 amendment 2026-07-10 -- fail-probe design):
+    ``True`` iff this judgment's triple came from the fail-probe run
+    (``data/calibration/emails-fail-probe.jsonl``), never the original
+    calibration emails. Defaults ``False`` so every pre-existing
+    ``judgments.jsonl`` round-trips unchanged. This is the ONLY signal
+    ``run_calibration_offline`` needs to derive its own probe-item and
+    valid-probe-key sets -- no ``RunArtifact``/candidate items required
+    offline at all (module docstring)."""
 
     item_id: str
     candidate: Literal["a", "b"]
@@ -1467,6 +1841,7 @@ class JudgmentRecord:
     rationale: str | None
     output_sha256: str
     judge_version: str
+    is_probe: bool = False
 
 
 @dataclass(frozen=True)
@@ -1484,15 +1859,26 @@ class JudgmentsFile:
 
 
 def judgment_records_from_judged(
-    judged: Sequence[JudgedTriple], *, judge_version: str
+    judged: Sequence[JudgedTriple],
+    *,
+    judge_version: str,
+    probe_item_ids: Collection[str] = (),
 ) -> list[JudgmentRecord]:
     """Converts a live run's freshly-judged triples into the persisted
     ``JudgmentRecord`` shape ``write_judgments_jsonl`` writes (finding F2) --
     each carries ``hash_output`` of its triple's ``candidate_value`` so a
     later ``--offline`` recompute can re-verify the same output-binding check
     ``pair_with_labels`` already enforces live, without needing the
-    candidate's raw output a second time."""
+    candidate's raw output a second time.
 
+    ``probe_item_ids`` (fail-probe design, D2 amendment 2026-07-10; default
+    ``()`` reproduces pre-amendment behavior exactly, every record
+    ``is_probe=False``): every item id belonging to the fail-probe run
+    (``CalibrationResult.probe_item_ids``) -- stamped onto each record's
+    ``is_probe`` so ``run_calibration_offline`` can recover probe-item
+    membership from persisted data alone."""
+
+    probe_ids = set(probe_item_ids)
     return [
         JudgmentRecord(
             item_id=jt.triple.item_id,
@@ -1503,6 +1889,7 @@ def judgment_records_from_judged(
             rationale=jt.rationale,
             output_sha256=hash_output(jt.triple.candidate_value),
             judge_version=judge_version,
+            is_probe=jt.triple.item_id in probe_ids,
         )
         for jt in judged
     ]
@@ -1557,6 +1944,7 @@ def run_calibration_offline(
     judgments: JudgmentsFile,
     labels: Sequence[CalibrationLabel],
     label_file_hash: str,
+    perturbation_overlay: Sequence[PerturbationOverlay] = (),
     date_override: date | None = None,
     ci_level: float = DEFAULT_CI_LEVEL,
     n_resamples: int = DEFAULT_N_RESAMPLES,
@@ -1570,9 +1958,20 @@ def run_calibration_offline(
     substituting persisted judgments for a freshly re-judged triple set (gold
     resolution is unaffected either way: it only ever reads ``labels``, live
     or offline). Unlike the live path, every input here is already on disk,
-    so every check -- gold resolution's labels-only validations AND ``pair_
-    judgments_with_labels``'s population-parity checks alike (owner-ruled,
-    2026-07-09, module docstring) -- runs before any statistic is computed.
+    so every check -- gold resolution's labels-only validations, the
+    perturbation overlay's own validation, AND ``pair_judgments_with_
+    labels``'s population-parity checks alike (owner-ruled, 2026-07-09,
+    module docstring) -- runs before any statistic is computed.
+
+    ``perturbation_overlay`` (fail-probe design, D2 amendment 2026-07-10;
+    default ``()`` reproduces pre-amendment behavior exactly): re-validated
+    against probe-item/valid-probe-key sets derived PURELY from
+    ``judgments.judgments``'s persisted ``is_probe`` flag -- no
+    ``RunArtifact``/candidate items needed offline at all (module docstring).
+    A probe set is considered "used" iff at least one persisted judgment has
+    ``is_probe=True``; the fail-probe disclosure fields on the returned
+    ``CalibrationResult`` are populated identically to ``run_calibration``'s
+    in that case, ``None`` otherwise.
 
     Fails loudly rather than silently recompute against data the certificate
     can no longer trust:
@@ -1583,6 +1982,8 @@ def run_calibration_offline(
     - ``DualAnnotationError``/``CalibrationBindingError`` if the two
       annotators' labels do not satisfy the dual-annotation precondition
       (``resolve_gold_labels``/``compute_iaa_ceiling``).
+    - ``PerturbationOverlayError`` if ``perturbation_overlay`` does not
+      satisfy its own binding invariant against the persisted judgments.
     - ``DualAnnotationError`` if a gold label has no corresponding persisted
       judgment, or a persisted judgment's key was labeled by neither
       annotator (population-parity invariant, ``pair_judgments_with_
@@ -1603,9 +2004,22 @@ def run_calibration_offline(
 
     gold = resolve_gold_labels(labels)
 
+    # Fail-probe design (D2 amendment 2026-07-10): probe-item/valid-probe-key
+    # sets are derived purely from the persisted `is_probe` flag -- no
+    # RunArtifact needed offline (module docstring).
+    probe_item_ids = {j.item_id for j in judgments.judgments if j.is_probe}
+    has_probe_set = bool(probe_item_ids)
+    valid_probe_keys = {
+        (j.item_id, j.candidate, j.field) for j in judgments.judgments if j.is_probe
+    }
+    overlay_by_key = validate_perturbation_overlay(
+        perturbation_overlay, probe_item_ids=probe_item_ids, valid_probe_keys=valid_probe_keys
+    )
+
     # Population-parity invariant (owner-ruled, 2026-07-09, module
     # docstring): `valid_keys` is the same population the ceiling kappa and
-    # n_adjudicated below must also be restricted to.
+    # n_adjudicated below must also be restricted to. Spans the UNION of
+    # real + probe judgments (fail-probe design) unchanged.
     paired, judge_errors_excluded, valid_keys = pair_judgments_with_labels(
         judgments.judgments, gold
     )
@@ -1644,6 +2058,25 @@ def run_calibration_offline(
 
     resolved_date = resolve_certificate_date(labels, date_override)
 
+    n_perturbed: int | None = None
+    achieved_fail_prevalence: float | None = None
+    real_only_kappa: KappaResult | None = None
+    perturbed_rows_passed_by_gold: int | None = None
+    real_only_warnings: tuple[str, ...] = ()
+    if has_probe_set:
+        n_perturbed = len(overlay_by_key)
+        achieved_fail_prevalence = 1.0 - overall.prevalence
+        real_only = compute_real_only_kappa(
+            paired, probe_item_ids, ci_level=ci_level, n_resamples=n_resamples, seed=seed
+        )
+        if real_only is not None:
+            real_only_kappa, real_only_warnings = real_only
+        perturbed_rows_passed_by_gold = sum(
+            1
+            for g in gold
+            if (g.item_id, g.candidate, g.field) in overlay_by_key and g.verdict == "pass"
+        )
+
     return CalibrationResult(
         judge_version=current_judge_version,
         label_file_hash=label_file_hash,
@@ -1657,8 +2090,13 @@ def run_calibration_offline(
         judge_errors_excluded=judge_errors_excluded,
         self_consistency=self_consistency,
         ceiling=ceiling,
-        warnings=agreement_warnings + ceiling_warnings,
+        warnings=agreement_warnings + ceiling_warnings + real_only_warnings,
         n_adjudicated=n_adjudicated,
+        n_perturbed=n_perturbed,
+        achieved_fail_prevalence=achieved_fail_prevalence,
+        real_only_kappa=real_only_kappa,
+        perturbed_rows_passed_by_gold=perturbed_rows_passed_by_gold,
+        probe_item_ids=frozenset(probe_item_ids),
     )
 
 
@@ -1826,15 +2264,18 @@ __all__ = [
     "JudgmentRecord",
     "JudgmentsFile",
     "PairedJudgment",
+    "PerturbationOverlayError",
     "SelfConsistencyRecord",
     "SelfConsistencyResult",
     "StaleJudgmentsError",
     "Triple",
+    "apply_perturbation_overlay",
     "build_certificate",
     "build_triples",
     "check_disjoint_from_golden",
     "compute_agreement",
     "compute_iaa_ceiling",
+    "compute_real_only_kappa",
     "decide_verdict",
     "hash_label_file",
     "hash_output",
@@ -1843,6 +2284,7 @@ __all__ = [
     "labeling_template_rows",
     "load_calibration_labels",
     "load_judgments_jsonl",
+    "load_perturbation_overlay",
     "measure_self_consistency",
     "pair_judgments_with_labels",
     "pair_with_labels",
@@ -1853,6 +2295,7 @@ __all__ = [
     "run_calibration",
     "run_calibration_offline",
     "select_fixed_self_consistency_triples",
+    "validate_perturbation_overlay",
     "write_certificate",
     "write_judgments_jsonl",
 ]

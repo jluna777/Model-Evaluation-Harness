@@ -5,15 +5,19 @@
 
 **Amended 2026-07-09 (owner):** dual-annotation upgrade — this ticket's original single-annotator + test-retest design is replaced by dual independent annotation with owner adjudication (decisions.md D2 amendment 2026-07-09). Both annotators label the full set independently; the owner adjudicates disagreements; inter-annotator agreement sets the measured ceiling. The acceptance criteria and notes below reflect the amended design.
 
+**Amended 2026-07-10 (owner):** fail-probe perturbation set — the owner's initial fail rate on the 100 real calibration judgments came back at 0%, and harder real emails demonstrably do not reach spec §5's ≥20% floor (decisions.md D2 amendment 2026-07-10). A second, disjoint item source (`data/calibration/emails-fail-probe.jsonl`) plus a committed perturbation overlay (`data/calibration/perturbations.jsonl`) supplies controlled, disclosed fail-side content instead. The deliverables, acceptance criteria, and notes below are updated accordingly.
+
 ## Goal
 Produce the judge calibration: dual-annotator field judgments (owner + a second, independent annotator), owner adjudication of disagreements, the agreement report with cluster-bootstrap CIs (judge-vs-gold and the human-human IAA ceiling), the committed calibration certificate, and the judge self-consistency measurement — wiring `eval calibrate` as a reportable command that resolves gold and the ceiling automatically whenever both annotators' labels are present.
 
 ## Deliverables
 - `data/calibration/emails.jsonl` (25 dedicated calibration emails; more if the stratification loop adds items)
-- `data/calibration/labels.jsonl` (both annotators' labels + owner adjudication rows)
+- `data/calibration/emails-fail-probe.jsonl` (~10 fail-probe items, same schema, ids continuing the `cal-0NN` sequence, disjoint from `emails.jsonl` — D2 amendment 2026-07-10)
+- `data/calibration/perturbations.jsonl` (committed perturbation overlay rows — D2 amendment 2026-07-10)
+- `data/calibration/labels.jsonl` (both annotators' labels + owner adjudication rows, covering real AND fail-probe items)
 - `data/calibration/certificate.json` (committed)
 - `src/harness/calibrate.py`
-- CLI `eval calibrate` added to `src/harness/cli.py` (dual annotation is automatic; no flag)
+- CLI `eval calibrate` added to `src/harness/cli.py` (dual annotation is automatic; no flag; `--fail-probe-emails`/`--perturbations` optional, absent = pre-amendment behavior)
 - `tests/unit/test_calibrate.py` (synthetic fixtures per acceptance criteria)
 
 ## Interfaces
@@ -27,9 +31,10 @@ Produce the judge calibration: dual-annotator field judgments (owner + a second,
 
 **Produces:**
 - `data/calibration/certificate.json` per spec §5, consumed by T10 report headers and by T1's `fingerprint(...)` `calibration_verdict` argument at T15/T16 call sites:
-  `{judge_version, overall_kappa, kappa_ci, per_candidate_kappa, per_candidate_kappa_ci?, verdict: "adequate"|"adequate_with_caveat"|"inadequate", ceiling_kappa?, ceiling_kappa_ci?, n_adjudicated?, label_file_hash, date}`
-- `eval calibrate` — reportable command (fails fast without Langfuse keys); resolves dual-annotation gold + the human-human ceiling automatically when both annotators' `round="initial"` labels are complete, else a clean, loud error (`DualAnnotationError`)
+  `{judge_version, overall_kappa, kappa_ci, per_candidate_kappa, per_candidate_kappa_ci?, verdict: "adequate"|"adequate_with_caveat"|"inadequate", ceiling_kappa?, ceiling_kappa_ci?, n_adjudicated?, label_file_hash, date, n_perturbed?, achieved_fail_prevalence?, real_only_kappa?, real_only_kappa_ci?, perturbed_rows_passed_by_gold?}`
+- `eval calibrate` — reportable command (fails fast without Langfuse keys); resolves dual-annotation gold + the human-human ceiling automatically when both annotators' `round="initial"` labels are complete, else a clean, loud error (`DualAnnotationError`); loads the fail-probe set and applies the perturbation overlay when present, else a clean, loud error (`PerturbationOverlayError`) on a malformed overlay
 - Labels file rows per spec §5: `{label_id, item_id, candidate, field, annotator, verdict, critique, label_date, round: "initial"|"adjudication"}`
+- Perturbation overlay rows per spec §5: `{item_id, candidate, field, perturbed_value, corruption_type, rationale}`
 
 ## Acceptance criteria
 - [ ] `data/calibration/emails.jsonl` uses the same item schema as golden (including `expected` reference values) and is disjoint from `data/golden/golden.jsonl` — a unit test asserts zero id/email overlap.
@@ -45,6 +50,12 @@ Produce the judge calibration: dual-annotator field judgments (owner + a second,
 - [ ] `eval calibrate` on a fixture with both annotators' complete, correctly-bound labels adds the ceiling row automatically (no flag) — human-human κ on the intersection, with its own CI, labeled *the human-human agreement ceiling*; the offline (`--offline`) path reproduces the same gold resolution and ceiling identically from persisted `judgments.jsonl` + `labels.jsonl`.
 - [ ] `data/calibration/certificate.json` committed with every spec §5 field, `label_file_hash` matching `labels.jsonl`, and `judge_version` matching T7's `judge_version()`.
 - [ ] The second annotator has read the written labeling conventions/rubric before labeling (D2 amendment 2026-07-09: the ceiling measures task ambiguity only if both annotators apply the same rules) — recorded in this ticket's evidence.
+- [ ] Perturbation overlay validation verified on synthetic fixtures (D2 amendment 2026-07-10): a valid overlay row is accepted and its value flows into the reconstructed triple/labeling sheet/label binding hash; a key targeting the original `emails.jsonl`, a nonexistent (item_id, candidate, field) key, and a duplicate key each raise `PerturbationOverlayError` naming every offending key, all-or-nothing.
+- [ ] Fail-probe disclosure fields verified on synthetic fixtures: `n_perturbed` counts overlaid rows; the achieved fail prevalence is computed over the combined (real + probe) valid population; `perturbed_rows_passed_by_gold` counts overlaid rows whose resolved gold is nonetheless `"pass"`; a real-only Cohen's κ (judge vs. gold restricted to non-probe items) is computed alongside — never replacing — the primary overall κ, which remains the sole adequacy-decision statistic over the full, probe-included population.
+- [ ] Absent-probe-file backward compatibility: `eval calibrate` with no `emails-fail-probe.jsonl`/`perturbations.jsonl` present reproduces pre-amendment behavior exactly (every fail-probe disclosure field `None`/absent from the report) — existing tests predating this amendment keep passing unchanged.
+- [ ] Offline-path parity: `eval calibrate --offline` re-validates the SAME overlay file against `judgments.jsonl`'s persisted `is_probe` flag and reproduces the identical disclosure numbers as the live run, with zero API calls and no fail-probe emails file needed offline.
+- [ ] Population-parity checks (D2 amendment 2026-07-09b) span the union of real + probe triples unchanged: a probe-set judge error, or a probe key labeled by neither annotator, is handled identically to a real-set one.
+- [ ] Blindness protocol recorded in this ticket's evidence (decisions.md D2 amendment 2026-07-10): the second annotator's fail-probe sheet is uniform and indistinguishable from a real-item sheet; the owner knows the fail-probe batch exists but not which rows are perturbed or how, while labeling.
 - [ ] `uv run pytest` and `uv run ruff check` pass.
 - [ ] ◆ Owner validates (signs) the calibration certificate.
 

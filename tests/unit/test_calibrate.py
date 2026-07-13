@@ -63,6 +63,7 @@ from harness.schema import (
     GoldenExpected,
     GoldenItem,
     GoldenMeta,
+    PerturbationOverlay,
     TicketExtraction,
 )
 from harness.stats.agreement import KappaResult
@@ -638,6 +639,219 @@ class TestLabelingTemplateRows:
 
 
 # --------------------------------------------------------------------------
+# Perturbation overlay (fail-probe design, D2 amendment 2026-07-10):
+# validate_perturbation_overlay / apply_perturbation_overlay /
+# load_perturbation_overlay.
+# --------------------------------------------------------------------------
+
+
+def make_overlay_row(
+    item_id: str,
+    candidate: str,
+    field: str,
+    perturbed_value: str,
+    *,
+    corruption_type: str = "ungrounded_addition",
+    rationale: str = "scripted probe",
+) -> PerturbationOverlay:
+    return PerturbationOverlay(
+        item_id=item_id,
+        candidate=candidate,
+        field=field,
+        perturbed_value=perturbed_value,
+        corruption_type=corruption_type,
+        rationale=rationale,
+    )
+
+
+class TestValidatePerturbationOverlay:
+    def test_valid_overlay_is_accepted_and_returned_by_key(self):
+        overlay = [make_overlay_row("cal-101", "a", "issue_summary", "corrupted text")]
+
+        validated = calibrate.validate_perturbation_overlay(
+            overlay,
+            probe_item_ids={"cal-101", "cal-102"},
+            valid_probe_keys={
+                ("cal-101", "a", "issue_summary"),
+                ("cal-102", "b", "requested_action"),
+            },
+        )
+
+        assert validated == {("cal-101", "a", "issue_summary"): overlay[0]}
+
+    def test_empty_overlay_returns_empty_mapping(self):
+        validated = calibrate.validate_perturbation_overlay(
+            [], probe_item_ids={"cal-101"}, valid_probe_keys={("cal-101", "a", "issue_summary")}
+        )
+
+        assert validated == {}
+
+    def test_key_targeting_original_emails_file_raises(self):
+        """A key whose item_id is NOT among the probe items (e.g. it belongs
+        to the original emails.jsonl) must raise, naming the key."""
+
+        overlay = [make_overlay_row("cal-001", "a", "issue_summary", "corrupted text")]
+
+        with pytest.raises(calibrate.PerturbationOverlayError) as excinfo:
+            calibrate.validate_perturbation_overlay(
+                overlay,
+                probe_item_ids={"cal-101"},
+                valid_probe_keys={("cal-101", "a", "issue_summary")},
+            )
+
+        message = str(excinfo.value)
+        assert "target the original emails file" in message
+        assert "('cal-001', 'a', 'issue_summary')" in message
+
+    def test_nonexistent_key_raises(self):
+        """A probe item_id whose (candidate, field) doesn't correspond to any
+        actually-judgeable triple must raise as a nonexistent key -- distinct
+        from targeting the original file."""
+
+        overlay = [make_overlay_row("cal-101", "a", "requested_action", "corrupted text")]
+
+        with pytest.raises(calibrate.PerturbationOverlayError) as excinfo:
+            calibrate.validate_perturbation_overlay(
+                overlay,
+                probe_item_ids={"cal-101"},
+                valid_probe_keys={("cal-101", "a", "issue_summary")},  # different field
+            )
+
+        message = str(excinfo.value)
+        assert "don't exist among the fail-probe run's judgeable triples" in message
+        assert "('cal-101', 'a', 'requested_action')" in message
+
+    def test_duplicate_key_raises(self):
+        overlay = [
+            make_overlay_row("cal-101", "a", "issue_summary", "first corrupted text"),
+            make_overlay_row("cal-101", "a", "issue_summary", "second corrupted text"),
+        ]
+
+        with pytest.raises(calibrate.PerturbationOverlayError) as excinfo:
+            calibrate.validate_perturbation_overlay(
+                overlay,
+                probe_item_ids={"cal-101"},
+                valid_probe_keys={("cal-101", "a", "issue_summary")},
+            )
+
+        message = str(excinfo.value)
+        assert "duplicate overlay row" in message
+        assert "('cal-101', 'a', 'issue_summary')" in message
+
+    def test_all_three_violations_reported_together(self):
+        overlay = [
+            make_overlay_row("cal-001", "a", "issue_summary", "x"),  # targets original file
+            make_overlay_row("cal-101", "b", "requested_action", "y"),  # nonexistent
+            make_overlay_row("cal-101", "a", "issue_summary", "z1"),
+            make_overlay_row("cal-101", "a", "issue_summary", "z2"),  # duplicate of above
+        ]
+
+        with pytest.raises(calibrate.PerturbationOverlayError) as excinfo:
+            calibrate.validate_perturbation_overlay(
+                overlay,
+                probe_item_ids={"cal-101"},
+                valid_probe_keys={("cal-101", "a", "issue_summary")},
+            )
+
+        message = str(excinfo.value)
+        assert "target the original emails file" in message
+        assert "don't exist among the fail-probe run's judgeable triples" in message
+        assert "duplicate overlay row" in message
+
+
+class TestApplyPerturbationOverlay:
+    def test_overlaid_triple_gets_replaced_value(self):
+        email = make_item("cal-101").email
+        triple = Triple("cal-101", "a", "issue_summary", email, "ref", "real candidate output")
+        overlay_row = make_overlay_row("cal-101", "a", "issue_summary", "corrupted output")
+        overlay_by_key = {("cal-101", "a", "issue_summary"): overlay_row}
+
+        result = calibrate.apply_perturbation_overlay([triple], overlay_by_key)
+
+        assert len(result) == 1
+        assert result[0].candidate_value == "corrupted output"
+        # Every other field is preserved unchanged.
+        assert result[0].item_id == "cal-101"
+        assert result[0].candidate == "a"
+        assert result[0].field == "issue_summary"
+        assert result[0].email == email
+        assert result[0].reference == "ref"
+
+    def test_non_overlaid_triple_keeps_real_output(self):
+        email = make_item("cal-101").email
+        triple = Triple("cal-101", "a", "issue_summary", email, "ref", "real candidate output")
+
+        result = calibrate.apply_perturbation_overlay([triple], {})
+
+        assert result == [triple]
+
+    def test_mixed_triples_only_matching_keys_replaced(self):
+        email = make_item("cal-101").email
+        triples = [
+            Triple("cal-101", "a", "issue_summary", email, "ref", "real-1"),
+            Triple("cal-101", "a", "requested_action", email, "ref", "real-2"),
+        ]
+        overlay_by_key = {
+            ("cal-101", "a", "issue_summary"): make_overlay_row(
+                "cal-101", "a", "issue_summary", "corrupted-1"
+            )
+        }
+
+        result = calibrate.apply_perturbation_overlay(triples, overlay_by_key)
+
+        by_field = {t.field: t for t in result}
+        assert by_field["issue_summary"].candidate_value == "corrupted-1"
+        assert by_field["requested_action"].candidate_value == "real-2"
+
+    def test_overlaid_value_flows_into_labeling_sheet_and_its_hash_binding(self):
+        """The overlay must be applied BEFORE labeling_template_rows is
+        called on the reconstructed triples, so a labeling sheet generated
+        from a fail-probe run is hash-bound to the CORRUPTED text, never the
+        real candidate output -- the design's "everywhere downstream" claim,
+        exercised concretely for the labeling-sheet consumer."""
+
+        email = make_item("cal-101").email
+        triple = Triple("cal-101", "a", "issue_summary", email, "ref", "real candidate output")
+        overlay_row = make_overlay_row("cal-101", "a", "issue_summary", "corrupted output")
+        overlaid = calibrate.apply_perturbation_overlay(
+            [triple], {("cal-101", "a", "issue_summary"): overlay_row}
+        )
+
+        rows = calibrate.labeling_template_rows(overlaid, "owner")
+
+        assert rows[0]["candidate_value"] == "corrupted output"
+        assert rows[0]["output_sha256"] == calibrate.hash_output("corrupted output")
+        assert rows[0]["output_sha256"] != calibrate.hash_output("real candidate output")
+
+
+class TestLoadPerturbationOverlay:
+    def test_loads_rows_from_file(self, tmp_path):
+        path = tmp_path / "perturbations.jsonl"
+        row = make_overlay_row("cal-101", "a", "issue_summary", "corrupted text")
+        path.write_text(json.dumps(row.model_dump(mode="json")) + "\n", encoding="utf-8")
+
+        rows = calibrate.load_perturbation_overlay(path)
+
+        assert len(rows) == 1
+        assert isinstance(rows[0], PerturbationOverlay)
+        assert rows[0].item_id == "cal-101"
+
+    def test_absent_file_returns_empty_list(self, tmp_path):
+        path = tmp_path / "does-not-exist.jsonl"
+
+        assert calibrate.load_perturbation_overlay(path) == []
+
+    def test_skips_blank_lines(self, tmp_path):
+        path = tmp_path / "perturbations.jsonl"
+        row = make_overlay_row("cal-101", "a", "issue_summary", "corrupted text")
+        path.write_text(f"\n{json.dumps(row.model_dump(mode='json'))}\n\n", encoding="utf-8")
+
+        rows = calibrate.load_perturbation_overlay(path)
+
+        assert len(rows) == 1
+
+
+# --------------------------------------------------------------------------
 # compute_agreement
 # --------------------------------------------------------------------------
 
@@ -717,6 +931,74 @@ class TestComputeAgreement:
 
         assert overall.kappa == 0.8
         assert any("Omitted 3 of 10" in w for w in warnings_out)
+
+
+# --------------------------------------------------------------------------
+# compute_real_only_kappa (fail-probe design, D2 amendment 2026-07-10)
+# --------------------------------------------------------------------------
+
+
+class TestComputeRealOnlyKappa:
+    def _paired(self, item_id: str, candidate: str, owner: str, judge: str) -> PairedJudgment:
+        return PairedJudgment(item_id, candidate, owner, judge)
+
+    def test_restricts_to_non_probe_items(self, monkeypatch):
+        captured: list[list[str]] = []
+        real_cohens_kappa = agreement_module.cohens_kappa
+
+        def _spy(a, b, *, clusters=None, **kwargs):
+            captured.append(list(clusters))
+            return real_cohens_kappa(a, b, clusters=clusters, **kwargs)
+
+        monkeypatch.setattr(calibrate, "cohens_kappa", _spy)
+
+        paired = [
+            self._paired("cal-001", "a", "pass", "pass"),
+            self._paired("cal-002", "a", "fail", "fail"),
+            self._paired("cal-003", "a", "pass", "pass"),
+            self._paired("cal-101", "a", "fail", "fail"),  # probe item
+        ]
+
+        result = calibrate.compute_real_only_kappa(
+            paired, probe_item_ids={"cal-101"}, n_resamples=50, seed=0
+        )
+
+        assert result is not None
+        kappa_result, _warnings = result
+        assert kappa_result.kappa == pytest.approx(1.0)
+        assert len(captured[0]) == 3  # cal-101 excluded
+
+    def test_empty_probe_ids_uses_full_population(self):
+        # >=6 items to avoid jackknife degeneracy in the BCa CI (mirrors
+        # TestComputeAgreement's own fixture sizing).
+        paired = [self._paired(f"cal-{i:03d}", "a", "pass", "pass") for i in range(1, 6)]
+        paired.append(self._paired("cal-006", "a", "fail", "fail"))
+
+        result = calibrate.compute_real_only_kappa(paired, probe_item_ids=set(), n_resamples=50)
+
+        assert result is not None
+        kappa_result, _warnings = result
+        assert kappa_result.kappa == pytest.approx(1.0)
+
+    def test_returns_none_when_fewer_than_two_non_probe_paired(self):
+        paired = [
+            self._paired("cal-101", "a", "pass", "pass"),  # probe
+            self._paired("cal-102", "a", "fail", "fail"),  # probe
+            self._paired("cal-001", "a", "pass", "pass"),  # only one real item
+        ]
+
+        result = calibrate.compute_real_only_kappa(
+            paired, probe_item_ids={"cal-101", "cal-102"}, n_resamples=50
+        )
+
+        assert result is None
+
+    def test_returns_none_when_zero_non_probe_paired(self):
+        paired = [self._paired("cal-101", "a", "pass", "pass")]
+
+        result = calibrate.compute_real_only_kappa(paired, probe_item_ids={"cal-101"})
+
+        assert result is None
 
 
 # --------------------------------------------------------------------------
@@ -1468,6 +1750,35 @@ class TestBuildCertificate:
         assert certificate.ceiling_kappa_ci == pytest.approx((0.8, 0.95))
         assert certificate.n_adjudicated == 2
 
+    def test_perturbation_fields_default_to_none_when_absent(self):
+        result = _sample_result()
+
+        certificate = build_certificate(result)
+
+        assert certificate.n_perturbed is None
+        assert certificate.achieved_fail_prevalence is None
+        assert certificate.real_only_kappa is None
+        assert certificate.real_only_kappa_ci is None
+        assert certificate.perturbed_rows_passed_by_gold is None
+
+    def test_perturbation_fields_populated_when_present(self):
+        result = _sample_result(
+            n_perturbed=4,
+            achieved_fail_prevalence=0.22,
+            real_only_kappa=KappaResult(
+                kappa=0.65, ci=(0.4, 0.82), raw_agreement=0.9, prevalence=0.7
+            ),
+            perturbed_rows_passed_by_gold=1,
+        )
+
+        certificate = build_certificate(result)
+
+        assert certificate.n_perturbed == 4
+        assert certificate.achieved_fail_prevalence == pytest.approx(0.22)
+        assert certificate.real_only_kappa == pytest.approx(0.65)
+        assert certificate.real_only_kappa_ci == pytest.approx((0.4, 0.82))
+        assert certificate.perturbed_rows_passed_by_gold == 1
+
 
 class TestWriteCertificateRoundTrip:
     def test_json_round_trip(self, tmp_path):
@@ -1573,6 +1884,31 @@ class TestRenderCalibrationReport:
 
         assert "2 judge error(s)" in actual
         assert "population-parity invariant" in actual
+
+    def test_omits_perturbation_section_when_no_probe_set_used(self):
+        actual = render_calibration_report(_sample_result(n_perturbed=None))
+
+        assert "Perturbation Probe Set" not in actual
+
+    def test_renders_perturbation_section_when_probe_set_used(self):
+        result = _sample_result(
+            n_perturbed=4,
+            achieved_fail_prevalence=0.22,
+            real_only_kappa=KappaResult(
+                kappa=0.65, ci=(0.4, 0.82), raw_agreement=0.9, prevalence=0.7
+            ),
+            perturbed_rows_passed_by_gold=1,
+        )
+
+        actual = render_calibration_report(result)
+
+        assert "Perturbation Probe Set" in actual
+        assert "Overlaid rows (n_perturbed): 4" in actual
+        assert "22.0%" in actual
+        assert "Real-only κ" in actual
+        assert "0.650" in actual
+        assert "never replacing it as the decision statistic" in actual
+        assert "Perturbed rows the resolved gold still passed: 1" in actual
 
 
 # --------------------------------------------------------------------------
@@ -1879,6 +2215,451 @@ class TestPopulationParityInvariant:
 
 
 # --------------------------------------------------------------------------
+# run_calibration / run_calibration_offline with a fail-probe perturbation
+# set (D2 amendment 2026-07-10).
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _FailProbeFixture:
+    run_a: RunArtifact
+    run_b: RunArtifact
+    probe_run_a: RunArtifact
+    probe_run_b: RunArtifact
+    labels: list[CalibrationLabel]
+    judge: Judge
+    client: _KeyedJudgeClient
+    overlay: list[PerturbationOverlay]
+    caught_key: tuple[str, str, str]
+    uncaught_key: tuple[str, str, str]
+    caught_perturbed_value: str
+    uncaught_perturbed_value: str
+
+
+def _fail_probe_fixture() -> _FailProbeFixture:
+    """2 real calibration items (cal-001/cal-002) x 2 candidates x 2 fields =
+    8 main triples, one "fail" pair per candidate so neither candidate's
+    subset is single-category -- everything else "pass", both annotators and
+    the judge agreeing everywhere (n_adjudicated == 0).
+
+    2 fail-probe items (cal-101/cal-102) x 2 candidates x 2 fields = 8 probe
+    triples. The overlay perturbs exactly two of them: ``caught_key``'s
+    corrupted text is correctly flagged "fail" by both annotators and the
+    judge (a caught perturbation); ``uncaught_key``'s corrupted text is
+    still labeled/judged "pass" (the disclosed ``perturbed_rows_passed_by_
+    gold`` case -- a perturbation the human standard did not flag). The
+    remaining 6 probe triples keep their real output, labeled/judged "pass".
+
+    Combined valid population: 16 keys, 3 "fail" (2 main + 1 probe-caught),
+    13 "pass" -- judge agrees with gold everywhere (both overall and
+    real-only kappa are well-defined and equal to 1.0).
+    """
+
+    main_item_ids = ["cal-001", "cal-002"]
+    main_items = [make_item(i) for i in main_item_ids]
+
+    def cv(item_id: str, candidate: str, field: str, *, tag: str = "value") -> str:
+        return f"{item_id}-{candidate}-{field}-{tag}"
+
+    rows_by_candidate: dict[str, list[RunRow]] = {"a": [], "b": []}
+    for item_id in main_item_ids:
+        for candidate in ("a", "b"):
+            rows_by_candidate[candidate].append(
+                make_row(
+                    item_id,
+                    0,
+                    issue_summary=cv(item_id, candidate, "issue_summary"),
+                    requested_action=cv(item_id, candidate, "requested_action"),
+                )
+            )
+    run_a = make_run_artifact("a", main_items, rows_by_candidate["a"])
+    run_b = make_run_artifact("b", main_items, rows_by_candidate["b"])
+
+    main_fail_pairs = {("cal-001", "a", "issue_summary"), ("cal-002", "b", "requested_action")}
+
+    probe_item_ids = ["cal-101", "cal-102"]
+    probe_items = [make_item(i) for i in probe_item_ids]
+    probe_rows_by_candidate: dict[str, list[RunRow]] = {"a": [], "b": []}
+    for item_id in probe_item_ids:
+        for candidate in ("a", "b"):
+            probe_rows_by_candidate[candidate].append(
+                make_row(
+                    item_id,
+                    0,
+                    issue_summary=cv(item_id, candidate, "issue_summary", tag="real"),
+                    requested_action=cv(item_id, candidate, "requested_action", tag="real"),
+                )
+            )
+    probe_run_a = make_run_artifact("a", probe_items, probe_rows_by_candidate["a"])
+    probe_run_b = make_run_artifact("b", probe_items, probe_rows_by_candidate["b"])
+
+    caught_key = ("cal-101", "a", "issue_summary")
+    uncaught_key = ("cal-102", "b", "requested_action")
+    caught_perturbed_value = "corrupted-cal-101-a-issue_summary"
+    uncaught_perturbed_value = "corrupted-cal-102-b-requested_action"
+
+    overlay = [
+        make_overlay_row(
+            *caught_key, caught_perturbed_value, corruption_type="ungrounded_addition"
+        ),
+        make_overlay_row(
+            *uncaught_key, uncaught_perturbed_value, corruption_type="dropped_essential"
+        ),
+    ]
+
+    labels: list[CalibrationLabel] = []
+    verdict_table: dict[str, str] = {}
+
+    for item_id in main_item_ids:
+        for candidate in ("a", "b"):
+            for field_name in ("issue_summary", "requested_action"):
+                key = (item_id, candidate, field_name)
+                value = cv(item_id, candidate, field_name)
+                verdict = "fail" if key in main_fail_pairs else "pass"
+                for annotator in ("owner", "annotator2"):
+                    labels.append(
+                        make_label(
+                            item_id, candidate, field_name, verdict,
+                            candidate_value=value, annotator=annotator,
+                        )
+                    )
+                verdict_table[value] = verdict
+
+    for item_id in probe_item_ids:
+        for candidate in ("a", "b"):
+            for field_name in ("issue_summary", "requested_action"):
+                key = (item_id, candidate, field_name)
+                real_value = cv(item_id, candidate, field_name, tag="real")
+                if key == caught_key:
+                    seen_value, verdict = caught_perturbed_value, "fail"
+                elif key == uncaught_key:
+                    seen_value, verdict = uncaught_perturbed_value, "pass"
+                else:
+                    seen_value, verdict = real_value, "pass"
+                for annotator in ("owner", "annotator2"):
+                    labels.append(
+                        make_label(
+                            item_id, candidate, field_name, verdict,
+                            candidate_value=seen_value, annotator=annotator,
+                        )
+                    )
+                verdict_table[seen_value] = verdict
+
+    def _verdict_for(candidate_value: str, idx: int) -> str:
+        return verdict_table[candidate_value]
+
+    client = _KeyedJudgeClient(verdict_for=_verdict_for)
+    judge = Judge(client)
+
+    return _FailProbeFixture(
+        run_a=run_a,
+        run_b=run_b,
+        probe_run_a=probe_run_a,
+        probe_run_b=probe_run_b,
+        labels=labels,
+        judge=judge,
+        client=client,
+        overlay=overlay,
+        caught_key=caught_key,
+        uncaught_key=uncaught_key,
+        caught_perturbed_value=caught_perturbed_value,
+        uncaught_perturbed_value=uncaught_perturbed_value,
+    )
+
+
+class TestRunCalibrationWithFailProbeSet:
+    def test_overlay_applied_before_judging_judge_sees_corrupted_text(self):
+        fx = _fail_probe_fixture()
+
+        calibrate_module_run_calibration = run_calibration(
+            run_a=fx.run_a,
+            run_b=fx.run_b,
+            labels=fx.labels,
+            judge=fx.judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=fx.probe_run_a,
+            probe_run_b=fx.probe_run_b,
+            perturbation_overlay=fx.overlay,
+            n_resamples=50,
+            seed=0,
+        )
+
+        judged_prompts = fx.client.calls
+        real_value = "cal-101-a-issue_summary-real"
+        assert any(fx.caught_perturbed_value in p for p in judged_prompts)
+        assert not any(real_value in p for p in judged_prompts)
+        assert calibrate_module_run_calibration.n_perturbed == 2
+
+    def test_non_overlaid_probe_rows_keep_real_run_output(self):
+        fx = _fail_probe_fixture()
+
+        run_calibration(
+            run_a=fx.run_a,
+            run_b=fx.run_b,
+            labels=fx.labels,
+            judge=fx.judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=fx.probe_run_a,
+            probe_run_b=fx.probe_run_b,
+            perturbation_overlay=fx.overlay,
+            n_resamples=50,
+            seed=0,
+        )
+
+        non_overlaid_real_value = "cal-101-b-issue_summary-real"
+        assert any(non_overlaid_real_value in p for p in fx.client.calls)
+
+    def test_disclosure_fields_populated_correctly(self):
+        fx = _fail_probe_fixture()
+
+        result = run_calibration(
+            run_a=fx.run_a,
+            run_b=fx.run_b,
+            labels=fx.labels,
+            judge=fx.judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=fx.probe_run_a,
+            probe_run_b=fx.probe_run_b,
+            perturbation_overlay=fx.overlay,
+            n_resamples=200,
+            seed=0,
+        )
+
+        assert result.n_perturbed == 2
+        assert result.achieved_fail_prevalence == pytest.approx(3 / 16)
+        assert result.perturbed_rows_passed_by_gold == 1
+        assert result.real_only_kappa is not None
+        assert result.real_only_kappa.kappa == pytest.approx(1.0)
+        assert result.overall.kappa == pytest.approx(1.0)
+        assert result.probe_item_ids == frozenset({"cal-101", "cal-102"})
+
+    def test_population_sizes_span_the_union_correctly(self, monkeypatch):
+        """Overall/per-candidate/ceiling kappa run over the FULL 16-key union
+        (main + probe); real-only kappa is separately restricted to the
+        8-key main-only population -- proving both populations are computed
+        distinctly, never conflated."""
+
+        call_lengths: list[int] = []
+        real_cohens_kappa = agreement_module.cohens_kappa
+
+        def _spy(a, b, *, clusters=None, **kwargs):
+            call_lengths.append(len(a))
+            return real_cohens_kappa(a, b, clusters=clusters, **kwargs)
+
+        monkeypatch.setattr(calibrate, "cohens_kappa", _spy)
+        fx = _fail_probe_fixture()
+
+        run_calibration(
+            run_a=fx.run_a,
+            run_b=fx.run_b,
+            labels=fx.labels,
+            judge=fx.judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=fx.probe_run_a,
+            probe_run_b=fx.probe_run_b,
+            perturbation_overlay=fx.overlay,
+            n_resamples=50,
+            seed=0,
+        )
+
+        # Order: overall, per-candidate "a", per-candidate "b", ceiling, real-only.
+        assert len(call_lengths) == 5
+        overall_n, cand_a_n, cand_b_n, ceiling_n, real_only_n = call_lengths
+        assert overall_n == 16
+        assert cand_a_n == 8
+        assert cand_b_n == 8
+        assert ceiling_n == 16
+        assert real_only_n == 8
+
+    def test_omitting_probe_runs_leaves_disclosure_fields_none(self):
+        """Backward compatibility: calling run_calibration without any
+        probe_run_a/probe_run_b/perturbation_overlay argument reproduces
+        pre-amendment behavior exactly -- every fail-probe disclosure field
+        stays at its default None/empty."""
+
+        run_a, run_b, labels, judge = _calibration_fixture()
+
+        result = run_calibration(
+            run_a=run_a,
+            run_b=run_b,
+            labels=labels,
+            judge=judge,
+            label_file_hash="fixture-hash",
+            n_resamples=50,
+            seed=0,
+        )
+
+        assert result.n_perturbed is None
+        assert result.achieved_fail_prevalence is None
+        assert result.real_only_kappa is None
+        assert result.perturbed_rows_passed_by_gold is None
+        assert result.probe_item_ids == frozenset()
+
+    def test_overlay_validation_error_propagates_before_any_judge_call(self):
+        """A bad overlay (key targeting the original emails file) must raise
+        PerturbationOverlayError before spending a single judge call --
+        mirroring the existing labels-defect-before-judge-call precedent."""
+
+        fx = _fail_probe_fixture()
+        bad_overlay = [make_overlay_row("cal-001", "a", "issue_summary", "x")]
+
+        with pytest.raises(calibrate.PerturbationOverlayError, match="original emails file"):
+            run_calibration(
+                run_a=fx.run_a,
+                run_b=fx.run_b,
+                labels=fx.labels,
+                judge=fx.judge,
+                label_file_hash="fixture-hash",
+                probe_run_a=fx.probe_run_a,
+                probe_run_b=fx.probe_run_b,
+                perturbation_overlay=bad_overlay,
+                n_resamples=50,
+            )
+
+        assert fx.client.calls == []
+
+    def test_missing_label_for_probe_key_raises_dual_annotation_error(self):
+        """Population parity spans the union unchanged (spec §5): a probe
+        key with no label from either annotator must raise the SAME
+        DualAnnotationError a main-set gap would."""
+
+        fx = _fail_probe_fixture()
+        dropped_key = ("cal-101", "a", "requested_action")
+        remaining_labels = [
+            label
+            for label in fx.labels
+            if (label.item_id, label.candidate, label.field) != dropped_key
+        ]
+
+        with pytest.raises(calibrate.DualAnnotationError, match="labeled by neither annotator"):
+            run_calibration(
+                run_a=fx.run_a,
+                run_b=fx.run_b,
+                labels=remaining_labels,
+                judge=fx.judge,
+                label_file_hash="fixture-hash",
+                probe_run_a=fx.probe_run_a,
+                probe_run_b=fx.probe_run_b,
+                perturbation_overlay=fx.overlay,
+                n_resamples=50,
+            )
+
+
+class TestRunCalibrationOfflineWithFailProbeSet:
+    def _judgments_file(self, result: CalibrationResult) -> calibrate.JudgmentsFile:
+        return calibrate.JudgmentsFile(
+            judge_version=result.judge_version,
+            written_at="2026-07-10T00:00:00+00:00",
+            judgments=tuple(
+                calibrate.judgment_records_from_judged(
+                    result.judged_triples,
+                    judge_version=result.judge_version,
+                    probe_item_ids=result.probe_item_ids,
+                )
+            ),
+            self_consistency=result.self_consistency_records,
+        )
+
+    def test_offline_reproduces_the_same_disclosure_as_live(self):
+        fx = _fail_probe_fixture()
+        live_result = run_calibration(
+            run_a=fx.run_a,
+            run_b=fx.run_b,
+            labels=fx.labels,
+            judge=fx.judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=fx.probe_run_a,
+            probe_run_b=fx.probe_run_b,
+            perturbation_overlay=fx.overlay,
+            n_resamples=200,
+            seed=0,
+        )
+        judgments_file = self._judgments_file(live_result)
+
+        offline_result = calibrate.run_calibration_offline(
+            judgments=judgments_file,
+            labels=fx.labels,
+            label_file_hash="fixture-hash",
+            perturbation_overlay=fx.overlay,
+            n_resamples=200,
+            seed=0,
+        )
+
+        assert offline_result.n_perturbed == live_result.n_perturbed == 2
+        assert offline_result.achieved_fail_prevalence == pytest.approx(
+            live_result.achieved_fail_prevalence
+        )
+        assert offline_result.perturbed_rows_passed_by_gold == (
+            live_result.perturbed_rows_passed_by_gold
+        )
+        assert offline_result.real_only_kappa is not None
+        assert live_result.real_only_kappa is not None
+        assert offline_result.real_only_kappa.kappa == pytest.approx(
+            live_result.real_only_kappa.kappa
+        )
+        assert offline_result.probe_item_ids == live_result.probe_item_ids
+
+    def test_backward_compatible_when_no_judgment_is_marked_is_probe(self):
+        """A judgments.jsonl produced entirely pre-amendment (every record's
+        ``is_probe`` defaulting False) must still recompute cleanly, with
+        every fail-probe disclosure field at its None default -- passing an
+        empty overlay reproduces pre-amendment behavior exactly."""
+
+        run_a, run_b, labels, judge = _calibration_fixture()
+        live_result = run_calibration(
+            run_a=run_a, run_b=run_b, labels=labels, judge=judge,
+            label_file_hash="fixture-hash", n_resamples=50, seed=0,
+        )
+        judgments_file = calibrate.JudgmentsFile(
+            judge_version=live_result.judge_version,
+            written_at="2026-07-10T00:00:00+00:00",
+            judgments=tuple(
+                calibrate.judgment_records_from_judged(
+                    live_result.judged_triples, judge_version=live_result.judge_version
+                )
+            ),
+            self_consistency=live_result.self_consistency_records,
+        )
+        assert all(not j.is_probe for j in judgments_file.judgments)
+
+        offline_result = calibrate.run_calibration_offline(
+            judgments=judgments_file, labels=labels, label_file_hash="fixture-hash",
+            n_resamples=50, seed=0,
+        )
+
+        assert offline_result.n_perturbed is None
+        assert offline_result.achieved_fail_prevalence is None
+        assert offline_result.real_only_kappa is None
+        assert offline_result.perturbed_rows_passed_by_gold is None
+
+    def test_offline_overlay_validation_error_propagates(self):
+        fx = _fail_probe_fixture()
+        live_result = run_calibration(
+            run_a=fx.run_a,
+            run_b=fx.run_b,
+            labels=fx.labels,
+            judge=fx.judge,
+            label_file_hash="fixture-hash",
+            probe_run_a=fx.probe_run_a,
+            probe_run_b=fx.probe_run_b,
+            perturbation_overlay=fx.overlay,
+            n_resamples=50,
+            seed=0,
+        )
+        judgments_file = self._judgments_file(live_result)
+        bad_overlay = [make_overlay_row("cal-001", "a", "issue_summary", "x")]
+
+        with pytest.raises(calibrate.PerturbationOverlayError, match="original emails file"):
+            calibrate.run_calibration_offline(
+                judgments=judgments_file,
+                labels=fx.labels,
+                label_file_hash="fixture-hash",
+                perturbation_overlay=bad_overlay,
+                n_resamples=50,
+            )
+
+
+# --------------------------------------------------------------------------
 # judgment_records_from_judged / pair_judgments_with_labels (finding F2)
 # --------------------------------------------------------------------------
 
@@ -1911,6 +2692,91 @@ class TestJudgmentRecordsFromJudged:
 
         assert records[0].verdict is None
         assert records[0].error == "refusal"
+
+    def test_is_probe_defaults_false_when_omitted(self):
+        """Backward compatibility (D2 amendment 2026-07-10): omitting
+        probe_item_ids reproduces pre-amendment behavior exactly -- every
+        record's is_probe is False."""
+
+        email = make_item("cal-001").email
+        triple = Triple("cal-001", "a", "issue_summary", email, "ref", "the-value")
+        judged = [JudgedTriple(triple, verdict="pass", error=None, rationale="ok")]
+
+        records = calibrate.judgment_records_from_judged(judged, judge_version="jv-x")
+
+        assert records[0].is_probe is False
+
+    def test_is_probe_stamped_from_probe_item_ids(self):
+        email = make_item("x").email
+        real_triple = Triple("cal-001", "a", "issue_summary", email, "ref", "real-value")
+        probe_triple = Triple("cal-101", "a", "issue_summary", email, "ref", "probe-value")
+        judged = [
+            JudgedTriple(real_triple, verdict="pass", error=None, rationale="ok"),
+            JudgedTriple(probe_triple, verdict="fail", error=None, rationale="ok"),
+        ]
+
+        records = calibrate.judgment_records_from_judged(
+            judged, judge_version="jv-x", probe_item_ids={"cal-101", "cal-102"}
+        )
+
+        by_item = {r.item_id: r for r in records}
+        assert by_item["cal-001"].is_probe is False
+        assert by_item["cal-101"].is_probe is True
+
+
+class TestJudgmentRecordIsProbeBackwardCompat:
+    def test_positional_construction_without_is_probe_defaults_false(self):
+        """Every existing positional-arg JudgmentRecord() construction in
+        this test module (8 args) must keep working unchanged -- proves the
+        new is_probe field doesn't break the old shape."""
+
+        record = calibrate.JudgmentRecord(
+            "cal-001", "a", "issue_summary", "pass", None, "ok", "deadbeef" * 8, "jv"
+        )
+
+        assert record.is_probe is False
+
+    def test_load_judgments_jsonl_row_without_is_probe_key_defaults_false(self, tmp_path):
+        """A judgments.jsonl written BEFORE this amendment has no 'is_probe'
+        key in its judgment rows at all -- JudgmentRecord(**row) must still
+        succeed, defaulting is_probe to False."""
+
+        path = tmp_path / "judgments.jsonl"
+        lines = [
+            json.dumps({"kind": "meta", "judge_version": "jv-1", "written_at": "2026-01-01"}),
+            json.dumps(
+                {
+                    "kind": "judgment",
+                    "item_id": "cal-001",
+                    "candidate": "a",
+                    "field": "issue_summary",
+                    "verdict": "pass",
+                    "error": None,
+                    "rationale": "ok",
+                    "output_sha256": "h" * 64,
+                    "judge_version": "jv-1",
+                    # no "is_probe" key -- pre-amendment shape.
+                }
+            ),
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        loaded = calibrate.load_judgments_jsonl(path)
+
+        assert loaded.judgments[0].is_probe is False
+
+    def test_write_load_round_trip_preserves_is_probe_true(self, tmp_path):
+        path = tmp_path / "judgments.jsonl"
+        record = calibrate.JudgmentRecord(
+            "cal-101", "a", "issue_summary", "fail", None, "ok", "a" * 64, "jv-1", is_probe=True
+        )
+
+        calibrate.write_judgments_jsonl(
+            path, judgments=[record], self_consistency=[], judge_version="jv-1"
+        )
+        loaded = calibrate.load_judgments_jsonl(path)
+
+        assert loaded.judgments[0].is_probe is True
 
 
 class TestPairJudgmentsWithLabels:
@@ -3231,3 +4097,347 @@ class TestCalibrateCLIOffline:
         assert result.exit_code == 1
         assert "Traceback" not in result.output
         assert first.item_id in result.output
+
+
+# --------------------------------------------------------------------------
+# `eval calibrate` fail-probe perturbation set (D2 amendment 2026-07-10):
+# --fail-probe-emails / --perturbations, live and --offline.
+# --------------------------------------------------------------------------
+
+
+def _fail_probe_cli_fixture(tmp_path: Path) -> dict:
+    """Writes a main calibration set (3 items) + a fail-probe set (2 items)
+    + a 1-row overlay perturbing (cal-101, a, issue_summary), seeds both
+    candidate runs via run_eval directly, and returns everything a CLI
+    invocation needs. The overlaid row's gold verdict is "fail" (a caught
+    perturbation); every other probe key keeps its real candidate output,
+    labeled "pass"."""
+
+    item_ids = ["cal-001", "cal-002", "cal-003"]
+    items = [_cli_item(i) for i in item_ids]
+    emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
+
+    probe_item_ids = ["cal-101", "cal-102"]
+    probe_items = [_cli_item(i) for i in probe_item_ids]
+    fail_probe_path = _write_dataset(tmp_path / "emails-fail-probe.jsonl", probe_items)
+
+    perturbed_key = ("cal-101", "a", "issue_summary")
+    perturbed_value = "ungrounded claim about a refund"
+    overlay_row = PerturbationOverlay(
+        item_id=perturbed_key[0],
+        candidate=perturbed_key[1],
+        field=perturbed_key[2],
+        perturbed_value=perturbed_value,
+        corruption_type="ungrounded_addition",
+        rationale="probe CLI test",
+    )
+    perturbations_path = tmp_path / "perturbations.jsonl"
+    perturbations_path.write_text(
+        json.dumps(overlay_row.model_dump(mode="json")) + "\n", encoding="utf-8"
+    )
+
+    labels = _happy_path_labels(item_ids)
+    for probe_item in probe_item_ids:
+        for candidate in ("a", "b"):
+            for field_name in ("issue_summary", "requested_action"):
+                key = (probe_item, candidate, field_name)
+                if key == perturbed_key:
+                    value, verdict = perturbed_value, "fail"
+                else:
+                    value, verdict = (
+                        _happy_path_candidate_value(probe_item, candidate, field_name),
+                        "pass",
+                    )
+                for annotator in ("owner", "annotator2"):
+                    labels.append(
+                        make_label(
+                            probe_item, candidate, field_name, verdict,
+                            candidate_value=value, annotator=annotator,
+                        )
+                    )
+    labels_path = _write_labels(tmp_path / "labels.jsonl", labels)
+    config_path = _write_calibrate_config(tmp_path / "config.yaml", k=1)
+
+    cfg = load_config(config_path)
+    effective_cfg, calib_items = cli._resolve_calibration_dataset(cfg, emails_path)
+    _seed_calibration_runs(effective_cfg, calib_items)
+    probe_effective_cfg, probe_calib_items = cli._resolve_calibration_dataset(
+        effective_cfg, fail_probe_path
+    )
+    _seed_calibration_runs(probe_effective_cfg, probe_calib_items)
+
+    def judge_factory() -> _KeyedJudgeClient:
+        def verdict_for(candidate_value: str, idx: int) -> str:
+            if candidate_value == perturbed_value:
+                return "fail"
+            parts = candidate_value.rsplit("-", 2)
+            if len(parts) == 3:
+                probe_item_id, candidate, short_field = parts
+                field = "issue_summary" if short_field == "issue" else "requested_action"
+                fail_pairs = {
+                    ("cal-001", "a", "issue_summary"),
+                    ("cal-002", "b", "requested_action"),
+                }
+                if (probe_item_id, candidate, field) in fail_pairs:
+                    return "fail"
+            return "pass"
+
+        return _KeyedJudgeClient(verdict_for=verdict_for)
+
+    return {
+        "emails_path": emails_path,
+        "labels_path": labels_path,
+        "config_path": config_path,
+        "fail_probe_path": fail_probe_path,
+        "perturbations_path": perturbations_path,
+        "judge_factory": judge_factory,
+        "item_ids": item_ids,
+        "probe_item_ids": probe_item_ids,
+    }
+
+
+def _forbid_build_model_key(label, config):
+    raise AssertionError("_build_model_key must not be called -- both runs are reused")
+
+
+class TestCalibrateCLIFailProbeSet:
+    def test_absent_probe_files_leave_certificate_perturbation_fields_none(
+        self, tmp_path, monkeypatch
+    ):
+        """Backward compatibility (D2 amendment 2026-07-10): --fail-probe-
+        emails/--perturbations default to paths that don't exist under this
+        tmp_path cwd -- current behavior (pre-amendment) must be unchanged."""
+
+        monkeypatch.chdir(tmp_path)
+        item_ids = ["cal-001", "cal-002", "cal-003"]
+        items = [_cli_item(i) for i in item_ids]
+        emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
+        labels_path = _write_labels(tmp_path / "labels.jsonl", _happy_path_labels(item_ids))
+        config_path = _write_calibrate_config(tmp_path / "config.yaml", k=1)
+
+        cfg = load_config(config_path)
+        effective_cfg, calib_items = cli._resolve_calibration_dataset(cfg, emails_path)
+        _seed_calibration_runs(effective_cfg, calib_items)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        monkeypatch.setattr(cli, "_build_model_key", _forbid_build_model_key)
+        monkeypatch.setattr(cli, "_build_judge_client", lambda config: _happy_path_judge_client())
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(emails_path),
+                "--labels",
+                str(labels_path),
+                "--config",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Perturbation Probe Set" not in result.output
+
+        cert_path = tmp_path / "data" / "calibration" / "certificate.json"
+        certificate = Certificate.model_validate(json.loads(cert_path.read_text(encoding="utf-8")))
+        assert certificate.n_perturbed is None
+        assert certificate.achieved_fail_prevalence is None
+        assert certificate.real_only_kappa is None
+        assert certificate.real_only_kappa_ci is None
+        assert certificate.perturbed_rows_passed_by_gold is None
+
+    def test_probe_file_present_applies_overlay_and_discloses_stats(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        fx = _fail_probe_cli_fixture(tmp_path)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        monkeypatch.setattr(cli, "_build_model_key", _forbid_build_model_key)
+        monkeypatch.setattr(cli, "_build_judge_client", lambda config: fx["judge_factory"]())
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(fx["emails_path"]),
+                "--labels",
+                str(fx["labels_path"]),
+                "--config",
+                str(fx["config_path"]),
+                "--fail-probe-emails",
+                str(fx["fail_probe_path"]),
+                "--perturbations",
+                str(fx["perturbations_path"]),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Perturbation Probe Set" in result.output
+
+        cert_path = tmp_path / "data" / "calibration" / "certificate.json"
+        certificate = Certificate.model_validate(json.loads(cert_path.read_text(encoding="utf-8")))
+        assert certificate.n_perturbed == 1
+        assert certificate.achieved_fail_prevalence is not None
+        assert certificate.real_only_kappa is not None
+        assert certificate.perturbed_rows_passed_by_gold == 0
+
+        judgments_path = tmp_path / "data" / "calibration" / "judgments.jsonl"
+        judgments = calibrate.load_judgments_jsonl(judgments_path)
+        probe_records = [j for j in judgments.judgments if j.item_id in fx["probe_item_ids"]]
+        assert len(probe_records) == 8  # 2 probe items x 2 candidates x 2 fields
+        assert all(j.is_probe for j in probe_records)
+        main_records = [j for j in judgments.judgments if j.item_id in fx["item_ids"]]
+        assert main_records and all(not j.is_probe for j in main_records)
+
+    def test_overlay_targeting_main_file_gives_clean_exit_one(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        item_ids = ["cal-001", "cal-002", "cal-003"]
+        items = [_cli_item(i) for i in item_ids]
+        emails_path = _write_dataset(tmp_path / "emails.jsonl", items)
+        labels_path = _write_labels(tmp_path / "labels.jsonl", _happy_path_labels(item_ids))
+        config_path = _write_calibrate_config(tmp_path / "config.yaml", k=1)
+
+        bad_overlay_row = PerturbationOverlay(
+            item_id="cal-001",
+            candidate="a",
+            field="issue_summary",
+            perturbed_value="x",
+            corruption_type="entity_swap",
+            rationale="bad -- targets the original emails file",
+        )
+        perturbations_path = tmp_path / "perturbations.jsonl"
+        perturbations_path.write_text(
+            json.dumps(bad_overlay_row.model_dump(mode="json")) + "\n", encoding="utf-8"
+        )
+
+        cfg = load_config(config_path)
+        effective_cfg, calib_items = cli._resolve_calibration_dataset(cfg, emails_path)
+        _seed_calibration_runs(effective_cfg, calib_items)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        monkeypatch.setattr(cli, "_build_model_key", _forbid_build_model_key)
+        monkeypatch.setattr(cli, "_build_judge_client", lambda config: _happy_path_judge_client())
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(emails_path),
+                "--labels",
+                str(labels_path),
+                "--config",
+                str(config_path),
+                "--perturbations",
+                str(perturbations_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "original emails file" in result.output
+
+
+class TestCalibrateCLIOfflineFailProbeSet:
+    def test_offline_recompute_matches_live_perturbation_fields(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        fx = _fail_probe_cli_fixture(tmp_path)
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        monkeypatch.setattr(cli, "_build_model_key", _forbid_build_model_key)
+        monkeypatch.setattr(cli, "_build_judge_client", lambda config: fx["judge_factory"]())
+
+        live_result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--emails",
+                str(fx["emails_path"]),
+                "--labels",
+                str(fx["labels_path"]),
+                "--config",
+                str(fx["config_path"]),
+                "--fail-probe-emails",
+                str(fx["fail_probe_path"]),
+                "--perturbations",
+                str(fx["perturbations_path"]),
+            ],
+        )
+        assert live_result.exit_code == 0, live_result.output
+        cert_path = tmp_path / "data" / "calibration" / "certificate.json"
+        live_certificate = Certificate.model_validate(
+            json.loads(cert_path.read_text(encoding="utf-8"))
+        )
+        judgments_path = tmp_path / "data" / "calibration" / "judgments.jsonl"
+
+        def _forbid(*args: object, **kwargs: object) -> None:
+            raise AssertionError("must not be called in --offline mode")
+
+        monkeypatch.setattr(cli, "_build_model_key", _forbid)
+        monkeypatch.setattr(cli, "_build_judge_client", _forbid)
+        _forbid_real_provider_client_construction(monkeypatch)
+
+        offline_result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--offline",
+                "--labels",
+                str(fx["labels_path"]),
+                "--judgments",
+                str(judgments_path),
+                "--perturbations",
+                str(fx["perturbations_path"]),
+            ],
+        )
+
+        assert offline_result.exit_code == 0, offline_result.output
+        offline_certificate = Certificate.model_validate(
+            json.loads(cert_path.read_text(encoding="utf-8"))
+        )
+        assert offline_certificate.n_perturbed == live_certificate.n_perturbed
+        assert offline_certificate.achieved_fail_prevalence == pytest.approx(
+            live_certificate.achieved_fail_prevalence
+        )
+        assert offline_certificate.real_only_kappa == pytest.approx(
+            live_certificate.real_only_kappa
+        )
+        assert offline_certificate.perturbed_rows_passed_by_gold == (
+            live_certificate.perturbed_rows_passed_by_gold
+        )
+
+    def test_offline_overlay_targeting_main_file_gives_clean_exit_one(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        labels_path, judgments_path = _seed_live_judgments(tmp_path)
+
+        bad_overlay_row = PerturbationOverlay(
+            item_id="cal-001",
+            candidate="a",
+            field="issue_summary",
+            perturbed_value="x",
+            corruption_type="entity_swap",
+            rationale="bad -- targets the original emails file, no probe set was ever used",
+        )
+        perturbations_path = tmp_path / "perturbations.jsonl"
+        perturbations_path.write_text(
+            json.dumps(bad_overlay_row.model_dump(mode="json")) + "\n", encoding="utf-8"
+        )
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "calibrate",
+                "--offline",
+                "--labels",
+                str(labels_path),
+                "--judgments",
+                str(judgments_path),
+                "--perturbations",
+                str(perturbations_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "original emails file" in result.output

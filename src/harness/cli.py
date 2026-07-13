@@ -225,6 +225,12 @@ DEFAULT_CERTIFICATE_PATH = Path("data/calibration/certificate.json")
 DEFAULT_CALIBRATION_EMAILS_PATH = Path("data/calibration/emails.jsonl")
 DEFAULT_CALIBRATION_LABELS_PATH = Path("data/calibration/labels.jsonl")
 DEFAULT_CALIBRATION_JUDGMENTS_PATH = Path("data/calibration/judgments.jsonl")
+# Fail-probe perturbation set (D2 amendment 2026-07-10): both optional --
+# an absent file at either default path means "no probe set"/"zero overlaid
+# rows" respectively, reproducing pre-amendment behavior exactly (see
+# harness.calibrate's module docstring, "Fail-probe perturbation set").
+DEFAULT_FAIL_PROBE_EMAILS_PATH = Path("data/calibration/emails-fail-probe.jsonl")
+DEFAULT_PERTURBATIONS_PATH = Path("data/calibration/perturbations.jsonl")
 
 
 class CandidateLabel(StrEnum):
@@ -523,6 +529,10 @@ def _clean_exit_on_expected_errors() -> Iterator[None]:
         # an unadjudicated disagreement) -- a setup/data-integrity problem,
         # never a traceback.
         calibrate_module.DualAnnotationError,
+        # Fail-probe perturbation set (D2 amendment 2026-07-10): an overlay
+        # row targets the original emails file, a nonexistent key, or a
+        # duplicate key -- a setup/data-integrity problem, never a traceback.
+        calibrate_module.PerturbationOverlayError,
     ) as exc:
         typer.secho(f"error: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
@@ -636,6 +646,29 @@ ConfigOption = Annotated[
 CalibrateConfigOption = Annotated[
     Path,
     typer.Option("--config", help="Path to the run configuration YAML (unused with --offline)."),
+]
+# Fail-probe perturbation set (D2 amendment 2026-07-10): neither uses
+# `exists=True` -- absence is a valid, meaningful state (no probe set / zero
+# overlaid rows), the same reasoning `CalibrateConfigOption` documents above.
+# `--fail-probe-emails` is read only on the live path (candidates are run on
+# it); `--perturbations` is read on BOTH live and offline (the overlay file
+# itself carries no API-derived state, so re-validating it offline costs
+# nothing -- module docstring).
+FailProbeEmailsOption = Annotated[
+    Path,
+    typer.Option(
+        "--fail-probe-emails",
+        help="Fail-probe emails JSONL path (optional; an absent file means no probe set, "
+        "current behavior unchanged). Live path only.",
+    ),
+]
+PerturbationsOption = Annotated[
+    Path,
+    typer.Option(
+        "--perturbations",
+        help="Perturbation overlay JSONL path (optional; an absent file means zero overlaid "
+        "rows). Read on both the live and --offline paths.",
+    ),
 ]
 
 
@@ -870,6 +903,8 @@ def calibrate(
             "reads it.",
         ),
     ] = DEFAULT_CALIBRATION_JUDGMENTS_PATH,
+    fail_probe_emails: FailProbeEmailsOption = DEFAULT_FAIL_PROBE_EMAILS_PATH,
+    perturbations_path: PerturbationsOption = DEFAULT_PERTURBATIONS_PATH,
     config: CalibrateConfigOption = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Judge calibration: agreement report + committed certificate (spec §5).
@@ -891,6 +926,18 @@ def calibrate(
     construction -- a labels-file defect is computable from ``labels`` alone,
     so it costs zero API calls and no client setup.
 
+    Fail-probe perturbation set (D2 amendment 2026-07-10): ``--fail-probe-
+    emails`` (live only) is loaded when the file exists at all -- an absent
+    file (the default when the owner hasn't drafted a probe set) means no
+    probe set, reproducing pre-amendment behavior exactly. When present,
+    both candidates are run on it (same k=1 seam) and its triples are
+    concatenated with the real calibration triples before judging.
+    ``--perturbations`` (both live and ``--offline``) is the committed
+    overlay file; an absent file means zero overlaid rows. Overlay
+    validation errors (``PerturbationOverlayError``: a key targeting the
+    original emails file, a nonexistent key, or a duplicate key) are mapped
+    to a clean exit 1, same as every other expected-failure condition here.
+
     Live (default): always reportable -- fails fast with ``MissingTracingError``
     if Langfuse credentials are absent, before any candidate or judge client is
     constructed -- and persists its judge output to ``judgments.jsonl``
@@ -899,9 +946,11 @@ def calibrate(
     calibration is defined at one candidate output per item).
 
     ``--offline``: a pure recompute from ``judgments.jsonl`` + the labels
-    file. It makes zero calls of any kind, so it constructs no client at all
-    and has no tracing requirement -- there is nothing here for Langfuse to
-    ever observe.
+    file (+ the overlay file, re-validated against ``judgments.jsonl``'s own
+    persisted ``is_probe`` flags -- no fail-probe emails file needed
+    offline). It makes zero calls of any kind, so it constructs no client at
+    all and has no tracing requirement -- there is nothing here for Langfuse
+    to ever observe.
 
     Both modes write ``data/calibration/certificate.json``, which every
     ``run``/``compare``/``gate`` report header consumes.
@@ -911,6 +960,7 @@ def calibrate(
         with _clean_exit_on_expected_errors():
             calib_labels = calibrate_module.load_calibration_labels(labels_path)
             judgments = calibrate_module.load_judgments_jsonl(judgments_path)
+            overlay_rows = calibrate_module.load_perturbation_overlay(perturbations_path)
             resolved_date = (
                 date.fromisoformat(date_override) if date_override is not None else None
             )
@@ -920,6 +970,7 @@ def calibrate(
                 judgments=judgments,
                 labels=calib_labels,
                 label_file_hash=label_file_hash,
+                perturbation_overlay=overlay_rows,
                 date_override=resolved_date,
             )
             certificate = calibrate_module.build_certificate(result)
@@ -945,6 +996,7 @@ def calibrate(
         # calibration run -- config.k is never inherited here.
         calibrate_cfg = effective_cfg.model_copy(update={"k": 1})
         calib_labels = calibrate_module.load_calibration_labels(labels_path)
+        overlay_rows = calibrate_module.load_perturbation_overlay(perturbations_path)
 
         # Finding: every DualAnnotationError/CalibrationBindingError this
         # command can raise over labels.jsonl is computable from the labels
@@ -956,11 +1008,22 @@ def calibrate(
         # correct standalone, so calling it twice here is fine.
         calibrate_module.resolve_gold_labels(calib_labels)
 
-        # Fail-fast anchor (spec §5/§8, T9/T11): both TraceContexts are
-        # constructed -- calibrate is always reportable -- before ANY
-        # candidate or judge client (_get_or_run/_build_judge_client below).
+        # Fail-fast anchor (spec §5/§8, T9/T11): every TraceContext this
+        # invocation could need -- the real calibration run's, AND the
+        # fail-probe run's when a probe file exists -- is constructed before
+        # ANY candidate or judge client (_get_or_run/_build_judge_client
+        # below).
         trace_a = TraceContext.for_run(calibrate_cfg, True)
         trace_b = TraceContext.for_run(calibrate_cfg, True)
+
+        has_probe_file = fail_probe_emails.exists()
+        probe_cfg: Config | None = None
+        probe_items: list[GoldenItem] | None = None
+        trace_probe_a = trace_probe_b = None
+        if has_probe_file:
+            probe_cfg, probe_items = _resolve_calibration_dataset(calibrate_cfg, fail_probe_emails)
+            trace_probe_a = TraceContext.for_run(probe_cfg, True)
+            trace_probe_b = TraceContext.for_run(probe_cfg, True)
 
         run_dir_a = _get_or_run(
             calibrate_cfg, "a", calib_items, EXTRACTION_PROMPT, trace_a, DEFAULT_RUNS_ROOT
@@ -970,6 +1033,18 @@ def calibrate(
         )
         run_a = load_run(run_dir_a)
         run_b = load_run(run_dir_b)
+
+        probe_run_a = probe_run_b = None
+        if has_probe_file:
+            assert probe_cfg is not None and probe_items is not None
+            probe_run_dir_a = _get_or_run(
+                probe_cfg, "a", probe_items, EXTRACTION_PROMPT, trace_probe_a, DEFAULT_RUNS_ROOT
+            )
+            probe_run_dir_b = _get_or_run(
+                probe_cfg, "b", probe_items, EXTRACTION_PROMPT, trace_probe_b, DEFAULT_RUNS_ROOT
+            )
+            probe_run_a = load_run(probe_run_dir_a)
+            probe_run_b = load_run(probe_run_dir_b)
 
         judge = Judge(_build_judge_client(calibrate_cfg))
         resolved_date = date.fromisoformat(date_override) if date_override is not None else None
@@ -981,6 +1056,9 @@ def calibrate(
             labels=calib_labels,
             judge=judge,
             label_file_hash=label_file_hash,
+            probe_run_a=probe_run_a,
+            probe_run_b=probe_run_b,
+            perturbation_overlay=overlay_rows,
             date_override=resolved_date,
         )
         certificate = calibrate_module.build_certificate(result)
@@ -990,8 +1068,13 @@ def calibrate(
         # Finding F2: persist this live run's full judge output so a future
         # `eval calibrate --offline` can recompute the same report +
         # certificate with zero API calls / zero client construction.
+        # `probe_item_ids` stamps each record's `is_probe` flag (fail-probe
+        # design) so `--offline` can rederive probe-item membership without
+        # ever needing a RunArtifact of its own.
         judgment_records = calibrate_module.judgment_records_from_judged(
-            result.judged_triples, judge_version=result.judge_version
+            result.judged_triples,
+            judge_version=result.judge_version,
+            probe_item_ids=result.probe_item_ids,
         )
         calibrate_module.write_judgments_jsonl(
             judgments_path,

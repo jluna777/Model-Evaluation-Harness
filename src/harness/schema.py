@@ -150,6 +150,50 @@ class CalibrationLabel(BaseModel):
     output_sha256: str
 
 
+class PerturbationOverlay(BaseModel):
+    """One row of the committed perturbation overlay file
+    (``data/calibration/perturbations.jsonl``, D2 amendment 2026-07-10 -- the
+    fail-probe design): replaces a fail-probe candidate output's field value
+    with a deliberately corrupted ``perturbed_value`` for exactly this
+    ``(item_id, candidate, field)`` key. Everywhere downstream that would
+    otherwise read the real candidate output for this key -- labeling
+    sheets, the human labels' ``output_sha256`` binding, and what the judge
+    judges -- sees the overlaid text instead; a key with no overlay entry
+    keeps the real run output untouched.
+
+    ``item_id`` MUST name an item from the fail-probe emails file
+    (``data/calibration/emails-fail-probe.jsonl``), never the original
+    ``data/calibration/emails.jsonl`` -- ``harness.calibrate.
+    validate_perturbation_overlay`` enforces this, together with rejecting
+    a nonexistent (item_id, candidate, field) key and a duplicate key,
+    before any overlay row is ever applied.
+
+    ``corruption_type`` is a closed enum (spec §5) naming the failure mode
+    this perturbation demonstrates: ``dropped_essential`` (an essential fact
+    from the reference is missing), ``ungrounded_addition`` (invented/
+    hallucinated content not in the email), ``contradiction`` (contradicts
+    the email or reference), ``supersession_leak`` (a superseded/earlier
+    request leaks into the primary-request answer), or ``entity_swap`` (a
+    wrong entity substituted for the correct one). ``rationale`` is the
+    free-text justification for why this perturbation demonstrates that
+    corruption type -- disclosure-only, never read by any statistic."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    candidate: Literal["a", "b"]
+    field: Literal["issue_summary", "requested_action"]
+    perturbed_value: str
+    corruption_type: Literal[
+        "dropped_essential",
+        "ungrounded_addition",
+        "contradiction",
+        "supersession_leak",
+        "entity_swap",
+    ]
+    rationale: str
+
+
 class Certificate(BaseModel):
     """Committed judge calibration certificate (spec §5).
 
@@ -181,7 +225,29 @@ class Certificate(BaseModel):
     disclosure of how much of the gold set required a tie-break, rather than
     reflecting spontaneous agreement. ``None`` for any certificate produced
     before dual annotation (the single-annotator design had no concept of
-    adjudication at all)."""
+    adjudication at all).
+
+    ``n_perturbed``/``achieved_fail_prevalence``/``real_only_kappa``/
+    ``real_only_kappa_ci``/``perturbed_rows_passed_by_gold`` (additive, D2
+    amendment 2026-07-10 -- the fail-probe/perturbation design): disclosure
+    for the controlled-perturbation fail-probe set (``data/calibration/
+    emails-fail-probe.jsonl`` + ``data/calibration/perturbations.jsonl``),
+    superseding spec §5's fail-enrichment paragraph for this path. ``None``
+    for every one of these fields when no fail-probe set was used (the
+    default, additive convention already established by ``ceiling_kappa``/
+    ``n_adjudicated``). When a fail-probe set WAS used: ``n_perturbed`` is
+    the count of (probe item, candidate, field) keys whose real candidate
+    output was replaced by the committed overlay; ``achieved_fail_prevalence``
+    is the fail rate of the resolved gold over the full combined (real +
+    probe) valid population -- the number that satisfies spec §5's >=20%
+    floor for this path; ``real_only_kappa``/``real_only_kappa_ci`` is the
+    judge-vs-gold Cohen's kappa restricted to non-probe items only
+    (``harness.calibrate.compute_real_only_kappa``), reported ALONGSIDE
+    ``overall_kappa`` -- never replacing it as the decision statistic, which
+    stays the full-population (probe-included) overall kappa;
+    ``perturbed_rows_passed_by_gold`` is the count of overlaid rows whose
+    resolved gold verdict is nonetheless ``"pass"`` -- a perturbation the
+    human standard did not flag, legitimate gold either way."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -196,3 +262,8 @@ class Certificate(BaseModel):
     n_adjudicated: int | None = None
     label_file_hash: str
     date: date
+    n_perturbed: int | None = None
+    achieved_fail_prevalence: float | None = None
+    real_only_kappa: float | None = None
+    real_only_kappa_ci: tuple[float, float] | None = None
+    perturbed_rows_passed_by_gold: int | None = None
