@@ -16,6 +16,14 @@ per judgment (the second annotator's full sheet has 140). Each row shows:
 - the email's subject (full email bodies are in `emails-reference.md`,
   keyed by `item_id` — read the email whenever groundedness is in question)
 
+The easiest way to work is the grader app at `tools/csv-grader.html` —
+open it in Chrome or Edge, load your CSV, and optionally load the two
+email `.jsonl` files (`data/calibration/emails.jsonl` and
+`emails-fail-probe.jsonl`) so every row can expand to show its full
+email in place. It saves back to the same file and keeps every column
+except your two editable ones read-only. Working directly in
+Excel/a text editor is equally fine.
+
 For each row, fill in exactly two cells:
 
 - **verdict** — `pass` or `fail` (lowercase)
