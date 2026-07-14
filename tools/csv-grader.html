@@ -62,10 +62,9 @@
   .toolbar { max-width:1080px; margin:0 auto; padding:12px 22px 14px;
     display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   label.toggle { font-family:var(--mono); font-size:11.5px; color:var(--ink-dim); display:inline-flex; align-items:center; gap:6px; cursor:pointer; }
-  .sheet-list { display:flex; flex-direction:column; gap:8px; width:100%; max-width:440px; }
-  .sheet-list .sub-lab { font-family:var(--mono); font-size:10px; text-transform:uppercase;
-    letter-spacing:.14em; color:var(--ink-faint); margin:8px 0 2px; text-align:center; }
-  .sheet-btn { font-size:13px; padding:10px 14px; }
+  select#sheetSel { background:var(--surface); border:1px solid var(--line); color:var(--ink);
+    border-radius:8px; padding:8px 10px; font-family:var(--mono); font-size:12.5px; max-width:340px; cursor:pointer; }
+  select#sheetSel:focus { outline:2px solid var(--accent); border-color:transparent; }
 
   /* ---------- landing ---------- */
   .landing { max-width:640px; margin:60px auto; padding:0 22px; text-align:center; }
@@ -218,7 +217,9 @@
       <h1>CSV grader</h1>
       <span class="file-label" id="fileLabel">no file open</span>
       <div class="spacer"></div>
+      <select id="sheetSel" style="display:none"></select>
       <button class="btn" id="connectBtn">Connect project</button>
+      <button class="btn" id="openBtn">Open CSV&hellip;</button>
       <button class="btn" id="emailsBtn">Load emails</button>
       <button class="btn" id="briefBtn">Briefing</button>
       <button class="btn" id="backupBtn" disabled>Download a copy</button>
@@ -236,7 +237,7 @@
   </div>
 </header>
 
-<div class="landing" id="landing">
+<div class="landing" id="landing" style="display:none" aria-hidden="true">
   <div class="brief" id="briefingBody">
     <p class="eyebrow">Judge-calibration labeling session</p>
     <h2>Annotator briefing</h2>
@@ -283,15 +284,9 @@
     </section>
   </div>
 
-  <div class="openrow">
-    <button class="btn primary" id="connectBigBtn" style="font-size:14px;padding:11px 22px">Connect project folder</button>
-    <div class="sheet-list" id="sheetList"></div>
-    <button class="btn" id="openBtn">Open a CSV manually&hellip;</button>
-    <p class="note">Connect once by picking the repository folder (the one containing <code>data\calibration</code>) &mdash; your sheets become one-click options and the emails load automatically. The folder is remembered for next time. Reads and writes happen entirely on your machine; nothing is uploaded.<br>Shortcuts: <kbd>J</kbd>/<kbd>K</kbd> move &middot; <kbd>1</kbd>/<kbd>2</kbd> pass/fail on focused row &middot; <kbd>E</kbd> view email &middot; <kbd>Ctrl</kbd>+<kbd>S</kbd> save</p>
-  </div>
 </div>
 
-<main id="list"></main>
+<main id="list"><div class="empty" id="emptyState">loading&hellip;</div></main>
 <div class="modal-backdrop" id="briefModal">
   <div class="modal" role="dialog" aria-modal="true" aria-label="Annotator briefing">
     <button class="close" id="briefClose" aria-label="Close briefing">&times;</button>
@@ -332,8 +327,11 @@
   }
 
   // ---------- state ----------
+  const SERVER = location.protocol==="http:" || location.protocol==="https:";
   let fileHandle=null, header=[], data=[], eol="\r\n", hadBOM=false, hadTrailingEol=true;
   let vIdx=-1, cIdx=-1, idx={};
+  let serverSheetName=null;         // sheet opened through the local server
+  let fileLabelName="";             // display name of whatever is open
   let emails={};                    // item_id -> {from, subject, body}
   const openEmails=new Set();       // row indices with the email panel open
   let dirty=false;
@@ -350,8 +348,8 @@
     dirty=d;
     $("saveBtn").disabled=!d;
     const fl=$("fileLabel");
-    if(!fileHandle) return;
-    fl.innerHTML=`<span class="name">${esc(fileHandle.name)}</span> · <span class="${d?'dirty':'saved'}">${d?'unsaved changes':'all changes saved'}</span>`;
+    if(!fileLabelName) return;
+    fl.innerHTML=`<span class="name">${esc(fileLabelName)}</span> · <span class="${d?'dirty':'saved'}">${d?'unsaved changes':'all changes saved'}</span>`;
   }
 
   // ---------- open ----------
@@ -363,9 +361,12 @@
     await openHandle(handle);
   }
   async function openHandle(handle){
-    fileHandle=handle;
+    fileHandle=handle; serverSheetName=null;
     const file=await handle.getFile();
-    let text=await file.text();
+    loadText(await file.text(), handle.name);
+  }
+  function loadText(text, label){
+    fileLabelName=label;
     hadBOM = text.charCodeAt(0)===0xFEFF; if(hadBOM) text=text.slice(1);
     eol = text.indexOf("\r\n")!==-1 ? "\r\n" : "\n";
     hadTrailingEol = /\r?\n$/.test(text);
@@ -379,7 +380,7 @@
       toast("Couldn't find verdict/critique columns.", true);
       // still allow viewing, but nothing to edit
     }
-    $("landing").style.display="none";
+    openEmails.clear(); focusRow=-1;
     $("progressWrap").style.display="block";
     $("toolbar").style.display="flex";
     $("backupBtn").disabled=false;
@@ -394,14 +395,26 @@
     if(await handle.requestPermission(opts)==="granted") return true;
     return false;
   }
+  function currentText(){
+    const body=serializeCSV([header,...data], eol);
+    return (hadBOM?"\uFEFF":"") + (hadTrailingEol ? body : body.replace(/\r?\n$/,""));
+  }
   async function save(){
+    if(serverSheetName){
+      try{
+        const resp=await fetch("/api/save/"+encodeURIComponent(serverSheetName),
+          {method:"POST", headers:{"Content-Type":"text/csv; charset=utf-8"}, body:currentText()});
+        if(!resp.ok) throw new Error("HTTP "+resp.status);
+        setDirty(false);
+        toast("Saved to "+serverSheetName);
+      }catch(e){ toast("Save failed: "+e.message, true); }
+      return;
+    }
     if(!fileHandle) return;
     try{
       if(!await verifyPerm(fileHandle)){ toast("Write permission denied.", true); return; }
-      const body=serializeCSV([header,...data], eol);
-      const text=(hadBOM?"\uFEFF":"") + (hadTrailingEol ? body : body.replace(/\r?\n$/,""));
       const w=await fileHandle.createWritable();
-      await w.write(text); await w.close();
+      await w.write(currentText()); await w.close();
       setDirty(false);
       toast("Saved to "+fileHandle.name);
     }catch(e){ toast("Save failed: "+e.message, true); }
@@ -412,7 +425,7 @@
     const blob=new Blob([text],{type:"text/csv"});
     const a=document.createElement("a");
     a.href=URL.createObjectURL(blob);
-    a.download=(fileHandle?fileHandle.name.replace(/\.csv$/i,""):"sheet")+"-copy.csv";
+    a.download=(fileLabelName?fileLabelName.replace(/\.csv$/i,""):"sheet")+"-copy.csv";
     a.click(); URL.revokeObjectURL(a.href);
   }
 
@@ -476,19 +489,23 @@
     await connectProject("pick");
   }
 
+  function parseEmailsText(text){
+    let count=0;
+    for(const line of text.split(/\r?\n/)){
+      if(!line.trim()) continue;
+      try{
+        const o=JSON.parse(line);
+        if(o && o.id && o.email && typeof o.email.body==="string"){ emails[o.id]=o.email; count++; }
+      }catch(e){}
+    }
+    return count;
+  }
   async function autoLoadEmails(){
     if(!calDir) return 0;
     let count=0;
     for await (const [name,h] of calDir.entries()){
       if(h.kind==="file" && /^emails.*\.jsonl$/i.test(name)){
-        const text=await (await h.getFile()).text();
-        for(const line of text.split(/\r?\n/)){
-          if(!line.trim()) continue;
-          try{
-            const o=JSON.parse(line);
-            if(o && o.id && o.email && typeof o.email.body==="string"){ emails[o.id]=o.email; count++; }
-          }catch(e){}
-        }
+        count+=parseEmailsText(await (await h.getFile()).text());
       }
     }
     if(count && data.length) render();
@@ -496,25 +513,47 @@
   }
 
   async function renderSheetList(){
-    const box=$("sheetList"); if(!box) return;
-    if(!sheetsDir){ box.innerHTML=""; return; }
+    if(!sheetsDir){ populateSheets([]); return; }
     const names=[];
     for await (const [name,h] of sheetsDir.entries()){
       if(h.kind==="file" && /\.csv$/i.test(name)) names.push(name);
     }
     names.sort();
-    box.innerHTML = names.length
-      ? `<p class="sub-lab">your sheets — click to open</p>`
-        + names.map(n=>`<button class="btn sheet-btn" data-name="${esc(n)}">${esc(n)}</button>`).join("")
-      : `<p class="sub-lab">no CSV sheets found in data\\calibration\\sheets</p>`;
-    box.querySelectorAll(".sheet-btn").forEach(b=>{
-      b.addEventListener("click", async ()=>{
-        try{
-          const h=await sheetsDir.getFileHandle(b.dataset.name);
-          await openHandle(h);
-        }catch(e){ toast("Couldn't open "+b.dataset.name+": "+e.message, true); }
-      });
-    });
+    populateSheets(names);
+    if(!names.length) toast("No CSV sheets found in data\\calibration\\sheets.", true);
+  }
+
+  // ---------- sheet menu (header dropdown, both modes) ----------
+  function populateSheets(names){
+    const sel=$("sheetSel");
+    if(!names.length){ sel.style.display="none"; return; }
+    sel.innerHTML=`<option value="">open a sheet…</option>`
+      + names.map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    sel.style.display="";
+  }
+  async function openSelected(name){
+    if(!name) return;
+    if(dirty && !confirm("Discard unsaved changes in "+(fileLabelName||"the current sheet")+"?")){
+      $("sheetSel").value = serverSheetName || ""; return;
+    }
+    if(SERVER){ await openServerSheet(name); return; }
+    if(!sheetsDir) return;
+    try{ await openHandle(await sheetsDir.getFileHandle(name)); }
+    catch(e){ toast("Couldn't open "+name+": "+e.message, true); }
+  }
+  async function openServerSheet(name){
+    try{
+      const resp=await fetch("/data/calibration/sheets/"+encodeURIComponent(name));
+      if(!resp.ok) throw new Error("HTTP "+resp.status);
+      const buf=await resp.arrayBuffer();
+      // ignoreBOM:true keeps a leading ﻿ in the string so the existing
+      // BOM round-trip logic sees exactly what's in the file.
+      const text=new TextDecoder("utf-8",{ignoreBOM:true}).decode(buf);
+      serverSheetName=name; fileHandle=null;
+      try{ localStorage.setItem("lastSheet", name); }catch(e){}
+      $("sheetSel").value=name;
+      loadText(text, name);
+    }catch(e){ toast("Couldn't open "+name+": "+e.message, true); }
   }
 
   // ---------- emails (optional, for in-row full-email view) ----------
@@ -527,19 +566,11 @@
         types:[{description:"Emails JSONL",accept:{"application/json":[".json",".jsonl"]}}]
       });
     }catch(e){ return; } // user cancelled
-    let count=0, bad=0;
+    let count=0;
     for(const h of handles){
-      const text=await (await h.getFile()).text();
-      for(const line of text.split(/\r?\n/)){
-        if(!line.trim()) continue;
-        try{
-          const o=JSON.parse(line);
-          if(o && o.id && o.email && typeof o.email.body==="string"){ emails[o.id]=o.email; count++; }
-          else bad++;
-        }catch(err){ bad++; }
-      }
+      count+=parseEmailsText(await (await h.getFile()).text());
     }
-    if(count) toast("Loaded "+count+" email"+(count===1?"":"s")+(bad?" ("+bad+" line(s) skipped)":""));
+    if(count) toast("Loaded "+count+" email"+(count===1?"":"s"));
     else toast("No emails found in those files.", true);
     if(data.length) render();
   }
@@ -685,8 +716,31 @@
   $("diffToggle").addEventListener("change", render);
   $("emailsBtn").addEventListener("click", loadEmails);
   $("connectBtn").addEventListener("click", connectFlow);
-  $("connectBigBtn").addEventListener("click", connectFlow);
-  connectProject("silent"); // resume a remembered project folder when permission persists
+  $("sheetSel").addEventListener("change", e=>openSelected(e.target.value));
+
+  // ---------- startup ----------
+  const SHORTCUTS="Shortcuts: <kbd>J</kbd>/<kbd>K</kbd> move &middot; <kbd>1</kbd>/<kbd>2</kbd> pass/fail &middot; <kbd>E</kbd> view email &middot; <kbd>Ctrl</kbd>+<kbd>S</kbd> save";
+  async function init(){
+    if(SERVER){
+      $("connectBtn").style.display="none";
+      $("openBtn").style.display="none";
+      $("emailsBtn").style.display="none";
+      $("emptyState").innerHTML="pick a sheet from the menu above &mdash; the emails are already loaded<br><br>"+SHORTCUTS;
+      let names=[];
+      try{ names=await (await fetch("/api/sheets")).json(); }
+      catch(e){ toast("Couldn't list sheets: "+e.message, true); }
+      populateSheets(names);
+      for(const f of ["emails.jsonl","emails-fail-probe.jsonl"]){
+        try{ const r=await fetch("/data/calibration/"+f); if(r.ok) parseEmailsText(await r.text()); }catch(e){}
+      }
+      let last=null; try{ last=localStorage.getItem("lastSheet"); }catch(e){}
+      if(last && names.includes(last)) await openServerSheet(last);
+    }else{
+      $("emptyState").innerHTML="click <b>Connect project</b> to list your sheets, or <b>Open CSV&hellip;</b> for any file<br><br>"+SHORTCUTS;
+      connectProject("silent"); // resume a remembered project folder when permission persists
+    }
+  }
+  init();
 
   // ---------- briefing modal ----------
   let briefOpen=false;
