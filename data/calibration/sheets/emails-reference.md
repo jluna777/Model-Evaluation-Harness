@@ -1,4 +1,4 @@
-﻿# Calibration Emails -- Reference for Labeling (emails only; no expected values)
+# Calibration Emails -- Reference for Labeling (emails only; no expected values)
 
 ---
 ## cal-001
@@ -438,5 +438,191 @@ My flight leaves next Wednesday, July 22, and I really need the sleeping bag pac
 
 Thanks,
 Rosamund Blackwood
+```
+
+---
+## cal-026
+
+**From:** soren.vikander@gmail.com  |  **Subject:** Two separate Ridgeline accounts under my name
+
+```
+Hi Ridgeline Support,
+
+I think I ended up with two separate accounts -- I checked out as a guest a while back under this email, and then later created a proper account with a password using a different address. Now my order history and rewards points are split between the two, and I'd like everything combined under one account if that's possible.
+
+Let me know what you need from me to sort it out.
+
+Thanks,
+Soren Vikander
+```
+
+---
+## cal-027
+
+**From:** delphine.rousseau@yahoo.com  |  **Subject:** Need this before my permit window opens - Order ORD-30023
+
+```
+Hi Ridgeline,
+
+My backcountry permit window opens Monday, July 20th, and I still need my Ridgetop Bear Canister (order ORD-30023) to arrive before then -- rangers won't let you into the zone without one. The tracking page hasn't moved in four days.
+
+Could you check on this and make sure it gets here in time?
+
+Thanks,
+Delphine Rousseau
+```
+
+---
+## cal-028
+
+**From:** kavi.ramanathan@outlook.com  |  **Subject:** Quick note on my gloves before a trip
+
+```
+Hi Ridgeline Team,
+
+Hope you're having a good week! I'm getting ready for a cold-weather trip next month and going through my gear one piece at a time -- stove, headlamp, extra fuel, the usual. The forecast is looking cold but clear so far, which should make for good conditions once I'm out there. I've been ordering from Ridgeline for a couple of years now and your gear has held up really well overall.
+
+While checking things over today, I noticed the wrist cinch cord on my Frostline Insulated Gloves (order ORD-30024) has snapped clean off on one glove, so I can't tighten it down anymore.
+
+Could you send a replacement pair? I'd like to have them in hand before I head out. Thanks so much!
+
+Best,
+Kavi Ramanathan
+```
+
+---
+## cal-029
+
+**From:** esperanza.duarte@icloud.com  |  **Subject:** Charged twice for my tent order
+
+```
+Hello Ridgeline,
+
+I just noticed I was charged twice for order ORD-30025, the Cascade 2-Person Tent -- two identical charges of $189.00 posted the same day. Could you refund the extra charge?
+
+Separately, totally unrelated -- do you offer price matching if I find the same tent cheaper somewhere else afterward?
+
+Thanks,
+Esperanza Duarte
+```
+
+---
+## cal-030
+
+**From:** wendell.ostrander@proton.me  |  **Subject:** Question about a trade-in or recycling program
+
+```
+Hi there,
+
+Before I order anything new, I wanted to ask -- does Ridgeline have any kind of trade-in or recycling program for old gear? I've got a few worn-out items I'd rather not just throw away.
+
+Thanks,
+Wendell Ostrander
+```
+
+---
+## cal-031
+
+**From:** ingmar.kolstad@gmail.com  |  **Subject:** Two problems with my camp lantern - Order ORD-30026
+
+```
+Dear Ridgeline Support,
+
+I'm writing about my Lowland Camp Lantern, order ORD-30026. It arrived with two separate problems: first, the hanging hook clip on top has snapped off, so I can't hang it from a tent loop anymore. Second, the light flickers on and off intermittently even with brand new batteries installed.
+
+Could you send a replacement lantern, or let me know what other options are available?
+
+Thank you,
+Ingmar Kolstad
+```
+
+---
+## cal-032
+
+**From:** noor.alsayegh@proton.me  |  **Subject:** Question about the Alpenglow Down Vest before a big move
+
+```
+Hi Ridgeline,
+
+I'm relocating to Fairbanks, Alaska this fall and I'm looking at the Alpenglow Down Vest to layer under a parka for the coldest stretches. Before I order one, could you tell me what temperature range it's rated for, and whether the down fill actually holds up in dry, sub-zero cold, or if it's really more of a shoulder-season piece?
+
+On a side note, my last order, ORD-30032, took almost three weeks to arrive even though Portland is only a short hop from your warehouse -- so I'm already bracing for a longer wait on anything shipped as far out as Alaska. The main thing I want to get right is whether the vest itself suits that kind of cold.
+
+Thanks for any guidance,
+Noor Al-Sayegh
+```
+
+---
+## cal-033
+
+**From:** bts.outdoors@outlook.com  |  **Subject:** Re: Order status
+
+```
+Hi,
+
+Just checking in again -- any movement on this? It's been a while since I last heard anything.
+
+Thanks
+
+---------- Forwarded message ---------
+From: Ridgeline Outfitters <support@ridgelineoutfitters.com>
+Date: Fri, Jul 10, 2026 at 11:20 AM
+Subject: Re: Order status
+To: bts.outdoors@outlook.com
+
+> Hi,
+>
+> Thanks for your patience -- we're still looking into the delay on order ORD-30028, the Glacier Insulated Water Bottle. We'll follow up as soon as we know more.
+>
+> Best,
+> Ridgeline Support Team
+>
+> ---------- Forwarded message ---------
+> From: bts.outdoors@outlook.com
+> Date: Mon, Jul 6, 2026 at 4:15 PM
+> Subject: Order status
+> To: Ridgeline Outfitters <support@ridgelineoutfitters.com>
+>
+> > Hi, I placed an order, ORD-30028, for a Glacier Insulated Water Bottle over a week ago and the tracking page still hasn't updated. Could someone check on it?
+> >
+> > Thanks,
+> > Beatrix Sorensen
+```
+
+---
+## cal-034
+
+**From:** emeka.adeyemi@gmail.com  |  **Subject:** Two orders arrived in the same box -- only one's a problem
+
+```
+Hi Ridgeline,
+
+I placed two separate orders about a week apart, and it looks like they ended up shipping together -- both arrived today in the same box: order ORD-30029 for the Switchback Trekking Poles, and order ORD-30031 for the Overlook Binoculars.
+
+The binoculars are great, no complaints there. But one of the trekking poles won't lock at any length -- the twist-lock collar just spins freely instead of gripping the inner shaft, so that pole is basically unusable on a hike.
+
+Could you send a replacement pole, or a full replacement pair if that's easier?
+
+Thanks,
+Emeka Adeyemi
+```
+
+---
+## cal-035
+
+**From:** colette.marchand@gmail.com  |  **Subject:** Re: Return for Longtrail Duffel Bag 90L
+
+```
+Actually, on second thought, please don't process the return -- I've decided to keep the duffel bag after all. But going back through my receipt, I noticed I was charged $15 more than the price currently listed on your site. Could you just refund that difference instead?
+
+Sorry for the back and forth!
+
+Colette
+
+On Wed, Jul 8, 2026 at 1:50 PM, Ridgeline Support <support@ridgelineoutfitters.com> wrote:
+> Hi Colette, no problem -- we can process a full refund for the Longtrail Duffel Bag 90L (order ORD-30030) once we receive the returned item. Let us know if you'd like to proceed.
+>
+> On Tue, Jul 7, 2026 at 10:05 AM, Colette Marchand <colette.marchand@gmail.com> wrote:
+> > Hi, I'd like to return my Longtrail Duffel Bag 90L, order ORD-30030 -- it's a bit bulkier than I expected.
 ```
 
