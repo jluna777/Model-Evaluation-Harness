@@ -7,8 +7,8 @@ provably be. Please read this page fully before opening your sheet.
 
 ## The task
 
-Your sheet (`sheet-second-annotator.csv` or `sheet-owner.csv`) has 100 rows.
-Each row shows:
+Your sheet (`sheet-second-annotator.csv` or `sheet-owner.csv`) has one row
+per judgment (the second annotator's full sheet has 140). Each row shows:
 
 - one **candidate value** — what an AI model extracted for one field
   (`issue_summary` or `requested_action`) from one customer-support email
@@ -55,7 +55,8 @@ What this means in practice:
 1. **Work alone.** Do not discuss any row, verdict, or impression with the
    other annotator until both sheets are complete and handed back. The
    measurement depends on your independence.
-2. **One sitting** if possible (plan ~1.5–1.75 hours for 100 rows).
+2. **One sitting** if possible (plan ~2–2.5 hours for the full 140-row
+   sheet; many rows resolve in under a minute).
 3. **Only edit the `verdict` and `critique` columns.** Do not reorder rows,
    delete rows, or change any other cell — each row is cryptographically
    bound to the exact candidate text you're judging, and edits elsewhere
