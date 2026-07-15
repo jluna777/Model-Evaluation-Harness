@@ -160,6 +160,12 @@
   .email-view .em-body { margin:0; font-size:13px; line-height:1.6; color:var(--ink);
     white-space:pre-wrap; word-break:break-word; }
   .email-view .em-missing { margin:0; font-family:var(--mono); font-size:12px; color:var(--partial); }
+  .initials { display:flex; gap:8px; flex-wrap:wrap; padding:10px 15px; border-top:1px dashed var(--line);
+    background:color-mix(in srgb,var(--partial) 6%,var(--bg2)); }
+  .initials .lab { font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.14em;
+    color:var(--ink-faint); align-self:center; }
+  .init-tag { font-family:var(--mono); font-size:11.5px; color:var(--ink); border:1px solid var(--line);
+    border-radius:6px; padding:3px 9px; background:var(--surface); }
 
   /* ---------- briefing ---------- */
   .brief { text-align:left; }
@@ -619,6 +625,11 @@
     const fieldTxt = r[idx.field]==="issue_summary" ? "issue_summary" : "requested_action";
     const cand_ab = r[idx.candidate];
     const open = openEmails.has(i);
+    const ctx = (idx.owner_initial!==undefined && idx.second_initial!==undefined)
+      ? `<div class="initials"><span class="lab">initial verdicts</span>
+           <span class="init-tag">owner &middot; ${esc(r[idx.owner_initial])}</span>
+           <span class="init-tag">second-annotator &middot; ${esc(r[idx.second_initial])}</span></div>`
+      : "";
     return `
     <div class="card ${v?'graded':''} ${vc} ${i===focusRow?'focus':''}" data-i="${i}" id="card-${i}">
       <div class="chead">
@@ -633,6 +644,7 @@
         <div class="val reference"><h4><span class="tick"></span>reference</h4><p>${esc(ref)}</p></div>
         <div class="val candidate"><h4><span class="tick"></span>candidate</h4><p>${candHTML}</p></div>
       </div>
+      ${ctx}
       ${open ? emailHTML(r) : ""}
       <div class="grade">
         <div class="verdict-col">
