@@ -680,12 +680,20 @@ def update_baseline(
     ``_promote_staged_baseline``: generate + guardrail-check into a
     ``.staging`` subdirectory of ``baselines_root`` first, so a failing
     guardrail check never creates or overwrites the real committed baseline
-    file, then promote and clean up staging. Kept for callers that
-    deliberately want to update a single candidate in isolation; ``eval gate
-    --update-baseline`` itself calls ``update_baselines`` (finding F3) so
-    both candidates commit atomically as a pair -- see that function's
-    docstring for why a single-candidate commit is unsafe for the CLI's own
-    two-candidate contract.
+    file, then promote and clean up staging. The OTHER candidate's committed
+    baseline file is never opened, read, or written by this function --
+    atomicity here is scoped to exactly the one file this call promotes,
+    never the pair.
+
+    ``eval gate --update-baseline`` calls this function directly when
+    ``--model {a|b}`` is passed (D3 amendment 2026-07-16, operational
+    grounds: the judge provider's daily quota is too small for one atomic
+    dual-candidate generation -- ~1,200 combined judge calls, confirmed live
+    when a dual run aborted mid-quota). Omitting ``--model`` is unchanged: the
+    CLI still calls ``update_baselines`` (finding F3) so both candidates
+    commit atomically as a pair by default -- see that function's docstring
+    for why the pair stays atomic there even though a single-candidate
+    commit is now also a supported, deliberate, operator-invoked CLI path.
 
     ``trace`` (additive, keyword-only, default ``None``) is threaded straight
     through to ``generate_baseline``/``run_eval`` -- the caller (``cli.py``)
@@ -745,6 +753,17 @@ def update_baselines(
     was wrong. A CI gate must never observe a and b baselines that were
     generated under different circumstances relative to each other; the
     all-or-nothing promotion here is what makes that structurally impossible.
+
+    This remains the CLI's default (``eval gate --update-baseline`` with no
+    ``--model``): the pair-atomic guarantee above is completely unchanged.
+    ``--model {a|b}`` (D3 amendment 2026-07-16, operational grounds: the
+    judge provider's daily quota cannot fit one dual-candidate generation)
+    opts a single invocation OUT of this function and into ``update_baseline``
+    instead, which commits only that one candidate -- a deliberate,
+    disclosed, operator-invoked choice, never a silent default, and never a
+    reopening of the reasoning above: two independently-scheduled
+    single-candidate updates are two separate, individually-atomic file
+    writes, not one pair-write with the atomicity removed.
     """
 
     baselines_root = Path(baselines_root)

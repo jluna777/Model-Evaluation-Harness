@@ -47,24 +47,29 @@ config's own ``k`` (3 by default) would triple spend for no benefit.
 override -- the golden set is the only dataset a baseline is ever compared
 against) and always runs both candidates. Delegates every decision --
 fingerprint check, judge-error budget, the statistical + adversarial-guardrail
-decision rule, rendering -- to ``harness.gate.gate.evaluate_gate`` (pure) and
-``harness.gate.gate.update_baselines`` (the impure entry point, for
-``--update-baseline``, atomically committing both candidates together --
-finding F3); this module only handles CLI plumbing (dataset/config/
-certificate loading, tracing, client construction via the same
-``_build_model_key``/``_get_or_run`` seams ``run``/``compare`` use, and the
-gate's own exit-code mapping -- see ``_gate_clean_exit``, which differs from
-``_clean_exit_on_expected_errors`` in a binding way, revised by finding F1:
-every gate condition that fires before a completed measurement exists --
-including ``RunAborted``, a run-config mismatch, missing tracing/certificate/
-API-key credentials, and an SDK construction failure -- is exit 2
-"measurement error", not exit 1; only a failed ``--update-baseline`` guardrail
-check (which DID complete a real measurement) stays exit 1. ``eval gate``
-also always forces a fresh ``run_eval`` execution for every candidate
-(finding F2) -- it never reuses ``run``/``compare``'s persisted run
-directories, since a stale completed run could silently replay scores
-produced by since-changed scoring code, defeating the gate's own threat
-model.).
+decision rule, rendering -- to ``harness.gate.gate.evaluate_gate`` (pure) and,
+for ``--update-baseline``, one of two impure entry points: ``update_baselines``
+(the default, atomically committing both candidates together -- finding F3)
+or, when ``--model {a|b}`` is also passed, ``update_baseline`` (regenerating
+and committing ONLY that one candidate, atomic per-file rather than per-pair
+-- D3 amendment 2026-07-16, operational: the judge provider's daily quota is
+too small for one dual-candidate generation, confirmed live when a dual
+``--update-baseline`` run aborted mid-quota; dual mode remains the default
+and unaffected when ``--model`` is omitted); this module only handles CLI
+plumbing (dataset/config/certificate loading, tracing, client construction
+via the same ``_build_model_key``/``_get_or_run`` seams ``run``/``compare``
+use, and the gate's own exit-code mapping -- see ``_gate_clean_exit``, which
+differs from ``_clean_exit_on_expected_errors`` in a binding way, revised by
+finding F1: every gate condition that fires before a completed measurement
+exists -- including ``RunAborted``, a run-config mismatch, missing
+tracing/certificate/API-key credentials, and an SDK construction failure --
+is exit 2 "measurement error", not exit 1; only a failed
+``--update-baseline`` guardrail check (which DID complete a real
+measurement) stays exit 1. ``eval gate`` also always forces a fresh
+``run_eval`` execution for every candidate (finding F2) -- it never reuses
+``run``/``compare``'s persisted run directories, since a stale completed run
+could silently replay scores produced by since-changed scoring code,
+defeating the gate's own threat model.).
 
 **Client-injection seam (binding for T11's tests):** ``_build_model_key`` is
 the SOLE call site that ever constructs ``AnthropicClient``/``OpenAIClient``/
@@ -738,9 +743,20 @@ def gate(
         typer.Option(
             "--update-baseline",
             help="Regenerate and commit fresh baselines for both candidates (K_baseline, "
-            "traced, reportable) instead of running the decision rule.",
+            "traced, reportable) instead of running the decision rule. Pair with --model to "
+            "regenerate only one candidate.",
         ),
     ] = False,
+    model: Annotated[
+        CandidateLabel | None,
+        typer.Option(
+            "--model",
+            help="With --update-baseline, regenerate and commit only this candidate's "
+            "baseline (a or b) instead of both -- for when the judge provider's daily quota "
+            "cannot fit one dual-candidate baseline generation (docs/decisions.md D3, "
+            "2026-07-16 amendment). Invalid without --update-baseline.",
+        ),
+    ] = None,
     seed_regression: Annotated[
         bool,
         typer.Option(
@@ -769,6 +785,18 @@ def gate(
     is even attempted (missing tracing/certificate/API-key credentials, an
     SDK construction failure, a run-config mismatch) -- finding F1.
 
+    ``--update-baseline --model {a|b}`` (D3 amendment 2026-07-16, operational):
+    regenerates and commits ONLY that one candidate's baseline instead of
+    both -- added because the judge provider's daily quota is smaller than
+    one atomic dual-candidate baseline generation (~1,200 judge calls;
+    confirmed live when a dual run aborted mid-quota). Atomicity still holds,
+    just re-scoped from the pair to the one file this invocation touches: the
+    OTHER candidate's committed baseline is never opened, read, or written.
+    Omitting ``--model`` is unchanged -- both candidates still commit
+    atomically as a pair, and remains the default. ``--model`` without
+    ``--update-baseline`` is a usage error (exit 1): it has no effect outside
+    baseline generation.
+
     This invocation's own fresh ``results/runs/gate/<uuid>`` directory
     (``_fresh_gate_runs_root``) is removed once the gate finishes, since it
     exists solely to drive this one measurement -- unless ``--keep-runs`` is
@@ -779,6 +807,14 @@ def gate(
     if update_baseline and seed_regression:
         typer.secho(
             "error: --update-baseline and --seed-regression are mutually exclusive",
+            err=True,
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    if model is not None and not update_baseline:
+        typer.secho(
+            "error: --model is only valid together with --update-baseline",
             err=True,
             fg=typer.colors.RED,
         )
@@ -810,6 +846,32 @@ def gate(
             require_certificate(certificate, reportable=True)
 
         if update_baseline:
+            if model is not None:
+                # D3 amendment 2026-07-16: single-candidate update, atomic
+                # per-file rather than per-pair -- the other candidate's
+                # committed baseline is never touched (`update_baseline`'s
+                # own docstring). Chosen operationally when the judge
+                # provider's daily quota can't fit one dual-candidate
+                # generation.
+                label = model.value
+                baseline_trace = TraceContext.for_run(cfg, True)
+                model_key = _build_model_key(label, cfg)
+                baseline = gate_module.update_baseline(
+                    cfg,
+                    model_key,
+                    dataset=items,
+                    prompt=EXTRACTION_PROMPT,
+                    certificate=certificate,
+                    runs_root=gate_runs_root,
+                    baselines_root=DEFAULT_BASELINES_ROOT,
+                    trace=baseline_trace,
+                )
+                typer.echo(
+                    f"Baseline written: {DEFAULT_BASELINES_ROOT / f'{label}.json'} "
+                    f"(fingerprint {baseline.fingerprint[:12]}...)"
+                )
+                return
+
             # Spec §8 traces per-run, not per-invocation (mirrors `compare`'s
             # own trace_a/trace_b split): each candidate's baseline generation
             # gets its own trace, both validated (fail-fast, before any API

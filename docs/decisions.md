@@ -103,7 +103,7 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 
 ## D3 — CI gate decision rule
 
-**Status:** Decided 2026-07-04 · Amended 2026-07-04a
+**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-16
 **Decision:** The gate operates on one composite score per email, on the nominal slice, as paired per-item deltas against a pinned baseline. Decision rule: one-sided sign-flip permutation test; fail only when p < α **and** the mean regression exceeds a practical margin. Bootstrap CI reported as the error bar, never the decision. MDE computed and printed on every run. Replicated runs averaged per item before pairing. Operational parameters: spec §6, §7.
 
 **Options considered:** (1) permutation test + margin + MDE *(chosen)*; (2) BCa bootstrap CI as the decision rule; (3) fixed score threshold (industry default).
@@ -126,6 +126,22 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 - **Exit-code contract:** pass / regression / measurement-error are distinct CI outcomes; judge failures are excluded from deltas and can never register as candidate regressions (spec §7).
 
 **Revisit if:** the golden set grows enough for finer margins; replicate data shows run variance negligible (drop K); repeated-gating false-alarm budget needs formal control; the owner prefers the non-inferiority framing above.
+
+**Amendment 2026-07-16 (owner, operational — per-candidate baseline updates):** `eval gate --update-baseline` gains an optional `--model {a|b}`. Passed, it regenerates and commits ONLY that one candidate's baseline (its own fresh K_baseline=6 traced run, its own guardrail-floor check, an atomic write of that one committed file); omitted, the existing atomic dual-candidate commit (`update_baselines`, T16 finding F3: both candidates staged and guardrail-checked together, promoted only if both pass) is completely unchanged and remains the default.
+
+**Same trigger as D1's 2026-07-16 amendment:** the judge provider's tier-1 quota (`generate_requests_per_model_per_day`, limit 1,000) cannot fit one atomic dual-candidate baseline generation (~1,200 combined judge calls) — confirmed live when a dual `eval gate --update-baseline` run aborted mid-run at 988/1000 requests against that exact quota metric. Splitting into two single-candidate invocations (run separately, e.g. on either side of a daily quota reset) lets each stay inside the daily budget; nothing about the statistical or fingerprint machinery changes.
+
+**Atomicity re-scoped, not weakened:** the F3 finding (dual-candidate commits must be all-or-nothing, never a partial pair) is preserved exactly for the default, no-`--model` path. `--model` does not reopen that reasoning — it does not make a *pair* update partial; it makes a *single-candidate* update the entire unit of work, and that single file's write was already atomic (stage into an isolated directory, guardrail-check, promote-or-discard) before this amendment. The other candidate's committed baseline is never opened, read, or written during a single-candidate update, whether it succeeds or is refused by the guardrail floor check. Two independently-run single-candidate updates are two separate atomic file writes, not one pair-write with the guarantee removed.
+
+**Options considered (this amendment):** (1) optional `--model {a|b}` on the existing command, dual mode remains default *(chosen)*; (2) a separate `eval gate --update-baseline-single {a|b}` subcommand; (3) always require two separate CI-triggered jobs, one per candidate, with no single-invocation dual mode at all.
+
+**Rationale (this amendment):**
+- Matches `eval run --model {a|b}`'s existing option style (spec §9) rather than inventing a new flag/subcommand shape for the same concept — the codebase already has one established way to say "just this candidate."
+- Dual mode staying the default (rather than flipping the default or removing it) means every existing invocation, script, and CI step that calls `eval gate --update-baseline` with no `--model` keeps behaving exactly as documented before this amendment — this is a strictly additive capability, not a behavior change for the common path.
+- A separate subcommand (option 2) would duplicate the certificate-loading, tracing, and exit-code plumbing `gate` already owns for no benefit over one additional option on the existing command.
+- Removing dual mode entirely (option 3) would needlessly break the common case (ample quota, one prompt-bump re-baseline) just to serve the quota-constrained case — the two are not mutually exclusive, so both should be selectable from one command.
+
+**Revisit if:** the provider's tier-1 quota changes such that a single dual-candidate generation reliably fits inside it (per-candidate updates would then be a purely optional convenience, not an operational necessity); or the golden set grows enough that even a single-candidate K_baseline=6 run risks its own quota exhaustion.
 
 ---
 

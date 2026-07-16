@@ -127,6 +127,14 @@ composite points at n=32** (spec §7, §11).
    directory, promoted to `baselines/{a,b}.json` only if **both** pass. Any
    failure (either `GuardrailFloorError` or another exception) leaves
    **neither** committed file touched — no partial pair.
+   When the judge provider's daily request quota cannot fit one dual
+   regeneration (~1,200 judge calls; see decisions.md D3 amendment
+   2026-07-16), run `eval gate --update-baseline --model a` and
+   `... --model b` as separate invocations instead — each regenerates,
+   guardrail-checks, and atomically promotes only its own
+   `baselines/{model}.json`, leaving the other committed file untouched.
+   Do not run the two single-candidate invocations concurrently: they
+   share the `.staging` scratch directory.
 2. The PR must attach the compare-vs-old-baseline report for human review
    — the regression surface is reviewed, never silently bypassed.
 

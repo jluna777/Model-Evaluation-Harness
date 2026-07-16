@@ -1726,6 +1726,187 @@ class TestGateCliUpdateBaselineAtomicity:
 
 
 # --------------------------------------------------------------------------
+# D3 amendment 2026-07-16 (operational): --update-baseline --model {a|b}
+# regenerates and commits only ONE candidate's baseline instead of both --
+# added because the judge provider's daily quota is smaller than one atomic
+# dual-candidate generation (~1,200 combined judge calls; confirmed live when
+# a dual run aborted mid-quota). Atomicity moves from "the pair" to "the
+# file": the OTHER candidate's committed baseline must never be touched,
+# whether the single-candidate update succeeds or is refused by the
+# guardrail floor check. Dual mode (no --model) must keep passing unchanged
+# -- see TestGateCliUpdateBaseline/TestGateCliUpdateBaselineAtomicity above.
+# --------------------------------------------------------------------------
+
+
+class TestGateCliUpdateBaselineSingleCandidate:
+    def test_model_a_regenerates_only_candidate_a_leaving_b_byte_identical(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        baseline_a_before = (Path("baselines") / "a.json").read_text(encoding="utf-8")
+        baseline_b_before = (Path("baselines") / "b.json").read_text(encoding="utf-8")
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        registry: dict[str, list[FakeModelClient]] = {}
+        monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
+
+        result = runner.invoke(
+            app, ["gate", "--config", str(config_path), "--update-baseline", "--model", "a"]
+        )
+
+        assert result.exit_code == 0, result.output
+        # Only candidate a's client was ever built -- b is never constructed,
+        # let alone measured, in single-candidate mode.
+        assert len(registry["candidate"]) == 1
+        # b's committed baseline is byte-for-byte untouched.
+        assert (Path("baselines") / "b.json").read_text(encoding="utf-8") == baseline_b_before
+        # a's committed baseline WAS regenerated (fresh created_at at minimum).
+        baseline_a_after = (Path("baselines") / "a.json").read_text(encoding="utf-8")
+        assert baseline_a_after != baseline_a_before
+        assert "Baseline written" in result.output
+        assert "a.json" in result.output
+        assert "b.json" not in result.output
+
+    def test_model_b_regenerates_only_candidate_b_leaving_a_byte_identical(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        baseline_a_before = (Path("baselines") / "a.json").read_text(encoding="utf-8")
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+        registry: dict[str, list[FakeModelClient]] = {}
+        monkeypatch.setattr(cli, "_build_model_key", _fake_build_model_key_factory(registry))
+
+        result = runner.invoke(
+            app, ["gate", "--config", str(config_path), "--update-baseline", "--model", "b"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert len(registry["candidate"]) == 1
+        assert (Path("baselines") / "a.json").read_text(encoding="utf-8") == baseline_a_before
+        assert "b.json" in result.output
+        assert "a.json" not in result.output
+
+    def test_guardrail_failure_in_single_mode_leaves_that_file_unwritten_and_other_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path, k_baseline=6)
+        _write_certificate_file("adequate")
+        cfg = load_config(config_path)
+        _generate_matching_baselines(cfg, items)
+
+        baseline_a_before = (Path("baselines") / "a.json").read_text(encoding="utf-8")
+        baseline_b_before = (Path("baselines") / "b.json").read_text(encoding="utf-8")
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        def factory(label: str, config: object) -> ModelKey:
+            candidate = _alternating_candidate_for_item("adv-0")
+            judge = FakeModelClient(make_result=lambda *a: judge_pass_result())
+            return ModelKey(label=label, candidate_client=candidate, judge_client=judge)
+
+        monkeypatch.setattr(cli, "_build_model_key", factory)
+
+        result = runner.invoke(
+            app, ["gate", "--config", str(config_path), "--update-baseline", "--model", "b"]
+        )
+
+        assert result.exit_code == 1, result.output  # GuardrailFloorError, F1
+        assert "Traceback" not in result.output
+        assert "guardrail" in result.output.lower()
+        # Neither committed baseline was touched: b's failing regeneration
+        # was never promoted, and a -- not even part of this invocation --
+        # was never opened at all.
+        assert (Path("baselines") / "a.json").read_text(encoding="utf-8") == baseline_a_before
+        assert (Path("baselines") / "b.json").read_text(encoding="utf-8") == baseline_b_before
+
+    def test_guardrail_failure_in_single_mode_with_no_pre_existing_baseline_leaves_it_absent(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path, k_baseline=6)
+        _write_certificate_file("adequate")
+
+        monkeypatch.setattr(cli, "TraceContext", _FakeTraceContext)
+
+        def factory(label: str, config: object) -> ModelKey:
+            candidate = _alternating_candidate_for_item("adv-0")
+            judge = FakeModelClient(make_result=lambda *a: judge_pass_result())
+            return ModelKey(label=label, candidate_client=candidate, judge_client=judge)
+
+        monkeypatch.setattr(cli, "_build_model_key", factory)
+
+        result = runner.invoke(
+            app, ["gate", "--config", str(config_path), "--update-baseline", "--model", "a"]
+        )
+
+        assert result.exit_code == 1, result.output
+        assert not (Path("baselines") / "a.json").exists()
+        assert not (Path("baselines") / "b.json").exists()
+
+    def test_model_without_update_baseline_is_a_clean_usage_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+
+        result = runner.invoke(app, ["gate", "--config", str(config_path), "--model", "a"])
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "--update-baseline" in result.output
+
+    def test_junk_model_value_is_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        items = [make_item("nom-0"), make_item("adv-0", slice_="adversarial")]
+        dataset_path = _write_golden_dataset(items)
+        config_path = _write_gate_config(dataset_path=dataset_path)
+
+        result = runner.invoke(
+            app,
+            ["gate", "--config", str(config_path), "--update-baseline", "--model", "c"],
+        )
+
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+
+    def test_help_text_documents_model_option(self, tmp_path, monkeypatch):
+        # Chdir into an isolated tmp_path -- otherwise the app-level
+        # `_load_env_callback` (which runs on every invocation, including
+        # `--help`) would discover this repo's own real, gitignored `.env`
+        # via `find_dotenv(usecwd=True)` and load its real Langfuse keys into
+        # the actual process environment (load_dotenv mutates os.environ
+        # directly, outside monkeypatch's teardown) -- permanently polluting
+        # the rest of this pytest session's tests that assert on Langfuse
+        # credentials being absent.
+        monkeypatch.chdir(tmp_path)
+
+        result = runner.invoke(app, ["gate", "--help"])
+
+        assert result.exit_code == 0
+        assert "--model" in result.output
+
+
+# --------------------------------------------------------------------------
 # F4: a run missing (or adding) a nominal item relative to the committed
 # baseline must exit 2, naming the id(s) -- never silently intersected.
 # --------------------------------------------------------------------------

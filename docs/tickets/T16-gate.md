@@ -3,6 +3,8 @@
 **Phase:** C · **Depends on:** T01, T02, T03, T04, T05, T07, T08, T09, T10, T11, T12, T13, T14, T15 · **Owner gate:** no
 **Sources:** plan.md task T16 · spec.md §7, §8, §9 · decisions.md D3
 
+**Amended 2026-07-16 (owner, operational):** `eval gate --update-baseline` gains an optional `--model {a|b}` (matching `eval run`'s existing option style) — regenerate and commit only that one candidate's baseline instead of both, atomic per-file (decisions.md D3 amendment 2026-07-16, provider daily-quota grounds: the judge's tier-1 quota is too small for one atomic dual-candidate generation, confirmed live when a dual run aborted mid-quota). The dual-candidate atomic commit (`gate.update_baselines`) remains the default and is unchanged when `--model` is omitted; `--model` is invalid without `--update-baseline`. The acceptance criteria below predate this amendment and describe the original dual-only design — they still hold for the default (no-`--model`) path.
+
 ## Goal
 Implement the CI gate decision rule exactly per spec §7 — `eval gate [--update-baseline|--seed-regression]` with the 0/1/2 exit-code contract — then generate and commit the real baselines and smoke-run the gate green against them.
 
