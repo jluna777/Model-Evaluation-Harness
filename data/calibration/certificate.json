@@ -1,0 +1,39 @@
+{
+  "judge_version": "4c717b2c052dd7eac052bb80abcebb93716cb53980cabb54d4fc6c4c3830c5b3",
+  "overall_kappa": 0.7191574724172517,
+  "kappa_ci": [
+    0.509781633249777,
+    0.8584070796460177
+  ],
+  "per_candidate_kappa": {
+    "a": 0.6153846153846155,
+    "b": 0.8447893569844789
+  },
+  "per_candidate_kappa_ci": {
+    "a": [
+      0.3812451960030745,
+      0.8073394495412843
+    ],
+    "b": [
+      0.6363636363636362,
+      0.9619151251360175
+    ]
+  },
+  "verdict": "adequate",
+  "ceiling_kappa": 0.7337624341720305,
+  "ceiling_kappa_ci": [
+    0.5752113993080795,
+    0.8537110377173047
+  ],
+  "n_adjudicated": 13,
+  "label_file_hash": "87008893ded8b74d3459c160d539279e7cc021e460c40722e829cbbf04db34ad",
+  "date": "2026-07-15",
+  "n_perturbed": 31,
+  "achieved_fail_prevalence": 0.22857142857142854,
+  "real_only_kappa": 0.0,
+  "real_only_kappa_ci": [
+    0.0,
+    0.0
+  ],
+  "perturbed_rows_passed_by_gold": 1
+}
