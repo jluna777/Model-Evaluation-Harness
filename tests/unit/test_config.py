@@ -17,7 +17,7 @@ class TestLoadConfig:
         assert config.k == 3
         assert config.k_baseline == 6
         assert config.retry_max_attempts == 4
-        assert config.price_snapshot.date == date(2026, 7, 4)
+        assert config.price_snapshot.date == date(2026, 7, 16)
         assert config.price_snapshot.label == "approximate-at-snapshot"
 
     def test_price_snapshot_survives_dump_and_reload(self, tmp_path):
@@ -30,7 +30,7 @@ class TestLoadConfig:
         reloaded = load_config(dumped_path)
 
         assert reloaded == config
-        assert reloaded.price_snapshot.date == date(2026, 7, 4)
+        assert reloaded.price_snapshot.date == date(2026, 7, 16)
         assert reloaded.price_snapshot.label == "approximate-at-snapshot"
 
     def test_unknown_top_level_key_raises_validation_error(self, tmp_path):
@@ -134,6 +134,15 @@ class TestFingerprint:
         # Recomputed again 2026-07-09 (T13 open-coding round): `prompt_version`
         # moved 3 -> 4 (Clusters B/C plus the category boundary), another
         # intentional hash change for the same reason.
+        # Checked 2026-07-16 (D1 amendment 2026-07-16d, judge re-certified and
+        # confirmed gemini-2.5-pro -> gemini-3-flash-preview): the digest
+        # below is UNCHANGED. `fingerprint()`'s payload only reads
+        # `config.prompt_version`/`config.dataset.version` off `config`;
+        # `judge_version` here is the fixed literal "judge-v1", not
+        # `rubric.judge_version()` -- so neither `models.judge` nor
+        # `price_snapshot` (both changed by this amendment) are hashed inputs.
+        # Verified by re-running this test against the amended
+        # `configs/default.yaml`, not assumed.
         config = load_config(DEFAULT_CONFIG_PATH)
 
         fp = fingerprint(

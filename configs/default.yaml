@@ -5,7 +5,7 @@
 models:
   candidate_a: claude-haiku-4-5-20251001
   candidate_b: gpt-5.4-mini
-  judge: gemini-2.5-pro
+  judge: gemini-3-flash-preview
 
 prompt_version: 4
 
@@ -25,7 +25,7 @@ gate:
 # snapshot date below -- not a live price feed. Consumed by the gate summary
 # for token-cost reporting (spec §7, §9).
 price_snapshot:
-  date: "2026-07-04"
+  date: "2026-07-16"
   label: approximate-at-snapshot
   candidate_a:
     input_per_mtok: 1.00
@@ -34,8 +34,8 @@ price_snapshot:
     input_per_mtok: 0.75
     output_per_mtok: 4.50
   judge:
-    input_per_mtok: 1.50
-    output_per_mtok: 9.00
+    input_per_mtok: 0.50
+    output_per_mtok: 3.00
 
 langfuse:
   host: https://cloud.langfuse.com

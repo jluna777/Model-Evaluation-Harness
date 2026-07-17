@@ -30,8 +30,8 @@ Composite mode used for every figure below: **FULL_7**.
 - MDE (α=0.05, 80% power): **6.10** points
 - Judge-error exclusions: 1 item(s) excluded from paired deltas (a missing judged field is never scored as a fail)
 - Adversarial-slice delta (current - baseline, always printed): **-2.00** points -- coarse guardrail (>=10-point drop): **not tripped**
-- Candidate token usage: 50000 in / 20000 out (~$0.1500, approximate-at-snapshot 2026-07-04)
-- Judge token usage: 80000 in / 30000 out (~$0.3900; judge calls dominate cost -- one call per judged field per replicate, vs one candidate call per replicate)
+- Candidate token usage: 50000 in / 20000 out (~$0.1500, approximate-at-snapshot 2026-07-16)
+- Judge token usage: 80000 in / 30000 out (~$0.1300; judge calls dominate cost -- one call per judged field per replicate, vs one candidate call per replicate)
 
 ### Candidate b
 
@@ -41,8 +41,8 @@ Composite mode used for every figure below: **FULL_7**.
 - MDE (α=0.05, 80% power): **5.80** points
 - Judge-error exclusions: 2 item(s) excluded from paired deltas (a missing judged field is never scored as a fail)
 - Adversarial-slice delta (current - baseline, always printed): **-11.50** points -- coarse guardrail (>=10-point drop): **TRIPPED**
-- Candidate token usage: 52000 in / 21000 out (~$0.1335, approximate-at-snapshot 2026-07-04)
-- Judge token usage: 81000 in / 31000 out (~$0.4005; judge calls dominate cost -- one call per judged field per replicate, vs one candidate call per replicate)
+- Candidate token usage: 52000 in / 21000 out (~$0.1335, approximate-at-snapshot 2026-07-16)
+- Judge token usage: 81000 in / 31000 out (~$0.1335; judge calls dominate cost -- one call per judged field per replicate, vs one candidate call per replicate)
 
 ## Family False-Alarm Rate
 

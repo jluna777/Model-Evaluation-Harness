@@ -142,8 +142,7 @@ frozen by the owner.
 
 ## Provenance & coupling
 
-- **The judge is Gemini-family** (`gemini-2.5-pro` since 2026-07-09, fallback `gemini-3.5-flash`; see decisions.md D1; was `gemini-3.5-flash`, escalation `gemini-2.5-pro`;
-  D1) — the same family planned to draft 80% of golden items. This is a real
+- **The judge is Gemini-family** (`gemini-3-flash-preview` since 2026-07-16, pinned snapshot version `3-flash-preview-12-2025`, fallback `gemini-3.5-flash`; see decisions.md D1; prior history: `gemini-2.5-pro` from 2026-07-09, originally `gemini-3.5-flash`) — the same family planned to draft 80% of golden items. This is a real
   generator–judge coupling and is named here deliberately rather than left to a
   limitations paragraph (constitution Principle 3).
 - **Why the coupling is accepted:**
