@@ -127,7 +127,7 @@ The model interface is a thin internal protocol (`complete_structured(email, sch
 | `eval rescore <run-dir>` | recompute all scores/statistics/reports from persisted raw outputs — zero API calls |
 
 - **Config** (`configs/default.yaml`, Pydantic-validated): model IDs, prompt version, dataset path/version, K, gate margin/alpha, price snapshot, Langfuse settings. Defaults are the decided D2/D3 values; changing margin, alpha, or K requires a dated decision-log amendment, and the gate summary prints the values used.
-- **Retries:** transport-level errors only (429/5xx/timeouts), capped jittered exponential backoff (cap: 4 attempts, exposed in config). A successfully returned response is never re-sampled regardless of content (the constitution's retries-as-quality-strategy cut draws exactly this line). Per-item results persist incrementally; an aborted run resumes rather than re-spending calls.
+- **Retries:** transport-level errors only (429/5xx/timeouts), capped jittered exponential backoff (cap: 12 attempts, exposed in config; each wait itself capped at 120s, bounding worst-case total wait before `TransportExhausted` to ~8 minutes). A successfully returned response is never re-sampled regardless of content (the constitution's retries-as-quality-strategy cut draws exactly this line). Per-item results persist incrementally; an aborted run resumes rather than re-spending calls. *(Widened 2026-07-17: the judge provider's 503 load-shedding bursts, observed live 2026-07-16/17, run 2-5 minutes -- the original 4-attempt/~30s cap could abort an almost-complete run mid-burst. The wider cap still respects CI's 30-minute job budget, and non-retryable errors still fail on the first attempt exactly as before.)*
 
 ## 10. Repo layout (target)
 

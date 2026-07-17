@@ -178,10 +178,13 @@ class _RecordingProviderClient:
     raising -- proves the real construction seam (``_build_model_key``) was
     genuinely exercised with the right model ids (F2), as opposed to every
     other test in this module, which replaces ``_build_model_key`` wholesale
-    or forbids construction outright."""
+    or forbids construction outright. ``max_attempts`` records the retry
+    hardening's config-threading (2026-07-17): ``_build_model_key`` must pass
+    ``config.retry_max_attempts`` through to every client it constructs."""
 
     model: str
     sdk_client: object
+    max_attempts: int | None = None
     calls: list[tuple[str, type]] = field(default_factory=list)
 
     def complete_structured(self, prompt: str, schema: type[BaseModel]) -> StructuredResult:
@@ -193,9 +196,11 @@ class _RecordingProviderClient:
 
 def _recording_factory(
     registry: list[_RecordingProviderClient],
-) -> Callable[[str, object], _RecordingProviderClient]:
-    def factory(model: str, sdk_client: object) -> _RecordingProviderClient:
-        client = _RecordingProviderClient(model=model, sdk_client=sdk_client)
+) -> Callable[..., _RecordingProviderClient]:
+    def factory(model: str, sdk_client: object, **kwargs: object) -> _RecordingProviderClient:
+        client = _RecordingProviderClient(
+            model=model, sdk_client=sdk_client, max_attempts=kwargs.get("max_attempts")
+        )
         registry.append(client)
         return client
 
@@ -849,6 +854,10 @@ class TestBuildModelKeyConstructionSeam:
         assert model_key_a.candidate_client is anthropic_instances[0]
         assert model_key_a.judge_client is gemini_instances[0]
         assert openai_instances == []
+        # Retry hardening (2026-07-17): config.retry_max_attempts threads
+        # through to every constructed client, candidate and judge alike.
+        assert anthropic_instances[0].max_attempts == config.retry_max_attempts
+        assert gemini_instances[0].max_attempts == config.retry_max_attempts
 
         model_key_b = cli._build_model_key("b", config)
 
@@ -856,6 +865,8 @@ class TestBuildModelKeyConstructionSeam:
         assert [c.model for c in gemini_instances] == [config.models.judge, config.models.judge]
         assert model_key_b.candidate_client is openai_instances[0]
         assert len(anthropic_instances) == 1  # unaffected by the "b" call
+        assert openai_instances[0].max_attempts == config.retry_max_attempts
+        assert gemini_instances[1].max_attempts == config.retry_max_attempts
 
     def test_run_end_to_end_exercises_judge_wrapping_the_gemini_client(self, tmp_path, monkeypatch):
         """Drives the real ``_build_model_key`` seam through a full ``eval

@@ -185,6 +185,7 @@ import openai
 import typer
 from dotenv import find_dotenv, load_dotenv
 from google import genai
+from google.genai import types as genai_types
 
 import harness.calibrate as calibrate_module
 from harness.config import Config, load_config
@@ -236,6 +237,16 @@ DEFAULT_CALIBRATION_JUDGMENTS_PATH = Path("data/calibration/judgments.jsonl")
 # harness.calibrate's module docstring, "Fail-probe perturbation set").
 DEFAULT_FAIL_PROBE_EMAILS_PATH = Path("data/calibration/emails-fail-probe.jsonl")
 DEFAULT_PERTURBATIONS_PATH = Path("data/calibration/perturbations.jsonl")
+
+# Explicit per-request timeout, seconds (live-discovered hardening item,
+# 2026-07-08/2026-07-17). All three provider SDKs default to read timeouts
+# around 10 minutes when left unset (anthropic/openai resolve their NOT_GIVEN
+# sentinel to a 600s read timeout; google-genai's HttpOptions.timeout has no
+# client-level default at all without an explicit override) -- long enough
+# for a hung connection to stall a run silently instead of handing control to
+# retry_transport's backoff. ~100s clears realistic judge/candidate latency
+# while still engaging retries promptly.
+_REQUEST_TIMEOUT_SECONDS = 100.0
 
 
 class CandidateLabel(StrEnum):
@@ -431,15 +442,32 @@ def _build_model_key(label: str, config: Config) -> ModelKey:
     if label == "a":
         candidate_client: ModelClient = _construct_client(
             "Anthropic",
-            lambda: AnthropicClient(config.models.candidate_a, anthropic.Anthropic()),
+            lambda: AnthropicClient(
+                config.models.candidate_a,
+                anthropic.Anthropic(timeout=_REQUEST_TIMEOUT_SECONDS),
+                max_attempts=config.retry_max_attempts,
+            ),
         )
     else:
         candidate_client = _construct_client(
             "OpenAI",
-            lambda: OpenAIClient(config.models.candidate_b, openai.OpenAI()),
+            lambda: OpenAIClient(
+                config.models.candidate_b,
+                openai.OpenAI(timeout=_REQUEST_TIMEOUT_SECONDS),
+                max_attempts=config.retry_max_attempts,
+            ),
         )
     judge_client: ModelClient = _construct_client(
-        "Gemini", lambda: GeminiClient(config.models.judge, genai.Client())
+        "Gemini",
+        lambda: GeminiClient(
+            config.models.judge,
+            genai.Client(
+                http_options=genai_types.HttpOptions(
+                    timeout=int(_REQUEST_TIMEOUT_SECONDS * 1000)
+                )
+            ),
+            max_attempts=config.retry_max_attempts,
+        ),
     )
 
     return ModelKey(label=label, candidate_client=candidate_client, judge_client=judge_client)
@@ -456,7 +484,16 @@ def _build_judge_client(config: Config) -> ModelClient:
     depending on an unrelated candidate's API key/construction succeeding."""
 
     _require_api_key("Gemini", "GEMINI_API_KEY", "GOOGLE_API_KEY")
-    return _construct_client("Gemini", lambda: GeminiClient(config.models.judge, genai.Client()))
+    return _construct_client(
+        "Gemini",
+        lambda: GeminiClient(
+            config.models.judge,
+            genai.Client(
+                http_options=genai_types.HttpOptions(timeout=int(_REQUEST_TIMEOUT_SECONDS * 1000))
+            ),
+            max_attempts=config.retry_max_attempts,
+        ),
+    )
 
 
 def _get_or_run(

@@ -52,7 +52,7 @@ class AnthropicClient:
         model: str,
         client: anthropic.Anthropic,
         *,
-        max_attempts: int = 4,
+        max_attempts: int = 12,
         max_tokens: int = 1024,
         sleep: Callable[[float], None] = time.sleep,
         jitter: Callable[[], float] = random.random,

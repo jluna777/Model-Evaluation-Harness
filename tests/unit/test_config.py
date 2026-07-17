@@ -16,7 +16,7 @@ class TestLoadConfig:
 
         assert config.k == 3
         assert config.k_baseline == 6
-        assert config.retry_max_attempts == 4
+        assert config.retry_max_attempts == 12
         assert config.price_snapshot.date == date(2026, 7, 16)
         assert config.price_snapshot.label == "approximate-at-snapshot"
 
@@ -117,6 +117,23 @@ class TestFingerprint:
         other_kwargs["config"] = other_config
 
         assert fingerprint(**kwargs) != fingerprint(**other_kwargs)
+
+    def test_unaffected_by_retry_max_attempts(self):
+        """Retry policy is a transport-layer operational knob, not a
+        measurement input: widening ``retry_max_attempts`` (2026-07-17 retry
+        hardening) must never change the fingerprint, or a baseline would
+        need re-generation every time retry patience is tuned."""
+
+        config = load_config(DEFAULT_CONFIG_PATH)
+        other_config = config.model_copy(
+            update={"retry_max_attempts": config.retry_max_attempts + 1}
+        )
+        kwargs = self._base_kwargs(config)
+
+        other_kwargs = dict(kwargs)
+        other_kwargs["config"] = other_config
+
+        assert fingerprint(**kwargs) == fingerprint(**other_kwargs)
 
     def test_pinned_fingerprint_value_is_unchanged_by_the_sort_keys_refactor(self):
         # Pins the exact hex digest `fingerprint()` produced for these fixed

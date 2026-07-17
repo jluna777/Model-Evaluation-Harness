@@ -55,7 +55,7 @@ class OpenAIClient:
         model: str,
         client: openai.OpenAI,
         *,
-        max_attempts: int = 4,
+        max_attempts: int = 12,
         schema_name: str = "ticket_extraction",
         sleep: Callable[[float], None] = time.sleep,
         jitter: Callable[[], float] = random.random,

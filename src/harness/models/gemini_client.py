@@ -120,7 +120,7 @@ class GeminiClient:
         model: str,
         client: genai.Client,
         *,
-        max_attempts: int = 4,
+        max_attempts: int = 12,
         sleep: Callable[[float], None] = time.sleep,
         jitter: Callable[[], float] = random.random,
     ) -> None:

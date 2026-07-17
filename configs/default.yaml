@@ -15,7 +15,12 @@ dataset:
 
 k: 3
 k_baseline: 6
-retry_max_attempts: 4
+# Widened 2026-07-17: gemini-3-flash-preview's 503 load-shedding bursts
+# (observed live 2026-07-16/17) run 2-5 minutes -- longer than the previous
+# 4-attempt, ~30s total patience, which could abort an almost-complete run
+# mid-burst. Paired with retry.py's 120s per-wait cap, worst-case total wait
+# before TransportExhausted is ~8 minutes, well inside CI's 30-minute budget.
+retry_max_attempts: 12
 
 gate:
   margin: 2.0
