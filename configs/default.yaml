@@ -18,8 +18,17 @@ k_baseline: 6
 # Widened 2026-07-17: gemini-3-flash-preview's 503 load-shedding bursts
 # (observed live 2026-07-16/17) run 2-5 minutes -- longer than the previous
 # 4-attempt, ~30s total patience, which could abort an almost-complete run
-# mid-burst. Paired with retry.py's 120s per-wait cap, worst-case total wait
-# before TransportExhausted is ~8 minutes, well inside CI's 30-minute budget.
+# mid-burst. Paired with retry.py's 120s per-wait cap, the backoff schedule
+# alone sums to ~487.5s (~8 minutes).
+#
+# Corrected 2026-07-17 (same day): that ~8-minute figure counted backoff
+# sleeps only and understated the true worst case -- httpx timeouts are
+# retryable, and each provider client now has an explicit ~100s per-request
+# timeout, so a hanging-connection burst compounds request timeouts with
+# backoff waits. retry.py's PATIENCE_BUDGET_SECONDS (600s) wall-clock budget
+# bounds this: worst-case total wait before TransportExhausted is now
+# budget + one final request timeout = 600 + 100 =~ 11.7 minutes, still well
+# inside CI's 30-minute job budget with margin left for setup steps.
 retry_max_attempts: 12
 
 gate:

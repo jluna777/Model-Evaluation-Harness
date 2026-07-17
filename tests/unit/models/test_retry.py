@@ -1,6 +1,11 @@
 import pytest
 
-from harness.models.retry import DEFAULT_MAX_BACKOFF_SECONDS, TransportExhausted, retry_transport
+from harness.models.retry import (
+    DEFAULT_MAX_BACKOFF_SECONDS,
+    PATIENCE_BUDGET_SECONDS,
+    TransportExhausted,
+    retry_transport,
+)
 
 
 class FakeTransportError(Exception):
@@ -9,6 +14,22 @@ class FakeTransportError(Exception):
 
 def _is_fake_transport_error(exc: BaseException) -> bool:
     return isinstance(exc, FakeTransportError)
+
+
+class _FakeClock:
+    """A wall clock that only moves when told to -- models real elapsed time
+    without any real sleeping. ``advance`` doubles as the ``sleep`` seam (a
+    sleep consumes wall time) and a fake ``fn`` can also call it directly to
+    model time spent hung inside a request before it times out."""
+
+    def __init__(self) -> None:
+        self._elapsed = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self._elapsed += seconds
+
+    def now(self) -> float:
+        return self._elapsed
 
 
 class TestRetryTransportSucceedsWithinCap:
@@ -189,10 +210,17 @@ class TestRetryTransportBackoffCap:
 class TestRetryTransportTotalPatience:
     """Hardening (2026-07-17): the configured default schedule
     (``retry_max_attempts: 12``, the module's ``DEFAULT_MAX_BACKOFF_SECONDS``
-    cap) must bound worst-case total wait to roughly 8-10 minutes -- long
-    enough to ride out an observed 2-5 minute 503 load-shedding burst,
-    short enough to leave CI's ~30-minute job budget intact. No real
-    sleeping: a fake clock records requested durations instead."""
+    cap) sums its backoff sleeps to roughly 8-10 minutes -- long enough to
+    ride out an observed 2-5 minute 503 load-shedding burst, short enough to
+    leave CI's ~30-minute job budget intact for a fast-failing burst. No
+    real sleeping: durations are recorded instead of actually waited out.
+
+    Correction (2026-07-17, same day): this class measures backoff-sleep
+    time only, which is not the true worst case for a *hanging* burst --
+    see ``TestRetryTransportPatienceBudget`` below for the compound bound
+    (patience budget + one final request timeout) that actually governs a
+    hang-dominated failure.
+    """
 
     def test_worst_case_total_wait_is_bounded_between_8_and_10_minutes(self):
         sleeps = []
@@ -237,3 +265,97 @@ class TestRetryTransportTotalPatience:
             pass
 
         assert sum(sleeps) == pytest.approx(487.5 / 2)
+
+
+class TestRetryTransportPatienceBudget:
+    """Correction (2026-07-17, same day): ``TestRetryTransportTotalPatience``
+    above only bounds backoff-sleep time. httpx timeouts are themselves
+    retryable transport errors (they satisfy ``is_transport_error``), and
+    each provider client sets an explicit ~100s per-request timeout -- so a
+    hanging-connection burst compounds up to 12 request timeouts with the
+    backoff waits between them (12*100s + 487.5s =~ 28.1 minutes), which
+    would floor an entire CI run against the 30-minute job ceiling.
+    ``PATIENCE_BUDGET_SECONDS`` (600s) is a wall-clock bound, independent of
+    ``max_attempts``, that cuts a hang-dominated burst off well before
+    attempt 12 while leaving fast-fail bursts' full backoff schedule
+    untouched. No real sleeping: ``_FakeClock`` records requested durations
+    instead of waiting them out."""
+
+    def test_budget_cutoff_fires_before_max_attempts_when_attempts_hang(self):
+        clock = _FakeClock()
+        calls = []
+
+        @retry_transport(
+            max_attempts=12,
+            is_transport_error=_is_fake_transport_error,
+            sleep=clock.advance,
+            jitter=lambda: 1.0,  # worst case: jitter never shrinks a wait
+            now=clock.now,
+            patience_budget=600.0,
+        )
+        def hangs_then_times_out():
+            calls.append(1)
+            clock.advance(100.0)  # each attempt hangs for the full ~100s
+            raise FakeTransportError("timeout")  # the request times out
+
+        try:
+            hangs_then_times_out()
+        except TransportExhausted as exc:
+            raised = exc
+        else:
+            raise AssertionError("expected TransportExhausted")
+
+        # 100s/attempt exhausts the 600s budget around the 6th attempt,
+        # well short of the 12-attempt cap that would otherwise apply.
+        assert raised.attempts == 6
+        assert len(calls) == 6
+
+    def test_fast_fail_burst_still_traverses_the_full_backoff_schedule(self):
+        """The budget must not shorten a fast-failing (no-hang) burst: the
+        487.5s worst-case backoff schedule fits comfortably inside the 600s
+        budget, so all 12 attempts still happen exactly as before this
+        correction."""
+        sleeps = []
+
+        @retry_transport(
+            max_attempts=12,
+            is_transport_error=_is_fake_transport_error,
+            sleep=sleeps.append,
+            jitter=lambda: 1.0,  # worst case: jitter never shrinks a wait
+            patience_budget=600.0,
+        )
+        def always_fails():
+            raise FakeTransportError("503")
+
+        try:
+            always_fails()
+        except TransportExhausted as exc:
+            raised = exc
+        else:
+            raise AssertionError("expected TransportExhausted")
+
+        assert raised.attempts == 12
+        assert len(sleeps) == 11
+        assert sum(sleeps) == pytest.approx(487.5)
+
+    def test_patience_budget_must_be_positive(self):
+        with pytest.raises(ValueError, match="patience_budget"):
+            retry_transport(
+                max_attempts=3,
+                is_transport_error=_is_fake_transport_error,
+                patience_budget=0.0,
+            )
+
+    def test_worst_case_single_call_wall_time_bound_is_budget_plus_one_timeout(self):
+        """The true worst-case wall time for one call is patience_budget plus
+        one final per-request timeout -- not the backoff schedule alone.
+        ``client_request_timeout_seconds`` mirrors cli.py's
+        ``_REQUEST_TIMEOUT_SECONDS`` (100.0), kept as a literal here so this
+        bound stays self-contained in a models-level test rather than
+        importing the CLI module."""
+        client_request_timeout_seconds = 100.0
+        worst_case_wall_seconds = PATIENCE_BUDGET_SECONDS + client_request_timeout_seconds
+
+        assert worst_case_wall_seconds == pytest.approx(700.0)
+        assert worst_case_wall_seconds / 60 == pytest.approx(11.6666667, rel=1e-6)
+        assert worst_case_wall_seconds < 30 * 60  # clears the CI job ceiling with margin
