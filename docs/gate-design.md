@@ -1,9 +1,10 @@
 # Gate design: the analytic false-alarm justification
 
 This document is the analytic half of the spec §7 false-alarm demonstration
-(constitution DoD 2); the other half is the "Results" section at the bottom,
-pending 10 local no-change runs. Linked from every `eval gate` summary
-(`render_gate_summary`, `src/harness/reports.py`).
+(constitution DoD 2); the other half is the "Results" section at the bottom
+(§8), completed 2026-07-17: 10 local no-change runs, 0 observed false
+alarms. Linked from every `eval gate` summary (`render_gate_summary`,
+`src/harness/reports.py`).
 
 ## 1. Threat model
 
@@ -82,10 +83,13 @@ keep baseline noise small relative to a gate run's, keeping the conditional
 rate close to unconditional α (D3 amendment 2026-07-04a). This is a
 qualitative "keeps it near-exact" argument, not a derived numerical bound.
 
-The planned 10 no-change runs (§8) are therefore a **conditional check
+The 10 no-change runs executed in §8 are therefore a **conditional check
 against the one committed baseline**, not 10 independent α draws — they
 share the same frozen baseline noise, so outcomes are correlated, not
-i.i.d. Bernoulli(α) trials.
+i.i.d. Bernoulli(α) trials. The observed **0/10** false-alarm count in §8
+should be read accordingly: it **supports**, rather than **proves**, the
+per-run α claim above — one correlated data point sitting alongside the
+analytic argument, not 10 independent confirmations of it.
 
 ## 4. Guardrail floor
 
@@ -159,23 +163,106 @@ failure/exhausted retry marks a field **missing**, never **fail** — items
 with any missing field are excluded from paired deltas (disclosed via an
 exclusion count), so judge failures can never register as a regression.
 
-## 8. Results: no-change demonstration (PENDING)
+## 8. Results: no-change demonstration
 
-**Not yet executed** — deferred until Phase B's real, traced baselines and
-API keys are available.
+**Executed 2026-07-17.** Ten sequential `eval gate` invocations against the
+committed `baselines/{a,b}.json`, no code/prompt/dataset/config change
+between runs; each a fresh run (§6), full API keys and Langfuse tracing
+present throughout (gate runs are reportable and fail fast without tracing,
+spec §8). All 20 candidate-runs (10 runs × 2 candidates) used exact
+permutation enumeration (`m` ranged 4–14, well under the `m ≤ 20` exact
+threshold, §2) and reported the coarse guardrail as **not tripped** in
+every case.
 
-**Planned protocol:** 10 sequential `eval gate` invocations, no
-code/prompt/dataset/config change between runs, against the committed
-`baselines/{a,b}.json`; each a fresh run (§6): the per-invocation
-run root already makes cross-run leakage structurally impossible, and
-scratch directories are additionally cleared between invocations as disk
-hygiene;
-full API keys and Langfuse credentials present throughout (gate runs are
-reportable and fail fast without tracing, spec §8). Recorded per run: run
-index, exit code, per-candidate one-sided p, mean delta. Observed
-false-alarm count = number of runs exiting 1. Per §3, this is a
-**conditional check** against the one frozen baseline, not 10 independent
-α draws — reported and interpreted as such.
+**Observed false-alarm count: 0/10.** All 10 runs exited **0 (pass)**; both
+candidates passed the paired-delta rule in every run.
+
+| Run | Exit | a: mean Δ | a: p (one-sided) | a: m | a: MDE | a: adv. Δ | b: mean Δ | b: p (one-sided) | b: m | b: MDE | b: adv. Δ | Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1  | 0 | -0.07 | 0.3750 | 4 | 0.50 | 0.00  | 0.52  | 0.8359 | 9  | 1.35 | 0.00  | PASS |
+| 2  | 0 | 0.07  | 0.7500 | 4 | 0.50 | 0.00  | 0.37  | 0.6538 | 11 | 2.03 | -0.26 | PASS |
+| 3  | 0 | 0.22  | 0.6875 | 4 | 1.34 | 0.26  | -0.37 | 0.1836 | 8  | 0.93 | -0.79 | PASS |
+| 4  | 0 | 0.67  | 0.8438 | 5 | 1.51 | 0.79  | -0.22 | 0.4189 | 14 | 1.92 | -0.53 | PASS |
+| 5  | 0 | 0.82  | 0.8750 | 6 | 1.54 | 0.00  | 0.52  | 0.7827 | 11 | 1.80 | -0.79 | PASS |
+| 6  | 0 | 1.26  | 1.0000 | 5 | 1.53 | 0.00  | 0.37  | 0.6819 | 13 | 2.13 | -1.06 | PASS |
+| 7  | 0 | 0.07  | 0.5938 | 5 | 1.34 | 0.00  | 0.82  | 0.8809 | 9  | 1.69 | 0.00  | PASS |
+| 8  | 0 | 0.52  | 0.7812 | 5 | 1.32 | 1.06  | -0.22 | 0.3691 | 10 | 1.73 | -0.53 | PASS |
+| 9  | 0 | 0.67  | 0.9688 | 5 | 1.20 | 0.79  | 0.52  | 0.7236 | 11 | 1.91 | -0.26 | PASS |
+| 10 | 0 | 1.12  | 1.0000 | 5 | 1.36 | -0.26 | 1.41  | 0.9785 | 11 | 1.74 | -0.79 | PASS |
+
+Deltas and MDE in composite points, `current - baseline`; `m` = nonzero
+paired deltas feeding the permutation test; adversarial Δ is always printed
+regardless of guardrail status (§4). Runs 4 and 7 are each the final
+successful attempt of that run index — see "Aborted attempts" below for the
+6 and 3 measurement-error attempts that preceded them respectively.
+
+**Predicted vs. observed rate.** §2's family false-alarm rate (≤ ~9.8%
+worst case per run) predicts at most about 1 false alarm in expectation
+across 10 runs (10 × 0.0975 ≈ 0.975). Observing 0 is consistent with that
+prediction — not a rejection of it, and not proof the true rate is lower;
+10 correlated conditional checks (§3) have limited power to distinguish "0
+false alarms" from "a false alarm was simply never drawn this time."
+
+**Observed `m` values, and an honest sparse-delta disclosure.** Candidate
+a's `m` was 4, 4, 4, 5, 6, 5, 5, 5, 5, 5 across the 10 runs — a mostly-4–6
+range as expected going in. But per §2's minimum-attainable-p analysis,
+that range put candidate a in the sparse-delta regime on **9 of its 10
+runs**: 3 runs at `m = 4`, where rejection at α=0.05 was **structurally
+impossible** regardless of regression size (min attainable p = 0.0625 >
+0.05), and 6 runs at `m = 5`, where rejection was possible only if *every*
+nonzero delta shared the regression sign (min attainable p = 0.03125). Only
+run 5 (`m = 6`) sat outside that regime. This is disclosed plainly rather
+than glossed over: for most of candidate a's runs, a PASS verdict carries
+less evidentiary weight against a real regression than it would at higher
+`m` — in three of those runs, no regression size could have produced a
+FAIL at all. Candidate b's `m` ranged 8–14 (min attainable p from 0.0039
+down to 0.00006), giving real rejection room throughout, and it still never
+tripped the rule. MDE stayed well under the ~5–7 point expected order
+quoted in §5/§7 for both candidates across all 10 runs (a: 0.50–1.54 pts;
+b: 0.93–2.13 pts) — the empirical delta spread at this n was tighter than
+the conservative expectation, i.e. realized power was higher than assumed.
+
+**Correlated, not i.i.d. — supports, doesn't prove.** Per §3, these 10 runs
+share one frozen baseline realization; they are a conditional check against
+that baseline, not 10 independent α draws. "0/10" is offered as supporting
+evidence for the α claim alongside the analytic argument of §2–§3, not as
+an independent statistical proof of it.
+
+### Aborted attempts (non-measurements)
+
+The campaign also logged **9 aborted attempts**, each exiting **2**
+(measurement error) per the §7 exit-code contract — none produced a
+pass/fail verdict, and none counts toward or against the false-alarm rate
+above, exactly as §7 intends: exit 2 is "we don't know," not "we know, and
+it's bad."
+
+- **6 aborts** were run 4's first six attempts, all on the judge provider's
+  (`gemini-3-flash-preview`) 503 load-shedding bursts — observed live as
+  2–5 minute outages that exceeded the then-current retry patience.
+- **3 aborts** were run 7's first three attempts, on a candidate provider's
+  billing depletion — an account-level quota exhaustion, a distinct
+  failure class from a transport error, unaffected by retry patience and
+  resolved by topping up the account rather than a code change.
+
+Between run 4's completion and run 5's attempt, the transport retry policy
+was hardened in two same-day commits: `a502b3f` widened
+`retry_max_attempts` from 4 to 12 and capped each backoff wait at 120s
+(aimed at the observed 503 bursts), and `cf25499` added a 600s wall-clock
+`PATIENCE_BUDGET_SECONDS` on top of that backoff schedule, correcting an
+undercounted worst-case wait once per-request timeouts were also made
+retryable. Runs 5, 6, 8, 9, and 10 each completed cleanly on their first
+attempt after that hardening, with no further 503-driven aborts observed.
+Run 7 still needed three attempts before succeeding, but for the separate
+billing-depletion reason above, which transport-retry patience cannot
+address — the hardening was never expected to touch it.
+
+Both commits change **transport policy only**: how long the harness waits
+for a call to succeed or fail before giving up, never what it does with a
+call that did succeed. `retry_max_attempts` (and the patience budget) stay
+outside the run fingerprint by design (spec §9, a pinned test enforces
+this) — scores, deltas, p-values, and verdicts never depend on transport
+patience, and none of the numbers in the results table above are affected
+by which side of these commits a run happened to fall on.
 
 ## Sources
 

@@ -22,7 +22,7 @@ Commit the analytic false-alarm justification for the gate (`docs/gate-design.md
 - [ ] The doc contains the spec §7 threat-model statement: the gate protects against harness/scoring code changes, provider-side drift of served models, and judge drift; prompt changes are not gated automatically.
 - [ ] The doc contains the prompt-change re-baseline PR procedure: run `eval gate --update-baseline`, and the PR must attach the compare-vs-old-baseline report for human review.
 - [ ] The doc includes the sparse-delta disclosure consistent with spec §7 errata 2026-07-04: at m ≤ 4 no rejection is possible at α=0.05; at m = 5 rejection requires all five nonzero deltas to be regressions (min p = 0.031); and the two-candidate family false-alarm statement (two tests at α=0.05 → ≤ ~9.8% worst case).
-- [ ] 10 no-change gate runs are executed locally with full keys (traced — Langfuse credentials present; gate runs are reportable and fail fast without them, spec §8), against the committed baselines with no code/prompt/data change. A results table with exactly 10 rows (run index, exit code, per-candidate p, mean delta) is present in `docs/gate-design.md`, plus the observed false-alarm count (number of runs with exit code 1).
+- [x] 10 no-change gate runs are executed locally with full keys (traced — Langfuse credentials present; gate runs are reportable and fail fast without them, spec §8), against the committed baselines with no code/prompt/data change. A results table with exactly 10 rows (run index, exit code, per-candidate p, mean delta) is present in `docs/gate-design.md`, plus the observed false-alarm count (number of runs with exit code 1).
 - [ ] The T10 gate-summary link resolves: generate a gate summary (e.g. re-render a fixture or run `eval gate`), grep it for the relative link to `docs/gate-design.md`, and verify the file exists at the linked path from the repo root. Expected: link present, target file exists.
 - [ ] `uv run pytest` and `uv run ruff check` pass (no code changes expected; the task still ends green per Global constraints).
 
@@ -32,3 +32,22 @@ Commit the analytic false-alarm justification for the gate (`docs/gate-design.md
 - The observed false-alarm count recorded here is summarized in the README by T19; together with the analytic justification this satisfies both branches of the spec §7 false-alarm demonstration (constitution DoD 2).
 - Numbers used in the doc must match spec §7 verbatim: α = 0.05, margin 2.0, K=3, K_baseline=6, n=32 nominal items, adversarial guardrail ≥ 10 points (threshold verified ≥3× measured SE at baseline time), MDE expected order ~5–7 points at n=32.
 - This is a documentation + measurement ticket, not a TDD code ticket; no new source modules.
+
+## Evidence (2026-07-17)
+
+The 10-run no-change AC is complete. Results table, per-run per-candidate
+delta/p/m/MDE/adversarial-delta, the 0/10 observed false-alarm count, and
+the analytic-vs-observed narrative (including the honest sparse-delta
+disclosure for candidate a) are recorded in `docs/gate-design.md` §8. All
+10 runs' overall verdict is PASS, exit code 0.
+
+Provenance: the 10 gate-summary logs backing this table were captured
+locally to this session's scratchpad
+(`t17-run-{1,2,3}.log`, `t17-run-4-attempt-3.log`,
+`t17-run-{5,6,7,8,9,10}-attempt-1.log`, plus `t17-exitcodes.txt` for the
+full attempt/exit-code history) and are reproduced as summaries in the
+`docs/gate-design.md` §8 table; the scratchpad logs themselves are not
+committed. The campaign also produced 9 aborted (exit 2) attempts before
+runs 4 and 7 each completed — disclosed in §8's "Aborted attempts"
+subsection, along with the mid-campaign transport-retry hardening
+(`a502b3f`, `cf25499`) that followed run 4.
