@@ -113,7 +113,15 @@ def _refusal_reason(response: types.GenerateContentResponse) -> str | None:
 
 
 class GeminiClient:
-    """Judge client for Gemini models via native structured outputs."""
+    """Judge client for Gemini models via native structured outputs.
+
+    The injected ``client`` is stored as-is: nothing at this class boundary
+    inspects or overrides its ``http_options.retry_options``. Retry
+    non-compounding is enforced by convention -- construct the client with
+    the SDK's defaults, which resolve to no internal retry at all (see the
+    module docstring) -- so ``retry_transport`` stays the only retry layer.
+    Do not inject a client configured with its own retries.
+    """
 
     def __init__(
         self,
