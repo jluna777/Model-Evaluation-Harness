@@ -23,7 +23,7 @@ honesty ([constitution](docs/constitution.md)).
 | Judge–human agreement κ (vs ceiling 0.734) | 0.668 [0.420, 0.853] | 0.845 [0.639, 0.962] |
 
 **Paired comparison (b − a): +1.33 points, 95% BCa CI [−1.05, 3.71],
-two-sided permutation p = 0.31** — the gap is **not statistically
+two-sided permutation p = 0.32** — the gap is **not statistically
 significant** at this n, and the honest headline is a trade-off, not a
 winner: candidate a extracts the literal fields flawlessly (100% on
 customer name, order id, product name), while candidate b writes better
@@ -135,7 +135,10 @@ uv run eval calibrate --offline                       # certificate from committ
 ## Reproducibility contract
 
 - A run's identity is a **fingerprint** over config, served model versions
-  (captured from provider responses — alias drift is caught), judge
+  (captured from provider responses — candidate alias drift is caught;
+  the judge's provider echoes the requested alias, so judge drift is
+  guarded by a recorded dated snapshot + the booked re-certification, not
+  the fingerprint — see [gate-design §1](docs/gate-design.md)), judge
   version (hash of judge model + prompt + rubric + few-shots), composite
   mode, and calibration verdict. The gate exits 2 on any mismatch.
 - **Raw outputs are always persisted**, including failures; reports are
@@ -199,10 +202,12 @@ uv run eval calibrate --offline                       # certificate from committ
   silent provider re-pointing surfaces as a fingerprint mismatch (exit 2)
   rather than a wrong verdict — but the alias itself is outside this
   repo's control.
-- **Real-only κ collapses.** On the 109 unperturbed rows both annotators
-  and the judge pass nearly everything → prevalence collapse (κ = 0.0 with
-  a degenerate CI); the informative number is overall κ on the enriched
-  set, and 1 of 31 planted defects was passed by gold.
+- **Real-only κ is structurally zero.** On the 100 real (non-probe) rows
+  the resolved gold passes everything — and with a constant gold marginal,
+  Cohen's κ is algebraically 0 no matter what the judge does (the judge's
+  actual real-row behavior: 88% raw agreement, every miss a false-fail,
+  none a false-pass). The informative number is overall κ on the enriched
+  set; 1 of 31 planted defects was passed by gold.
 - **Preview judge pin.** `gemini-3-flash-preview` is a preview ID
   (retirement/re-pointing risk; the served snapshot
   `3-flash-preview-12-2025` is recorded). It also load-sheds at peak hours

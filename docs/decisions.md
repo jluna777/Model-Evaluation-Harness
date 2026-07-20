@@ -6,7 +6,7 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 
 ## D1 — Judge protocol and judge model
 
-**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-09, 2026-07-09b, 2026-07-16
+**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-09, 2026-07-09b, 2026-07-16, 2026-07-16b, 2026-07-16c, 2026-07-16d
 **Decision:** Pointwise, reference-guided judging with a third-provider judge (`gemini-3-flash-preview` — provisional pin confirmed by certification 2026-07-16, see amendments 2026-07-16c/2026-07-16d; `gemini-2.5-pro` is the certified predecessor; `gemini-3.5-flash` is the documented fallback, currently in a capacity-shedding incident). The judge grades each candidate's free-text fields independently against the golden reference — binary rubric, one field per judge call, temperature 0. Model comparison is computed from paired per-item score deltas, never from head-to-head judging. Operational parameters: spec §4, §6.
 
 **Options considered:** (1) pointwise + third-provider judge *(chosen)*; (2) head-to-head pairwise with two-pass position swap (Arena-Hard protocol); (3) pointwise + offline head-to-head diagnostic.
@@ -39,7 +39,7 @@ Owner-decided per `docs/constitution.md` §6. Each record states the decision, t
 
 ## D2 — Judge calibration and agreement reporting
 
-**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-09, 2026-07-09b, 2026-07-10, 2026-07-16
+**Status:** Decided 2026-07-04 · Amended 2026-07-04a, 2026-07-09, 2026-07-09b, 2026-07-10, 2026-07-16, 2026-07-16b
 **Decision:** Binary pass/fail rubric with written rationale. Calibration data is disjoint from the golden set: dedicated calibration emails, both candidates' outputs, every free-text field labeled by the owner, stratified toward borderline/failing outputs. Cohen's kappa (with cluster-bootstrap CI) is the single deciding agreement statistic, reported per candidate; raw agreement and prevalence are descriptive context. Owner test-retest relabeling provides an estimated consistency ceiling. Operational parameters: spec §5.
 
 **Options considered:** (1) binary rubric + stratified set + test-retest *(chosen)*; (2) 1–5 graded rubric (weighted kappa + Spearman); (3) binary with minimal calibration, no retest.

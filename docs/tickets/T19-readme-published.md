@@ -117,3 +117,14 @@ substantive findings (the `is_probe` defect above; a backwards
 judge-vs-candidate cost-share claim that also lived in
 `reports.py`'s gate-summary renderer, corrected with its pinned test
 fixture; an MDE range digit 2.16 → 2.13) all fixed before owner review.
+
+**Addendum (2026-07-20, from the T20 final review):** the whole-branch
+review found a floating-point tie-counting defect in exact/MC
+`sign_flip_test` extremeness masks (T20 ticket, finding C1). Under the
+fixed code the published comparison's Monte-Carlo p recomputes to 0.3179
+(was 0.3066; 113/10,000 resamples were mathematically tied with the
+observed statistic and had been dropped from the count). The published
+compare report was regenerated under the fixed code and the README's
+paired-comparison line updated (p = 0.31 → 0.32); the delta, CI, and the
+not-significant conclusion are unchanged. This section's 0.3066 is left
+as written — it was the artifact's value at signing.

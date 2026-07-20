@@ -14,7 +14,17 @@ The gate protects against (spec §7, D3):
   or composite computation.
 - **Provider-side model drift** — every run records the served model
   version in its fingerprint (`served_versions`); a mismatch vs baseline is
-  a fingerprint mismatch (exit 2).
+  a fingerprint mismatch (exit 2). Scope caveat (2026-07-20): this
+  automatic guard is only as good as what the provider echoes. Both
+  candidates resolve to dated snapshots (`claude-haiku-4-5-20251001`,
+  `gpt-5.4-mini-2026-03-17`), so their drift is caught; the judge's
+  provider echoes the requested alias itself (`gemini-3-flash-preview`),
+  so a silent re-point of that preview alias would NOT trip the
+  fingerprint. The judge's drift guard is instead the dated snapshot
+  recorded at pin time (`3-flash-preview-12-2025`, decisions.md D1
+  2026-07-16c — re-verifiable via `models.get`) plus the booked post-v1
+  re-certification; stamping a dated judge snapshot into
+  `served_versions` is the booked mechanical fix.
 - **Judge drift** — a change to judge model/prompt/rubric/few-shots changes
   `judge_version`, also a fingerprint component.
 
@@ -195,6 +205,21 @@ paired deltas feeding the permutation test; adversarial Δ is always printed
 regardless of guardrail status (§4). Runs 4 and 7 are each the final
 successful attempt of that run index — see "Aborted attempts" below for the
 6 and 3 measurement-error attempts that preceded them respectively.
+
+**Errata (2026-07-20, tie-handling fix).** The p-values in this table were
+produced before the final whole-branch review found and fixed a
+floating-point tie-counting defect in exact-mode `sign_flip_test`
+(resampled statistics mathematically tied with the observed value could be
+excluded from the extreme count by last-ulp noise — the anti-conservative
+direction). The fix can only *raise* a p-value (tied blocks are now
+counted as extreme), so every PASS verdict and the 0/10 false-alarm count
+above stand a fortiori; the recorded p-values are lower bounds on their
+corrected values. For scale: the published comparison's Monte-Carlo p
+moved 0.3066 → 0.3179 under the fix (113 of 10,000 resamples were tied
+with the observed statistic). These runs' raw outputs were not retained
+run-by-run, so the table's p-values are not individually recomputed; the
+regression tests pinning the fix live in
+`tests/unit/stats/test_permutation.py::TestTieBlockCounting`.
 
 **Predicted vs. observed rate.** §2's family false-alarm rate (≤ ~9.8%
 worst case per run) predicts at most about 1 false alarm in expectation

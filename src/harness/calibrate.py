@@ -1806,8 +1806,11 @@ def render_calibration_report(result: CalibrationResult) -> str:
             f"{result.ceiling.kappa:.3f} (95% cluster-bootstrap CI "
             f"[{result.ceiling.ci[0]:.3f}, {result.ceiling.ci[1]:.3f}]) -- the human-human "
             "agreement ceiling. A judge κ exceeding this value indicates estimation noise, "
-            "not a super-human judge."
+            "not a super-human judge. (The ceiling measures agreement under the written "
+            "conventions with owner-adjudicated gold -- not a fully independent third "
+            "check.)"
         )
+        lines.append("")
         lines.append(f"Adjudicated disagreements: {result.n_adjudicated}.")
         lines.append("")
 
@@ -1826,13 +1829,35 @@ def render_calibration_report(result: CalibrationResult) -> str:
                 f"population): {result.achieved_fail_prevalence:.1%}"
             )
         if result.real_only_kappa is not None:
-            lines.append(
-                f"- Real-only κ (judge vs. gold, non-probe items only) = "
-                f"{result.real_only_kappa.kappa:.3f} (95% cluster-bootstrap CI "
-                f"[{result.real_only_kappa.ci[0]:.3f}, {result.real_only_kappa.ci[1]:.3f}]) -- "
-                "reported alongside the primary overall κ above, never replacing it as the "
-                "decision statistic."
-            )
+            rok = result.real_only_kappa
+            if rok.prevalence in (0.0, 1.0):
+                # Single-category GOLD marginal: kappa is algebraically 0 no
+                # matter what the judge does (p_o == p_e identically), and
+                # every bootstrap replicate is 0 -- a structural value, not a
+                # measurement. Rendering it with the informative-kappa framing
+                # invites the misreading "zero chance-corrected agreement on
+                # real data" (final whole-branch review 2026-07-20, I2).
+                miss_kind = "false-fail" if rok.prevalence == 1.0 else "false-pass"
+                lines.append(
+                    f"- Real-only κ (judge vs. gold, non-probe items only) = "
+                    f"{rok.kappa:.3f} (95% cluster-bootstrap CI "
+                    f"[{rok.ci[0]:.3f}, {rok.ci[1]:.3f}]) -- **structurally zero**: the "
+                    f"resolved gold is single-category on the real subset (pass-prevalence "
+                    f"{rok.prevalence:.1%}), and with a constant gold marginal Cohen's κ is "
+                    "algebraically 0 regardless of judge behavior. The meaningful "
+                    f"real-subset number is raw agreement: {rok.raw_agreement:.1%} (every "
+                    f"disagreement is a judge {miss_kind} relative to gold). Reported "
+                    "alongside the primary overall κ above, never replacing it as the "
+                    "decision statistic."
+                )
+            else:
+                lines.append(
+                    f"- Real-only κ (judge vs. gold, non-probe items only) = "
+                    f"{rok.kappa:.3f} (95% cluster-bootstrap CI "
+                    f"[{rok.ci[0]:.3f}, {rok.ci[1]:.3f}]) -- "
+                    "reported alongside the primary overall κ above, never replacing it as the "
+                    "decision statistic."
+                )
         else:
             lines.append(
                 "- Real-only κ (judge vs. gold, non-probe items only): **undefined** -- the "

@@ -1,7 +1,8 @@
 """Synthetic-fixture tests for judge calibration (T14): triple reconstruction,
-agreement statistics, adequacy verdicts, self-consistency, the test-retest
-ceiling, and the committed certificate. No live API calls anywhere in this
-module -- every judge call is served by a hand-written fake client.
+agreement statistics, adequacy verdicts, self-consistency, the inter-annotator
+(human-human) ceiling, and the committed certificate. No live API calls
+anywhere in this module -- every judge call is served by a hand-written fake
+client.
 """
 
 from __future__ import annotations

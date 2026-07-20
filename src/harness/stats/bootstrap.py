@@ -289,6 +289,13 @@ def _bca_percentiles(
     degenerate case where every bootstrap replicate lands on (or on one
     side of) the observed statistic, e.g. constant input data. There, z0
     would be +/-infinity and the BCa adjustment is undefined.
+
+    Tie handling: ``p0`` uses Efron's strict-``<`` convention (replicates
+    exactly equal to the observed statistic do not count as "below"). On
+    heavily tied bootstrap distributions -- kappa over pass/fail labels
+    produces many -- this is a deliberate convention choice, not an
+    accident; alternatives (counting half the ties) shift z0 slightly but
+    stay within the interval's own Monte-Carlo noise.
     """
 
     p0 = float(np.mean(boot_stats < observed))
