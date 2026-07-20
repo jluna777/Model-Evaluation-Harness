@@ -1,0 +1,4 @@
+# Published evidence must survive checkout byte-identical on every platform:
+# the README's recompute contract (eval rescore / eval compare reuse) is
+# byte-exact, and CRLF normalization would silently break it.
+results/published/** -text
