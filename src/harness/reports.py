@@ -915,8 +915,8 @@ def render_gate_summary(data: GateSummaryData) -> str:
         lines.append(
             f"- Judge token usage: {candidate.usage_judge.get('input_tokens', 0)} in / "
             f"{candidate.usage_judge.get('output_tokens', 0)} out (~${cost_judge:.4f}; "
-            "judge calls dominate cost -- one call per judged field per replicate, "
-            "vs one candidate call per replicate)"
+            "judge calls outnumber candidate calls -- one per judged field per "
+            "replicate, vs one candidate call per replicate -- but each is short)"
         )
         lines.append("")
 
