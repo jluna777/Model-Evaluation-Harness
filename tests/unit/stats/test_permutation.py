@@ -53,6 +53,81 @@ class TestExactModeAnchors:
         assert result.min_attainable_p == pytest.approx(0.5)
 
 
+class TestTieBlockCounting:
+    """Regression tests for the exact-mode tie-handling defect found by the
+    final whole-branch review (2026-07-20): the observed statistic was
+    computed via ``ndarray.mean()`` (pairwise summation over all deltas,
+    zeros included) while resampled statistics went through
+    ``signs @ nonzero`` -- a last-ulp mismatch that could exclude the
+    observed value's own tie block (which always contains the identity
+    assignment) from the extreme count. On the gate's quantized deltas
+    (multiples of 100/21 at K=3) this returned p-values BELOW the test's
+    own ``min_attainable_p`` floor and could reject at m = 4 where the
+    documented floor (0.0625) makes rejection impossible at alpha = 0.05."""
+
+    # One judged-field flip at K=3 changes a per-item composite delta by
+    # 100/21 -- the exact quantum the gate's tied deltas arrive in.
+    _Q = 100.0 / 21.0
+
+    def test_identity_tie_block_counted_one_sided_quantized(self):
+        # The reviewer's verified counterexample: all-negative m=4 over the
+        # nominal slice (n_total=32). Only the identity assignment attains
+        # the observed minimum, so exact p is exactly 2**-4.
+        deltas = [-self._Q, -self._Q, -2 * self._Q, -3 * self._Q] + [0.0] * 28
+
+        result = sign_flip_test(deltas, sided="one", seed=0)
+
+        assert result.method == "exact"
+        assert result.p == pytest.approx(0.0625)
+        assert result.p >= result.min_attainable_p
+
+    def test_m4_above_margin_cannot_reject_at_alpha_05(self):
+        # Above-margin all-negative m=4 regression (mean 2.08 > margin 2.0):
+        # the documented sparse-delta guarantee says no rejection is possible
+        # at alpha=0.05 because min attainable p = 0.0625.
+        deltas = [-2 * self._Q, -2 * self._Q, -4 * self._Q, -6 * self._Q] + [0.0] * 28
+
+        result = sign_flip_test(deltas, sided="one", seed=0)
+
+        assert result.p == pytest.approx(0.0625)
+        assert result.p > 0.05
+
+    def test_identity_and_negation_tie_blocks_counted_two_sided(self):
+        # Two-sided extremeness is invariant under full sign negation, so
+        # the extreme set always contains the identity AND its mirror:
+        # exact p is exactly 2**(1-4) here, the documented two-sided floor.
+        deltas = [-self._Q, -self._Q, -2 * self._Q, -3 * self._Q] + [0.0] * 28
+
+        result = sign_flip_test(deltas, sided="two", seed=0)
+
+        assert result.method == "exact"
+        assert result.p == pytest.approx(0.125)
+        assert result.p >= result.min_attainable_p
+
+    @pytest.mark.parametrize("sided", ["one", "two"])
+    @pytest.mark.parametrize(
+        "magnitudes",
+        [
+            (1, 1, 2, 3),
+            (1, 1, 1, 1),
+            (2, 2, 4, 6),
+            (1, 2, 3, 4, 5),
+            (1, 1, 2, 2, 3, 3),
+        ],
+    )
+    def test_exact_p_never_below_floor_on_quantized_ties(self, sided, magnitudes):
+        # Property pinned across a family of tied, quantized configurations:
+        # a correct sign test can never return p < min_attainable_p, because
+        # the extreme set always contains at least the identity assignment.
+        deltas = [-k * self._Q for k in magnitudes]
+        deltas += [0.0] * (32 - len(deltas))
+
+        result = sign_flip_test(deltas, sided=cast(Literal["one", "two"], sided), seed=0)
+
+        assert result.method == "exact"
+        assert result.p >= result.min_attainable_p
+
+
 class TestTwoSided:
     def test_two_sided_p_is_double_one_sided_for_a_clean_extreme(self):
         deltas = [-5.0, -1.0]

@@ -86,9 +86,19 @@ def sign_flip_test(
         raise ValueError("deltas must be non-empty")
 
     n_total = deltas_arr.size
-    observed = float(deltas_arr.mean())
     nonzero = deltas_arr[deltas_arr != 0]
     m = nonzero.size
+    # The observed statistic is the mean over ALL deltas (zeros included),
+    # but it is computed through the SAME dot-product expression the
+    # resampled statistics use below (the identity sign assignment), never
+    # via ndarray.mean(): pairwise summation over the full array and a
+    # dot product over the nonzero values can differ in the last ulp, and
+    # that mismatch excluded the observed value's own tie block -- which
+    # always contains the identity assignment -- from the extreme count
+    # (final whole-branch review 2026-07-20, Critical C1: returned p-values
+    # below min_attainable_p and could reject at m = 4 where the documented
+    # floor makes rejection impossible).
+    observed = float(np.ones(m, dtype=np.int8) @ nonzero) / n_total if m else 0.0
 
     if m == 0:
         # No sign to flip anywhere: the single attainable statistic is the
@@ -131,10 +141,22 @@ def sign_flip_test(
 def _extreme_mask(
     stats: np.ndarray, observed: float, sided: Literal["one", "two"]
 ) -> np.ndarray:
-    """Boolean mask of resampled statistics at least as extreme as ``observed``."""
+    """Boolean mask of resampled statistics at least as extreme as ``observed``.
 
+    Comparisons carry a relative tolerance (the same guard
+    ``scipy.stats.permutation_test`` documents for its null distribution):
+    distinct sign assignments that are mathematically tied with the observed
+    statistic can differ from it in the last ulp, and a strict comparison
+    would drop the whole tie block from the extreme count -- the
+    anti-conservative direction (final whole-branch review 2026-07-20, C1).
+    The tolerance (1e-14 relative, floored absolutely at 1e-14) is
+    astronomically below the gate's delta quantum (100/21/32 at K=3), so it
+    can only ever merge genuine floating-point tie blocks, never distinct
+    statistics."""
+
+    tol = 1e-14 * max(1.0, abs(observed))
     if sided == "one":
-        return stats <= observed
+        return stats <= observed + tol
     if sided == "two":
-        return np.abs(stats) >= abs(observed)
+        return np.abs(stats) >= abs(observed) - tol
     raise ValueError(f"sided must be 'one' or 'two', got {sided!r}")
